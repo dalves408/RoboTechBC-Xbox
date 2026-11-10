@@ -3,7 +3,7 @@ setlocal EnableExtensions
 rem Interactive playtest for the current RelWithDebInfo build.
 rem Double-click this file from Explorer, or run it from a cmd prompt.
 rem Full boot — logo / intro Binks play (no movie skip).
-rem Screenshots: focus the FB window, press F12 or PrintScreen → screenshots\shot_*.bmp
+rem Screenshots: focus the FB window, press Delete → screenshots\shot_*.bmp
 
 cd /d "%~dp0"
 
@@ -22,14 +22,14 @@ rem main.c already defaults DX11 / present / PB_EXEC / keyboard / FFP_INLINE / e
 rem Only clear a watchdog if a prior drive script left one in this shell.
 set "RECOMP_WATCHDOG_SECS="
 
-rem F12 / PrintScreen dump via existing fb_present RECOMP_FB_SHOT_DIR (BMP).
+rem Delete dumps via fb_present RECOMP_FB_SHOT_DIR (BMP).
 set "RECOMP_FB_SHOT_DIR=%CD%\screenshots"
 if not exist "%RECOMP_FB_SHOT_DIR%" mkdir "%RECOMP_FB_SHOT_DIR%"
 
 echo.
 echo Launching (full intros — no movie skip):
 echo   %EXE%
-echo Screenshots: focus the game window, press F12 or PrintScreen
+echo Screenshots: focus the game window, press Delete
 echo   saves BMP to: %RECOMP_FB_SHOT_DIR%
 echo Logs stay in this window. Close the game window or press Ctrl+C to stop.
 echo.
