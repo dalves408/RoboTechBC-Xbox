@@ -5,11 +5,12 @@ rem Double-click this file from Explorer, or run it from a cmd prompt.
 rem Full boot — logo / intro Binks play (no movie skip).
 rem Screenshots: focus the FB window, press Delete → screenshots\shot_*.bmp
 rem
-rem Controls (FB window must be focused):
+rem Controls (keyboard → pad; works even if the launch console has focus):
 rem   Arrows = D-pad     Enter/Z = A (confirm)     Esc/X = B (back)
 rem   Space = START      Backspace = BACK
 rem   WASD = left stick  IJKL = right stick
 rem   C/V = X/Y          Q/E = White/Black         1/3 = L/R trigger
+rem   Delete = screenshot (FB window). Prefer clicking the game window.
 
 cd /d "%~dp0"
 
@@ -32,6 +33,7 @@ set "RECOMP_PAD_SCRIPT="
 set "RECOMP_PAD_PRESS="
 set "RECOMP_KEY_SCRIPT="
 set "RECOMP_USB_XAPI_TD="
+set "RECOMP_KEYBOARD_FOCUS="
 set "RECOMP_KEYBOARD=1"
 set "RECOMP_USB=1"
 set "RECOMP_USB_PADS=1"
@@ -44,8 +46,9 @@ if not exist "%RECOMP_FB_SHOT_DIR%" mkdir "%RECOMP_FB_SHOT_DIR%"
 echo.
 echo Launching (full intros — no movie skip):
 echo   %EXE%
-echo Controls ^(focus game window^): Arrows=D-pad  Enter/Z=A  Esc/X=B  Space=START
+echo Controls: Arrows=D-pad  Enter/Z=A  Esc/X=B  Space=START
 echo   WASD=left stick  IJKL=right stick  C/V=X/Y  Q/E=White/Black  1/3=triggers
+echo   ^(keyboard works even if this console has focus; click game window preferred^)
 echo Screenshots: Delete → %RECOMP_FB_SHOT_DIR%
 echo Logs stay in this window. Close the game window or press Ctrl+C to stop.
 echo.
