@@ -1,16 +1,13 @@
 @echo off
 setlocal EnableExtensions
 rem Interactive playtest for the current RelWithDebInfo build.
-rem Double-click this file from Explorer, or run it from a cmd prompt.
-rem Full boot — logo / intro Binks play (no movie skip).
-rem Screenshots: focus the FB window, press Delete → screenshots\shot_*.bmp
+rem Double-click from Explorer. Full intros. Delete = screenshot.
 rem
-rem Controls (keyboard → pad; works even if the launch console has focus):
+rem Controls (click the game window first):
 rem   Arrows = D-pad     Enter/Z = A (confirm)     Esc/X = B (back)
 rem   Space = START      Backspace = BACK
 rem   WASD = left stick  IJKL = right stick
 rem   C/V = X/Y          Q/E = White/Black         1/3 = L/R trigger
-rem   Delete = screenshot (FB window). Prefer clicking the game window.
 
 cd /d "%~dp0"
 
@@ -22,24 +19,46 @@ if not exist "%EXE%" (
     exit /b 1
 )
 
-rem If an earlier bring-up pass stashed logos/intros, put them back so boot is complete.
+rem Keep bak OHCI linked. Shared toolkit ohci.c often drifts to XAPI_TD WIP
+rem (empty interrupt EDs / bad freelist). SYNTH_TD crashes this title's ISR.
+set "OHCI=%CD%\tools\xboxrecomp\src\usb\ohci.c"
+set "OHCI_BAK=%CD%\patches\ohci.c.dx11bak"
+if not exist "%OHCI_BAK%" if exist "%CD%\tools\xboxrecomp\src\usb\ohci.c.dx11bak" (
+    if not exist "%CD%\patches" mkdir "%CD%\patches"
+    copy /y "%CD%\tools\xboxrecomp\src\usb\ohci.c.dx11bak" "%OHCI_BAK%" >nul
+)
+if exist "%OHCI%" if exist "%OHCI_BAK%" (
+    fc /b "%OHCI%" "%OHCI_BAK%" >nul 2>&1
+    if errorlevel 1 (
+        echo WARNING: ohci.c drifted from bak — restoring and rebuilding RelWithDebInfo.
+        copy /y "%OHCI_BAK%" "%OHCI%" >nul
+        powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\build.ps1" -Configuration RelWithDebInfo
+        if errorlevel 1 (
+            echo Rebuild failed — interactive controls may stay dead until bak OHCI is linked.
+            pause
+            exit /b 1
+        )
+    )
+)
+
 powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\skip_boot_movies.ps1" -Restore >nul 2>&1
 
-rem main.c defaults DX11 / present / PB_EXEC / etc. Explicit input for interactive play:
-rem keyboard-as-pad + USB pad 0 (bak OHCI). Clear drive-script leftovers.
+rem Clear scripted/drive leftovers.
 set "RECOMP_WATCHDOG_SECS="
 set "RECOMP_PAD_LIVE="
 set "RECOMP_PAD_SCRIPT="
 set "RECOMP_PAD_PRESS="
 set "RECOMP_KEY_SCRIPT="
-set "RECOMP_USB_XAPI_TD="
 set "RECOMP_KEYBOARD_FOCUS="
+set "RECOMP_USB_SYNTH_TD="
+set "RECOMP_USB_XAPI_TD="
+
+rem Live keyboard + USB pad 0 (bak OHCI).
 set "RECOMP_KEYBOARD=1"
 set "RECOMP_USB=1"
 set "RECOMP_USB_PADS=1"
 set "RECOMP_CONTIG_AVOID_IMAGE=1"
 
-rem Delete dumps via fb_present RECOMP_FB_SHOT_DIR (BMP).
 set "RECOMP_FB_SHOT_DIR=%CD%\screenshots"
 if not exist "%RECOMP_FB_SHOT_DIR%" mkdir "%RECOMP_FB_SHOT_DIR%"
 
@@ -47,10 +66,8 @@ echo.
 echo Launching (full intros — no movie skip):
 echo   %EXE%
 echo Controls: Arrows=D-pad  Enter/Z=A  Esc/X=B  Space=START
-echo   WASD=left stick  IJKL=right stick  C/V=X/Y  Q/E=White/Black  1/3=triggers
-echo   ^(keyboard works even if this console has focus; click game window preferred^)
+echo   WASD=left stick  IJKL=right stick — click the GAME window, then press keys
 echo Screenshots: Delete → %RECOMP_FB_SHOT_DIR%
-echo Logs stay in this window. Close the game window or press Ctrl+C to stop.
 echo.
 "%EXE%"
 set "EC=%ERRORLEVEL%"

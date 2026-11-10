@@ -25,6 +25,25 @@ if (-not (Test-Path -LiteralPath $genTypes) -and -not $genAny) {
     throw 'Generate C sources first: .\.venv\Scripts\python.exe scripts\pipeline.py --lift'
 }
 
+# Interactive keyboard-as-pad needs bak OHCI. Shared toolkit ohci.c is often
+# overwritten by the XAPI_TD WIP; pin/reapply before every build.
+$ohci = Join-Path $projectRoot 'tools\xboxrecomp\src\usb\ohci.c'
+$ohciBak = Join-Path $projectRoot 'patches\ohci.c.dx11bak'
+$ohciToolkitBak = Join-Path $projectRoot 'tools\xboxrecomp\src\usb\ohci.c.dx11bak'
+if (-not (Test-Path -LiteralPath $ohciBak) -and (Test-Path -LiteralPath $ohciToolkitBak)) {
+    New-Item -ItemType Directory -Force -Path (Split-Path $ohciBak) | Out-Null
+    Copy-Item -LiteralPath $ohciToolkitBak -Destination $ohciBak -Force
+}
+if ((Test-Path -LiteralPath $ohciBak) -and (Test-Path -LiteralPath $ohci)) {
+    $hLive = (Get-FileHash -LiteralPath $ohci).Hash
+    $hBak = (Get-FileHash -LiteralPath $ohciBak).Hash
+    if ($hLive -ne $hBak) {
+        Write-Host "Reapplying patches\ohci.c.dx11bak over tools/.../ohci.c (WIP drift)."
+        Copy-Item -LiteralPath $ohciBak -Destination $ohci -Force
+        (Get-Item -LiteralPath $ohci).LastWriteTime = Get-Date
+    }
+}
+
 $buildDir = Join-Path $projectRoot 'build'
 $cmakeArgs = @(
     '-S', $projectRoot,
