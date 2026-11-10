@@ -483,6 +483,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         rbx_d3d11_register();
     }
 
+    /* Bat double-click leaves the launch console focused; WM_KEYDOWN then
+     * never reaches the FB window. Raw INPUTSINK + async cover that, and
+     * periodically reclaiming foreground after logos matches CS menu bats. */
+    {
+        extern void (*xbox_fb_tick_hook)(void);
+        extern void rbx_fb_focus_tick(void);
+        xbox_fb_tick_hook = rbx_fb_focus_tick;
+    }
+
     /* Step 7: Call the recompiled entry point */
     printf("\nStarting game...\n");
     fflush(stdout);
@@ -497,6 +506,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     free(xbe_data);
 
     return 0;
+}
+
+/* Periodic FB focus reclaim for bat launches (console often stays foreground). */
+void rbx_fb_focus_tick(void)
+{
+    extern void xbox_FramebufferRaiseFocus(void);
+    static DWORD s_focus_t0;
+    static DWORD s_last;
+    DWORD now = GetTickCount();
+    if (!s_focus_t0)
+        s_focus_t0 = now;
+    if (now - s_focus_t0 >= 120000u)
+        return;
+    if (now - s_last < 3000u)
+        return;
+    s_last = now;
+    xbox_FramebufferRaiseFocus();
 }
 
 /* ── XBE Loading ───────────────────────────────────────────── */
