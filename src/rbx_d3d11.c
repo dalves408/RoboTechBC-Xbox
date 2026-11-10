@@ -54,7 +54,7 @@ typedef struct { float sw, sh, tw, th; uint32_t textured, afunc; float aref; uin
 /* Matches rbx_rc_hlsl.h cbuffer C (b0) for combiner draws. */
 typedef struct {
     float surf[2], zscale, aref;
-    uint32_t atest, afunc, textured, pad0;
+    uint32_t atest, afunc, textured, dbg; /* dbg: 1=V0, 2=solid, 3=T0 */
     float isz[2], pad1[2];
 } RcDrawCb;
 typedef struct {
@@ -251,10 +251,12 @@ static int initialize_combiners(void)
 {
     ID3DBlob *v = NULL, *err = NULL;
     D3D11_BUFFER_DESC bd;
+    /* float4 POSITION packs x,y,z,rhw. Diffuse is TEXCOORD7 (not COLOR): the
+     * COLOR semantic was unread on mission RC draws (T0*V0 → black) while
+     * menus (T0-only) still looked fine. */
     D3D11_INPUT_ELEMENT_DESC e[] = {
-        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,       0,  0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "RHW",      0, DXGI_FORMAT_R32_FLOAT,             0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "COLOR",    0, DXGI_FORMAT_R8G8B8A8_UNORM,        0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT,    0,  0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 7, DXGI_FORMAT_B8G8R8A8_UNORM,        0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,          0, 20, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "TEXCOORD", 1, DXGI_FORMAT_R32G32B32A32_FLOAT,    0, 28, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT,    0, 44, D3D11_INPUT_PER_VERTEX_DATA, 0 },
@@ -273,7 +275,7 @@ static int initialize_combiners(void)
     }
     if (FAILED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(v),
                ID3D10Blob_GetBufferSize(v), NULL, &s_rc_vs))
-     || FAILED(ID3D11Device_CreateInputLayout(s_dev, e, 10, ID3D10Blob_GetBufferPointer(v),
+     || FAILED(ID3D11Device_CreateInputLayout(s_dev, e, 9, ID3D10Blob_GetBufferPointer(v),
                ID3D10Blob_GetBufferSize(v), &s_rc_il))) {
         SAFE_REL(v); SAFE_REL(s_rc_vs); SAFE_REL(s_rc_il); return 0;
     }
@@ -1383,6 +1385,23 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
             }
         }
         dst[kept] = v[0]; dst[kept + 1] = v[1]; dst[kept + 2] = v[2];
+        /* Stage1 often samples with oT1; if the VSH left t1 at 0, reuse t0 so
+         * the 0919390C T1-blend does not hit opaque black at UV(0,0). */
+        if (b->combiner) {
+            unsigned k;
+            for (k = 0; k < 3; k++) {
+                float *t0 = dst[kept + k].tex[0], *t1 = dst[kept + k].tex[1];
+                uint32_t d = dst[kept + k].diffuse;
+                if (fabsf(t1[0]) + fabsf(t1[1]) + fabsf(t1[2]) < 1e-6f
+                    && fabsf(t0[0]) + fabsf(t0[1]) + fabsf(t0[2]) > 1e-6f)
+                    memcpy(t1, t0, sizeof dst[0].tex[0]);
+                /* Pack D3DCOLOR into d1 as float RGBA for the RC VS (V0). */
+                dst[kept + k].d1[0] = ((d >> 16) & 255u) / 255.0f;
+                dst[kept + k].d1[1] = ((d >> 8) & 255u) / 255.0f;
+                dst[kept + k].d1[2] = (d & 255u) / 255.0f;
+                dst[kept + k].d1[3] = ((d >> 24) & 255u) / 255.0f;
+            }
+        }
         kept += 3;
     }
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
@@ -1401,6 +1420,51 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
             RcParams rc;
             RcDrawCb rcb;
             const Nv2aCombiner *c = b->combiner;
+            /* Snapshot: batch.combiner points at the live PB state. */
+            Nv2aCombiner c_local = *c;
+            c = &c_local;
+            /* Stage1 ic1=0919390C is lerp(R0,T1,T1.a). With oT1==0 that samples
+             * opaque black at UV(0,0) and kills the fill. Skip stage1 when the
+             * batch's original oT1 is ~zero (before t1←t0 reuse), or RC1SKIP=1. */
+            { static int rc1skip = -1, rc1fix = 0;
+              int t1_zero = 1;
+              unsigned k;
+              if (rc1skip < 0) rc1skip = getenv("RECOMP_GPU_RC1SKIP") != NULL;
+              for (k = 0; k < b->count; k++) {
+                  const float *t1 = b->vertices[k].tex[1];
+                  if (fabsf(t1[0]) + fabsf(t1[1]) + fabsf(t1[2]) > 1e-5f) { t1_zero = 0; break; }
+              }
+              if ((c_local.control & 255u) >= 2u
+                  && c_local.color_icw[1] == 0x0919390Cu
+                  && (rc1skip || t1_zero)) {
+                  c_local.control = (c_local.control & ~255u) | 1u;
+                  c_local.stage_program = c_local.stage_program & 31u;
+                  if (rc1fix < 12) {
+                      fprintf(stderr, "[RBX DX11] RC stage1 skip (ic1=0919390C t1_zero=%d env=%d) n=%u\n",
+                              t1_zero, rc1skip, kept);
+                      rc1fix++;
+                  }
+              } }
+            /* Cel-outline / black-V0 pass (ic0=00002004) redraws the same mesh
+             * in black after the lit pass and paints Ch1 near-black. Skip by
+             * default; RECOMP_GPU_SKIPBLACK=0 restores the hardware pass. */
+            { static int skipblk = -1, nblk;
+              if (skipblk < 0) {
+                  const char *e = getenv("RECOMP_GPU_SKIPBLACK");
+                  skipblk = !(e && e[0] == '0');
+              }
+              if (skipblk && c_local.color_icw[0] == 0x00002004u) {
+                  uint32_t k, dmax = 0;
+                  for (k = 0; k < kept; k++) {
+                      uint32_t d = dst[k].diffuse & 0x00FFFFFFu;
+                      if (d > dmax) dmax = d;
+                  }
+                  if (dmax == 0) {
+                      if (nblk++ < 12)
+                          fprintf(stderr, "[RBX DX11] skip black-V0 pass n=%u\n", kept);
+                      return;
+                  }
+              } }
             if (!initialize_combiners() || !(s_rc_ps = combiner_shader(c)))
                 use_rc = 0;
             else {
@@ -1449,6 +1513,13 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
                 rcb.afunc = r->alpha_func >= 0x200 ? r->alpha_func - 0x200 : r->alpha_func;
                 { static int na = -1; if (na < 0) na = getenv("RECOMP_GPU_NOATEST") != NULL;
                   if (na && s_frame >= 450) { rcb.atest = 0; rcb.afunc = 8; } }
+                { static int rcdbg = -1;
+                  if (rcdbg < 0) {
+                      const char *e = getenv("RECOMP_GPU_RCDBG");
+                      rcdbg = e ? atoi(e) : 0;
+                  }
+                  if (rcdbg && s_frame >= 450) rcb.dbg = (uint32_t)rcdbg;
+                }
                 rcb.textured = bound_srv[0] != NULL;
                 cbuf = s_cbr[s_cb_i++ % CB_RING];
                 if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)cbuf, 0,
@@ -1471,13 +1542,16 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
             static unsigned n; const Nv2aVertex *v0 = &b->vertices[0];
             uint32_t dmax = 0, k;
             float umin = 1e9f, umax = -1e9f, vmin = 1e9f, vmax = -1e9f, wmin = 1e9f, wmax = -1e9f;
+            float u1min = 1e9f, u1max = -1e9f, v1min = 1e9f, v1max = -1e9f;
             for (k = 0; k < kept; k++) {
                 uint32_t d = b->vertices[k].diffuse & 0x00FFFFFFu;
-                const float *t = b->vertices[k].tex[0];
+                const float *t = b->vertices[k].tex[0], *t1 = b->vertices[k].tex[1];
                 if (d > dmax) dmax = d;
                 if (t[0] < umin) umin = t[0]; if (t[0] > umax) umax = t[0];
                 if (t[1] < vmin) vmin = t[1]; if (t[1] > vmax) vmax = t[1];
                 if (t[3] < wmin) wmin = t[3]; if (t[3] > wmax) wmax = t[3];
+                if (t1[0] < u1min) u1min = t1[0]; if (t1[0] > u1max) u1max = t1[0];
+                if (t1[1] < v1min) v1min = t1[1]; if (t1[1] > v1max) v1max = t1[1];
             }
             if (n++ < 400) {
                 uint32_t sp = 0, f0 = 0, f1 = 0, fmt = 0, ctl = 0;
@@ -1491,25 +1565,29 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
                     ai0 = mc->alpha_icw[0]; ai1 = mc->alpha_icw[1];
                     ao0 = mc->alpha_ocw[0]; ao1 = mc->alpha_ocw[1];
                 }
-                /* Prefer 2-stage / large draws after the first 80 UI samples. */
-                int skip_ui = (n > 80 && use_rc && b->combiner
-                    && (b->combiner->stage_program & ~0x1Fu) == 0 && kept < 24 && n < 350);
+                /* Prefer 2-stage / large draws; always keep 2-stage samples. */
+                int is2 = use_rc && b->combiner && (b->combiner->stage_program & ~0x1Fu) != 0;
+                int skip_ui = (!is2 && n > 80 && use_rc && b->combiner
+                    && kept < 24 && n < 350);
                 if (!skip_ui) {
                 if (use_rc && b->stages && (b->stage_valid & 1))
                     fmt = b->stages[0].color;
                 fprintf(stderr, "[MISSDIFF] f%u rc=%d n=%u rt=%08X %ux%u c0=%08X dmax=%06X "
-                        "uv0=[%.3f..%.3f],[%.3f..%.3f] q=[%.3f..%.3f] sp=%08X ctl=%08X "
+                        "uv0=[%.3f..%.3f],[%.3f..%.3f] q=[%.3f..%.3f] "
+                        "uv1=[%.3f..%.3f],[%.3f..%.3f] sp=%08X ctl=%08X "
                         "ic=%08X/%08X oc=%08X/%08X ai=%08X/%08X ao=%08X/%08X fin=%08X/%08X "
-                        "tex=%s off=%08X fmt=%02X bl=%u %X/%X at=%u/%X/%u dt=%u cm=%08X\n",
+                        "tex=%s off=%08X/%08X fmt=%02X bl=%u %X/%X at=%u/%X/%u dt=%u cm=%08X sv=%X\n",
                         s_frame, use_rc, kept, s->color_va, s->width, s->height, v0->diffuse,
-                        dmax, umin, umax, vmin, vmax, wmin, wmax, sp, ctl,
+                        dmax, umin, umax, vmin, vmax, wmin, wmax,
+                        u1min, u1max, v1min, v1max, sp, ctl,
                         ic0, ic1, oc0, oc1, ai0, ai1, ao0, ao1, f0, f1,
                         (use_rc ? (bound_srv[0] != NULL) : (b->texture != NULL)) ? "Y" : "n",
                         use_rc ? (b->stages && (b->stage_valid & 1) ? b->stages[0].offset : 0)
                                : (b->texture ? b->texture->offset : 0),
+                        use_rc && b->stages && (b->stage_valid & 2) ? b->stages[1].offset : 0,
                         fmt, r->blend_enable, r->blend_src, r->blend_dst,
                         r->alpha_test_enable, r->alpha_func, r->alpha_ref,
-                        r->depth_test_enable, r->color_mask);
+                        r->depth_test_enable, r->color_mask, b->stage_valid);
                 }
             }
           } }
