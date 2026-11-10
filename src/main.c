@@ -328,7 +328,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
              * XAPI's USB interrupt EDs resolve; without this the pad can
              * enumerate (setups OK) but never open interrupt-IN reports. */
             { "RECOMP_CONTIG_AVOID_IMAGE", "1" },
+            /* Transform DrawPrimitiveUP / INLINE_ARRAY world geometry through
+             * the FFP composite matrix (mission meshes). =0 reproduces the
+             * black post-briefing present with huge off-surface coords. */
+            { "RECOMP_FFP_INLINE", "1" },
+            /* GPU raster path (src/rbx_d3d11.c). =0 falls back to CPU PB_EXEC. */
+            { "RECOMP_D3D11", "1" },
+            /* D3D11 swap-chain present beside GDI (gpu_present.c). */
+            { "RECOMP_D3D_PRESENT", "1" },
+            /* CPU-only bring-up: white oD0 when VSH leaves diffuse clear.
+             * With DX11 this washes the mission to white — leave unset. */
         };
+        /* CPU fallback only: force white diffuse when no D3D11 backend. */
+        if ((!getenv("RECOMP_D3D11") || getenv("RECOMP_D3D11")[0] == '0')
+            && !getenv("RECOMP_VSH_DEFAULT_DIFFUSE"))
+            _putenv_s("RECOMP_VSH_DEFAULT_DIFFUSE", "1");
         size_t i;
         for (i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
             if (!getenv(defs[i].name))
@@ -460,6 +474,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * silently inert, and the one diagnostic that tells a hang from slowness
      * does nothing while appearing to be set. */
     xbox_WatchdogStart();
+
+    /* D3D11 Nv2aBackend: GPU-fills decoded batches, readback into guest FB.
+     * Must register before the guest's first KickOff. RECOMP_D3D11=0 skips. */
+    {
+        extern void rbx_d3d11_register(void);
+        rbx_d3d11_register();
+    }
 
     /* Step 7: Call the recompiled entry point */
     printf("\nStarting game...\n");

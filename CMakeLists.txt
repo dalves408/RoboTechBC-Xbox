@@ -33,6 +33,7 @@ file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
+    src/rbx_d3d11.c
 )
 
 add_executable(${PROJECT_NAME} WIN32
@@ -46,10 +47,14 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp
     ${XBOXRECOMP_DIR}/include
+    ${XBOXRECOMP_DIR}/src/kernel
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     d3d11
+    d3dcompiler
+    windowscodecs
+    ole32
     dxgi
     dxguid
     $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>
