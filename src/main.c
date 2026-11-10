@@ -305,6 +305,42 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     printf("=== Robotech Battlecry (Xbox) - Static Recompilation ===\n");
     printf("Loading XBE...\n");
 
+    /* Bring-up defaults (same set RedCard / NHL Hitz use). Without
+     * RECOMP_PB_EXEC the title's D3D pushbuffers never rasterize, so the
+     * framebuffer window stays black after CreateDevice even though KickOff
+     * and fence waits complete (fence mirror alone is not enough). Only fill
+     * gaps the launcher did not already set. */
+    {
+        struct { const char *name; const char *value; } defs[] = {
+            { "RECOMP_PB_EXEC", "1" },
+            { "RECOMP_PB_WALK", "dma" },
+            { "RECOMP_FB_WINDOW", "1" },
+            { "RECOMP_KEYBOARD", "1" },
+            { "RECOMP_USB", "1" },
+            { "RECOMP_FENCE_EXEC", "1" },
+            { "RECOMP_TITLE_KEVENTS", "1" },
+            { "RECOMP_VBLANK", "paced" },
+            { "RECOMP_FLIP_PACING", "edge" },
+            { "RECOMP_HEAP_RECLAIM", "1" },
+            { "RECOMP_AC97_READY", "1" },
+        };
+        size_t i;
+        for (i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
+            if (!getenv(defs[i].name))
+                _putenv_s(defs[i].name, defs[i].value);
+        }
+        /* RECOMP_AC97_READY=0 means "force off": presence gates the APU. */
+        {
+            const char *ac97 = getenv("RECOMP_AC97_READY");
+            if (ac97 && ac97[0] == '0' && ac97[1] == '\0')
+                _putenv_s("RECOMP_AC97_READY", "");
+        }
+        fprintf(stderr, "[BOOT] PB_EXEC=%s FB_WINDOW=%s FENCE_EXEC=%s\n",
+                getenv("RECOMP_PB_EXEC") ? getenv("RECOMP_PB_EXEC") : "(off)",
+                getenv("RECOMP_FB_WINDOW") ? "1" : "(off)",
+                getenv("RECOMP_FENCE_EXEC") ? "1" : "(off)");
+    }
+
     /* Install VEH handler (first handler in chain) */
     /* Load symbols up front rather than from inside the handler: at fault
      * time the process is already in a bad way, and SymInitialize

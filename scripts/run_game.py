@@ -33,6 +33,16 @@ else:
     env.pop("RECOMP_WATCHDOG_SECS", None)
 env.setdefault("RECOMP_PB_REPORT_MS", "3000")
 env.setdefault("RECOMP_KERNEL_LOG_BUDGET", "50")
+# PB_EXEC / FB_WINDOW / etc. are also defaulted inside main.c; keep these
+# here so a launch without rebuilding still gets a visible window.
+env.setdefault("RECOMP_PB_EXEC", "1")
+env.setdefault("RECOMP_PB_WALK", "dma")
+env.setdefault("RECOMP_FB_WINDOW", "1")
+env.setdefault("RECOMP_KEYBOARD", "1")
+env.setdefault("RECOMP_FENCE_EXEC", "1")
+env.setdefault("RECOMP_AC97_READY", "1")
+env.setdefault("RECOMP_HEAP_RECLAIM", "1")
+
 
 logs = root / "analysis"
 logs.mkdir(exist_ok=True)
