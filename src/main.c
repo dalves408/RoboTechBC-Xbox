@@ -39,6 +39,7 @@
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
+#include <ohci.h>
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -323,6 +324,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             { "RECOMP_FLIP_PACING", "edge" },
             { "RECOMP_HEAP_RECLAIM", "1" },
             { "RECOMP_AC97_READY", "1" },
+            /* Keep MmAllocateContiguousMemory out of the loaded image range so
+             * XAPI's USB interrupt EDs resolve; without this the pad can
+             * enumerate (setups OK) but never open interrupt-IN reports. */
+            { "RECOMP_CONTIG_AVOID_IMAGE", "1" },
         };
         size_t i;
         for (i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
@@ -370,6 +375,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     g_xbox_mem_offset = xbox_GetMemoryOffset();
     printf("Xbox memory mapped. Offset: 0x%llX\n", (unsigned long long)g_xbox_mem_offset);
+
+    /* XAPI talks to its controller through the MCPX OHCI registers. The
+     * runtime keeps this model opt-in via RECOMP_USB — without xbox_OhciInit
+     * the MMIO traps never install, so PAD_SCRIPT / PAD_LIVE / keyboard-as-pad
+     * never reach the title (menu stays on A CONFIRM with no presses). */
+    xbox_OhciInit();
 
     /* D3D8 (XDK 4721) stores the device pointer at 0x00166B48. KickOff /
      * BlockOn-style waits compare PUT at +0x30 against *(GET ptr at +0x34).

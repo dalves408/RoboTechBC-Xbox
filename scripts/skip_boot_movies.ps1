@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$Restore
 )
 $ErrorActionPreference = 'Stop'
@@ -9,7 +9,10 @@ $files = @(
     'TDK Logo.bik',
     'Harmony Logo.bik',
     'VC Logo.bik',
-    'Intro.bik'
+    'Intro.bik',
+    # Mission briefing / chapter Binks — skip for gameplay bring-up so NEW GAME
+    # can reach m101_f.lvl without a long software decode of m100.bik.
+    'm100.bik'
 )
 if ($Restore) {
     foreach ($f in $files) {
