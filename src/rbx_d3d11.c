@@ -37,7 +37,7 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 #define MAX_TEX  768
 #define VB_BYTES (8u * 1024u * 1024u)
 
-typedef struct { uint32_t va, w, h, bpp, pitch, dirty, used;
+typedef struct { uint32_t va, w, h, bpp, pitch, dirty, used, aa_sx, aa_sy;
                  ID3D11Texture2D *tex, *stage; ID3D11RenderTargetView *rtv; ID3D11ShaderResourceView *srv; uint32_t sampled;
                  /* deferred readback: the copy queued at the last flip (pstage, one of stage/stage2) and where it goes */
                  ID3D11Texture2D *stage2, *pstage; int pend; uint32_t pva, pw, ph, ppitch, pbpp;
@@ -431,6 +431,7 @@ static Rt *get_rt(const Nv2aSurface *s)
     for (i = 0; i < MAX_RT; i++) {
         if (s_rt[i].tex && s_rt[i].va == s->color_va && s_rt[i].w == w && s_rt[i].h == h) {
             s_rt[i].used = s_tick; s_rt[i].pitch = s->pitch; s_rt[i].bpp = s->bytes_per_pixel;
+            s_rt[i].aa_sx = s->aa_sx ? s->aa_sx : 1; s_rt[i].aa_sy = s->aa_sy ? s->aa_sy : 1;
             return &s_rt[i];
         }
         if (!s_rt[i].tex && free_i < 0) free_i = i;
@@ -459,6 +460,7 @@ static Rt *get_rt(const Nv2aSurface *s)
     if (!s_rb_sync) ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_rt[free_i].stage2);
     s_rt[free_i].va = s->color_va; s_rt[free_i].w = w; s_rt[free_i].h = h;
     s_rt[free_i].pitch = s->pitch; s_rt[free_i].bpp = s->bytes_per_pixel; s_rt[free_i].used = s_tick; s_rt[free_i].dirty = 0;
+    s_rt[free_i].aa_sx = s->aa_sx ? s->aa_sx : 1; s_rt[free_i].aa_sy = s->aa_sy ? s->aa_sy : 1;
     s_rt[free_i].shown_dirty = 0;
     if (s_resets) rt_seed_from_guest(&s_rt[free_i], s);
     if (s_verbose || getenv("RECOMP_GPU_LOGRT"))
@@ -1048,6 +1050,21 @@ decode:
         unsigned q0 = qpc_us(), q1;
         if (!argb) return s_white_srv;
         if (!nv2a_backend_decode_texture(t, argb)) { fprintf(stderr, "[GPUTR] decode FAILED fmt=%02X %ux%u\n", t->color, t->width, t->height); free(argb); e->tex = NULL; return s_white_srv; }
+        { static int tm = -1; static unsigned tn;
+          if (tm < 0) tm = getenv("RECOMP_GPU_TEXMEAN") != NULL;
+          if (tm && tn < 80 && t->width >= 32 && t->color != 0x1E) {
+              size_t np = (size_t)t->width * t->height, i; unsigned long long sum = 0;
+              unsigned a0 = 0;
+              for (i = 0; i < np; i++) {
+                  uint32_t p = argb[i];
+                  sum += (p & 255u) + ((p >> 8) & 255u) + ((p >> 16) & 255u);
+                  if ((p >> 24) == 0) a0++;
+              }
+              tn++;
+              fprintf(stderr, "[TEXMEAN] f%u off=%08X %ux%u fmt=%02X meanRGB=%.1f a0=%u%%\n",
+                      s_frame, t->offset, t->width, t->height, t->color,
+                      (double)sum / (double)(np * 3ull), (unsigned)(a0 * 100ull / np));
+          } }
         q1 = qpc_us(); st_dec_us += q1 - q0;
         /* A slot rewritten this often is a sprite sheet, which no pack can hold: not worth hashing every version. */
         if (s_hires && e->redecodes < 64 && rbx_pack_count() && pack_make(pixel_hash(argb, t->width, t->height), alpha_hash(argb, t->width, t->height), e)) { free(argb); e->from_pack = 1; goto made; }
@@ -1373,6 +1390,7 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
 
     {
         int use_rc = b->combiner != NULL;
+        int force_white = 0;
         ID3D11ShaderResourceView *bound_srv[4] = { 0, 0, 0, 0 };
         ID3D11SamplerState *bound_smp[4] = { 0, 0, 0, 0 };
         ID3D11Buffer *cbuf;
@@ -1399,11 +1417,15 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
                     if (st) {
                         int normalized = d3d8_format_is_swizzled(st->color)
                                       || d3d8_format_dxt_block_bytes(st->color);
+                        static int whitetex = -1;
+                        if (whitetex < 0)
+                            whitetex = getenv("RECOMP_GPU_WHITETEX") != NULL;
                         bound_srv[stage] = get_tex(st);
                         bound_smp[stage] = get_sampler(st);
                         rc.uvs[stage][0] = normalized ? 1.0f : 1.0f / (float)st->width;
                         rc.uvs[stage][1] = normalized ? 1.0f : 1.0f / (float)st->height;
-                        rc.uvs[stage][2] = 1.0f;
+                        /* uvs.z==0 → ps_rc substitutes white (texture-vs-combiner probe). */
+                        rc.uvs[stage][2] = whitetex ? 0.0f : 1.0f;
                     }
                 }
                 for (stage = 0; stage < 8; stage++) {
@@ -1425,6 +1447,8 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
                 rcb.aref = (float)(r->alpha_ref & 0xFF);
                 rcb.atest = r->alpha_test_enable;
                 rcb.afunc = r->alpha_func >= 0x200 ? r->alpha_func - 0x200 : r->alpha_func;
+                { static int na = -1; if (na < 0) na = getenv("RECOMP_GPU_NOATEST") != NULL;
+                  if (na && s_frame >= 450) { rcb.atest = 0; rcb.afunc = 8; } }
                 rcb.textured = bound_srv[0] != NULL;
                 cbuf = s_cbr[s_cb_i++ % CB_RING];
                 if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)cbuf, 0,
@@ -1441,23 +1465,76 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
             }
         }
 
-        /* Mission lighting audit: RECOMP_GPU_MISSDIFF=1. f>=450 is past Ch1
-         * briefing CONTINUE (mission mean drops ~1.6); log 150 draws there. */
+        /* Mission lighting audit: RECOMP_GPU_MISSDIFF=1. f>=450 ≈ Ch1 after CONTINUE. */
         { static int md = -1; if (md < 0) md = getenv("RECOMP_GPU_MISSDIFF") != NULL;
           if (md && s_frame >= 450) {
             static unsigned n; const Nv2aVertex *v0 = &b->vertices[0];
             uint32_t dmax = 0, k;
+            float umin = 1e9f, umax = -1e9f, vmin = 1e9f, vmax = -1e9f, wmin = 1e9f, wmax = -1e9f;
             for (k = 0; k < kept; k++) {
                 uint32_t d = b->vertices[k].diffuse & 0x00FFFFFFu;
+                const float *t = b->vertices[k].tex[0];
                 if (d > dmax) dmax = d;
+                if (t[0] < umin) umin = t[0]; if (t[0] > umax) umax = t[0];
+                if (t[1] < vmin) vmin = t[1]; if (t[1] > vmax) vmax = t[1];
+                if (t[3] < wmin) wmin = t[3]; if (t[3] > wmax) wmax = t[3];
             }
-            if (n++ < 150)
-                fprintf(stderr, "[MISSDIFF] f%u rc=%d n=%u rt=%08X %ux%u c0=%08X dmaxRGB=%06X d1=(%.2f,%.2f,%.2f) tex=%s off=%08X\n",
+            if (n++ < 400) {
+                uint32_t sp = 0, f0 = 0, f1 = 0, fmt = 0, ctl = 0;
+                uint32_t ic0 = 0, ic1 = 0, oc0 = 0, oc1 = 0, ai0 = 0, ai1 = 0, ao0 = 0, ao1 = 0;
+                if (use_rc && b->combiner) {
+                    const Nv2aCombiner *mc = b->combiner;
+                    sp = mc->stage_program; ctl = mc->control;
+                    f0 = mc->final0; f1 = mc->final1;
+                    ic0 = mc->color_icw[0]; ic1 = mc->color_icw[1];
+                    oc0 = mc->color_ocw[0]; oc1 = mc->color_ocw[1];
+                    ai0 = mc->alpha_icw[0]; ai1 = mc->alpha_icw[1];
+                    ao0 = mc->alpha_ocw[0]; ao1 = mc->alpha_ocw[1];
+                }
+                /* Prefer 2-stage / large draws after the first 80 UI samples. */
+                int skip_ui = (n > 80 && use_rc && b->combiner
+                    && (b->combiner->stage_program & ~0x1Fu) == 0 && kept < 24 && n < 350);
+                if (!skip_ui) {
+                if (use_rc && b->stages && (b->stage_valid & 1))
+                    fmt = b->stages[0].color;
+                fprintf(stderr, "[MISSDIFF] f%u rc=%d n=%u rt=%08X %ux%u c0=%08X dmax=%06X "
+                        "uv0=[%.3f..%.3f],[%.3f..%.3f] q=[%.3f..%.3f] sp=%08X ctl=%08X "
+                        "ic=%08X/%08X oc=%08X/%08X ai=%08X/%08X ao=%08X/%08X fin=%08X/%08X "
+                        "tex=%s off=%08X fmt=%02X bl=%u %X/%X at=%u/%X/%u dt=%u cm=%08X\n",
                         s_frame, use_rc, kept, s->color_va, s->width, s->height, v0->diffuse,
-                        dmax, v0->d1[0], v0->d1[1], v0->d1[2],
+                        dmax, umin, umax, vmin, vmax, wmin, wmax, sp, ctl,
+                        ic0, ic1, oc0, oc1, ai0, ai1, ao0, ao1, f0, f1,
                         (use_rc ? (bound_srv[0] != NULL) : (b->texture != NULL)) ? "Y" : "n",
                         use_rc ? (b->stages && (b->stage_valid & 1) ? b->stages[0].offset : 0)
-                               : (b->texture ? b->texture->offset : 0));
+                               : (b->texture ? b->texture->offset : 0),
+                        fmt, r->blend_enable, r->blend_src, r->blend_dst,
+                        r->alpha_test_enable, r->alpha_func, r->alpha_ref,
+                        r->depth_test_enable, r->color_mask);
+                }
+            }
+          } }
+
+        /* RECOMP_GPU_FORCEWHITE=1: mission RC → untextured vertex color + no depth.
+         * RECOMP_GPU_NODEPTH=1: keep combiners, drop depth/stencil only. */
+        { static int fw = -1, nd = -1;
+          if (fw < 0) fw = getenv("RECOMP_GPU_FORCEWHITE") != NULL;
+          if (nd < 0) nd = getenv("RECOMP_GPU_NODEPTH") != NULL;
+          if (s_frame >= 450 && use_rc && fw) {
+            force_white = 1;
+            use_rc = 0;
+            memset(&cb, 0, sizeof cb);
+            cb.sw = (float)s->width; cb.sh = (float)s->height;
+            cb.textured = 0; cb.afunc = 0x208; cb.aref = 0;
+            srv = s_white_srv;
+            { Nv2aTexture dflt; memset(&dflt, 0, sizeof dflt); dflt.addr_u = dflt.addr_v = 3; smp = get_sampler(&dflt); }
+            cbuf = s_cbr[s_cb_i++ % CB_RING];
+            if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)cbuf, 0,
+                           D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+                memcpy(m.pData, &cb, sizeof cb);
+                ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)cbuf, 0);
+            }
+          } else if (s_frame >= 450 && nd) {
+            force_white = 1; /* reuse flag: strip depth only */
           } }
 
         if (!use_rc) {
@@ -1493,7 +1570,7 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
         }
 
         bs = get_blend(r);
-        dss = get_dss(r, ds != NULL);
+        dss = get_dss(r, !force_white && ds != NULL);
         bf[0] = ((r->blend_color >> 16) & 255) / 255.0f; bf[1] = ((r->blend_color >> 8) & 255) / 255.0f;
         bf[2] = (r->blend_color & 255) / 255.0f; bf[3] = ((r->blend_color >> 24) & 255) / 255.0f;
         rtv = rt->rtv;
@@ -1525,7 +1602,8 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
         } else {
             sf_flush();
         }
-        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rtv, layer_draw ? s_sf_dsv : (ds ? ds->dsv : NULL));
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rtv,
+            layer_draw ? s_sf_dsv : (!force_white && ds ? ds->dsv : NULL));
         ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
         ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss, r->stencil_ref & 0xFF);
         ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
@@ -1628,6 +1706,7 @@ static void readback_finish(Rt *rt)
  * on its own clock, so the display never holds up the game. If sharing fails, the window keeps showing guest memory. */
 extern volatile uint32_t g_nv2a_flip_va;
 extern void gpu_present_set_source(void *shared_handle, uint32_t width, uint32_t height);
+extern void gpu_present_set_display_size(uint32_t width, uint32_t height);
 extern void gpu_present_frame_ready(void);
 extern void mvc2_overlay_flip_wait(void);
 static ID3D11Texture2D *s_share;
@@ -1677,6 +1756,14 @@ static void publish_frame(void)
             s_share_w = w; s_share_h = h;
             gpu_present_set_source(handle, w, h);
             s_share_on = 1;
+        }
+        /* Always refresh logical aspect: AA 1280×480 must letterbox as 640×480 (4:3). */
+        {
+            uint32_t ax = rt->aa_sx ? rt->aa_sx : 1, ay = rt->aa_sy ? rt->aa_sy : 1;
+            uint32_t dw = (rt->w / ax) * (uint32_t)s_scale, dh = (rt->h / ay) * (uint32_t)s_scale;
+            if (!dw) dw = 640;
+            if (!dh) dh = 480;
+            gpu_present_set_display_size(dw, dh);
         }
     }
     if (FAILED(IDXGIKeyedMutex_AcquireSync(s_share_mutex, 0, 4))) return;   /* the window has it: the next flip's frame */
