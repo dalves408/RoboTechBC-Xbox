@@ -49,6 +49,9 @@ game_files/
 analysis/*.log
 analysis/disc_manifest.json
 
+# Interactive playtest screenshots (F12 / PrintScreen via test_game.bat)
+screenshots/
+
 # IDE / OS
 .vscode/
 .idea/
