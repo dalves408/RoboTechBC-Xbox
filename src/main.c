@@ -318,6 +318,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             { "RECOMP_FB_WINDOW", "1" },
             { "RECOMP_KEYBOARD", "1" },
             { "RECOMP_USB", "1" },
+            /* Stable USB pad 0 for interactive keyboard-as-pad (avoid hot-plug AV). */
+            { "RECOMP_USB_PADS", "1" },
             { "RECOMP_FENCE_EXEC", "1" },
             { "RECOMP_TITLE_KEVENTS", "1" },
             { "RECOMP_VBLANK", "paced" },
