@@ -51,7 +51,10 @@ set "RECOMP_INPUT_DIAG=1"
 set "RECOMP_KEY_TRACE=1"
 set "RECOMP_USB_STATS=1"
 
-rem Clear CS/drive leftovers that break this title (SYNTH crashes; XAPI_TD freelist wrong).
+rem SYNTH_TD=1 crashes this title's XAPI ISR (NextTD→0x7FFFFFFF) the moment
+rem the interrupt ED appears — leaving reports=0 forever if you quit early,
+rem or a hard fault if you wait. XAPI queues real TDs itself on bak OHCI.
+rem Do NOT set XAPI_TD — freelist address is wrong for this title.
 set "RECOMP_USB_SYNTH_TD="
 set "RECOMP_USB_XAPI_TD="
 set "RECOMP_PAD_SCRIPT="
@@ -79,8 +82,9 @@ echo    Space      START ^(skip intro / Attract^)
 echo    WASD       left stick
 echo    Delete     Screenshot -^> %RECOMP_FB_SHOT_DIR%\shot_*.bmp
 echo.
-echo  Enter/Space/Z skips the current Bink/Attract ^(retail-style^).
-echo  Keys work even if this console keeps focus.
+echo  Enter/Space/Z skips Bink/Attract once the pad is open ^(~20-40s in^).
+echo  Keys work even if this console keeps focus ^(raw + async^).
+echo  Wait through logos until the title menu — do not close early.
 echo  EXE: %EXE%
 echo  Log: %RECOMP_ERR_LOG%
 echo.
