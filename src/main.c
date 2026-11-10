@@ -339,10 +339,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             /* CPU-only bring-up: white oD0 when VSH leaves diffuse clear.
              * With DX11 this washes the mission to white — leave unset. */
         };
-        /* CPU fallback only: force white diffuse when no D3D11 backend. */
-        if ((!getenv("RECOMP_D3D11") || getenv("RECOMP_D3D11")[0] == '0')
-            && !getenv("RECOMP_VSH_DEFAULT_DIFFUSE"))
-            _putenv_s("RECOMP_VSH_DEFAULT_DIFFUSE", "1");
+        /* Diffuse defaulting: CPU path needs white oD0 (else mission TEX*0 =
+         * black). DX11 RC substitutes white in vs_rc when rgb is clear; the
+         * executor-wide default whites out untextured overlays under RC. */
+        if (!getenv("RECOMP_VSH_DEFAULT_DIFFUSE")) {
+            const char *d3d = getenv("RECOMP_D3D11");
+            int dx11 = !d3d || d3d[0] != '0';
+            _putenv_s("RECOMP_VSH_DEFAULT_DIFFUSE", dx11 ? "0" : "1");
+        }
         size_t i;
         for (i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
             if (!getenv(defs[i].name))

@@ -47,6 +47,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp
     ${XBOXRECOMP_DIR}/include
+    ${XBOXRECOMP_DIR}/src
     ${XBOXRECOMP_DIR}/src/kernel
 )
 
