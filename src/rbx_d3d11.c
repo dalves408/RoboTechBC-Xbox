@@ -1466,22 +1466,28 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
         }
         kept += 3;
     }
-    /* SKIPBLACK must read dst before Unmap. */
+    /* SKIPBLACK must read dst before Unmap.
+     * Mission VSH does `MOV oD0, c[100]`: lit passes load c[100]=white, cel
+     * outline / darken passes load c[100]=black (often with a no-oT0 program).
+     * Any all-black-V0 RC batch only paints black over the lit fill — skip it
+     * for every combiner, not only ic0=00002004. RECOMP_GPU_SKIPBLACK=0 keeps
+     * the hardware passes. */
     if (kept && b->combiner) {
         static int skipblk = -1, nblk;
         if (skipblk < 0) {
             const char *e = getenv("RECOMP_GPU_SKIPBLACK");
             skipblk = !(e && e[0] == '0');
         }
-        if (skipblk && b->combiner->color_icw[0] == 0x00002004u) {
+        if (skipblk) {
             uint32_t k, dmax = 0;
             for (k = 0; k < kept; k++) {
                 uint32_t d = dst[k].diffuse & 0x00FFFFFFu;
                 if (d > dmax) dmax = d;
             }
             if (dmax == 0) {
-                if (nblk++ < 12)
-                    fprintf(stderr, "[RBX DX11] skip black-V0 pass n=%u\n", kept);
+                if (nblk++ < 24)
+                    fprintf(stderr, "[RBX DX11] skip black-V0 pass n=%u ic0=%08X\n",
+                            kept, b->combiner->color_icw[0]);
                 ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
                 if (packed_ext && s_xvb)
                     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_xvb, 0);
