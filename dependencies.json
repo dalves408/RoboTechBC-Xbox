@@ -1,0 +1,17 @@
+{
+  "xboxrecomp": {
+    "url": "https://github.com/sp00nznet/xboxrecomp.git",
+    "commit": "f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b",
+    "note": "the build PC uses the shared checkout at <tools>\\tools\\xboxrecomp (v0.16.0). Junctioned into tools/xboxrecomp."
+  },
+  "xbox-debug-kit": {
+    "url": "https://github.com/dalves408/Xbox-Debug-Kit.git",
+    "note": "Junctioned from <tools>\\Xbox-Debug-Kit when present."
+  },
+  "extract-xiso": {
+    "path": "<tools>\\tools\\xiso\\artifacts\\extract-xiso.exe",
+    "version": "2.7.1"
+  },
+  "capstone": "5.0.9",
+  "psutil": "7.2.2"
+}
