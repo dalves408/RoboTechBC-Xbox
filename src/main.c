@@ -324,6 +324,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
              * fences while the cinematic walker crawled (~draws freeze at
              * 331). Opt in once HUD flight is solid. */
             { "RECOMP_FENCE_EXEC", "0" },
+            /* Clear leaked DISPATCH depth (guest ret 0) so GPU/OHCI IRQs
+             * are not held off for the whole cinematic. */
+            { "RECOMP_IRQL_UNSTICK", "1" },
             { "RECOMP_TITLE_KEVENTS", "1" },
             { "RECOMP_VBLANK", "paced" },
             /* edge + slow mission frames held FLIP_STALL (no PFB ack) so

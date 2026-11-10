@@ -1040,7 +1040,10 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
                     hc->reg[HcInterruptStatus / 4], xbox_IrqlRaisedCount());
             /* CS Xbox: IRQL stuck at depth 1 with empty interrupt EDs.
              * Periodically clear the leak so WDH/SF can land. */
-            if (total == 0 && xbox_IrqlRaisedCount() > 0)
+            /* RBX-17: also clear when pad reports flow — Ch1 soft-hang left
+             * depth=1 for 1.5s+ while OHCI totals climbed, so total==0 never
+             * ran and D3D waits on GPU IRQs starved. */
+            if (xbox_IrqlRaisedCount() > 0)
                 xbox_IrqlUnstick();
             {
                 uint32_t c = hc->reg[HcControlHeadED / 4] & ED_PTR_MASK;
