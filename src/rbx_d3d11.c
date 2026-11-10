@@ -1441,6 +1441,25 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
             }
         }
 
+        /* Mission lighting audit: RECOMP_GPU_MISSDIFF=1. f>=450 is past Ch1
+         * briefing CONTINUE (mission mean drops ~1.6); log 150 draws there. */
+        { static int md = -1; if (md < 0) md = getenv("RECOMP_GPU_MISSDIFF") != NULL;
+          if (md && s_frame >= 450) {
+            static unsigned n; const Nv2aVertex *v0 = &b->vertices[0];
+            uint32_t dmax = 0, k;
+            for (k = 0; k < kept; k++) {
+                uint32_t d = b->vertices[k].diffuse & 0x00FFFFFFu;
+                if (d > dmax) dmax = d;
+            }
+            if (n++ < 150)
+                fprintf(stderr, "[MISSDIFF] f%u rc=%d n=%u rt=%08X %ux%u c0=%08X dmaxRGB=%06X d1=(%.2f,%.2f,%.2f) tex=%s off=%08X\n",
+                        s_frame, use_rc, kept, s->color_va, s->width, s->height, v0->diffuse,
+                        dmax, v0->d1[0], v0->d1[1], v0->d1[2],
+                        (use_rc ? (bound_srv[0] != NULL) : (b->texture != NULL)) ? "Y" : "n",
+                        use_rc ? (b->stages && (b->stage_valid & 1) ? b->stages[0].offset : 0)
+                               : (b->texture ? b->texture->offset : 0));
+          } }
+
         if (!use_rc) {
             memset(&cb, 0, sizeof cb);
             cb.sw = (float)s->width; cb.sh = (float)s->height;
