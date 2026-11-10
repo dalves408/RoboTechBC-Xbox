@@ -28,6 +28,26 @@ set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/xboxrecomp" CACHE PATH
 
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
+# Interactive pad input for this title requires bak OHCI. Shared toolkit
+# ohci.c is frequently overwritten by XAPI_TD WIP (empty interrupt EDs /
+# bad freelist). Compile a project-pinned copy and drop the live file.
+set(_RBX_OHCI_BAK "${CMAKE_CURRENT_SOURCE_DIR}/patches/ohci.c.dx11bak")
+set(_RBX_OHCI_PIN "${CMAKE_CURRENT_SOURCE_DIR}/patches/ohci_rbx_pinned.c")
+if(EXISTS "${_RBX_OHCI_BAK}" AND TARGET xbox_usb)
+    configure_file("${_RBX_OHCI_BAK}" "${_RBX_OHCI_PIN}" COPYONLY)
+    get_target_property(_USB_SOURCES xbox_usb SOURCES)
+    set(_USB_FILTERED "")
+    foreach(_s IN LISTS _USB_SOURCES)
+        get_filename_component(_sn "${_s}" NAME)
+        if(NOT _sn STREQUAL "ohci.c")
+            list(APPEND _USB_FILTERED "${_s}")
+        endif()
+    endforeach()
+    set_property(TARGET xbox_usb PROPERTY SOURCES ${_USB_FILTERED})
+    target_sources(xbox_usb PRIVATE "${_RBX_OHCI_PIN}")
+    message(STATUS "Robotech: linking pinned bak OHCI (${_RBX_OHCI_PIN})")
+endif()
+
 file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 
 set(GAME_SOURCES
