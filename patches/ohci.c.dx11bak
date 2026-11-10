@@ -183,6 +183,7 @@ static int s_device_hc;
 static unsigned s_ndp = OHCI_PORTS;
 static int s_npads = 1;          /* RECOMP_USB_PADS */
 static int s_auto_pads = 1;      /* RECOMP_USB_PADS unset: pads 2-4 follow the host controllers (hot-plug) */
+static int s_synth_inflight;     /* SYNTH work TD on done queue until WDH ACK */
 static int s_enabled;
 static int s_trace;
 
@@ -280,6 +281,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
             if (hcca)
                 wr32(hcca + HCCA_DONE_HEAD, 0);
             hc->reg[HcDoneHead / 4] = 0;
+            s_synth_inflight = 0; /* work TD free to re-arm */
         }
         *r &= ~v;                       /* write 1 to clear                 */
         hc->ack_seq++;
@@ -872,13 +874,19 @@ static uint32_t s_synth_tail_td;
 static uint32_t s_synth_buf;
 static int s_synth_ready;
 static int s_synth_enabled = -1;
+/* s_synth_inflight: declared with the other controller statics — work TD is
+ * on HccaDoneHead until the driver ACKs WDH. Re-arming the same node while
+ * XAPI still walks that list overwrote NextTD mid-walk and crashed Robotech
+ * (guest read 0x7FFFFFFF). Stay idle until WDH clears. */
 
 static void ohci_synth_td_init(void)
 {
     if (s_synth_enabled < 0) {
         const char *e = getenv("RECOMP_USB_SYNTH_TD");
-        /* Opt-in: completing synthetic TDs onto the done queue crashed CS's
-         * XAPI ISR (walked NextTD into 0x7FFFFFFF). Keep off unless set. */
+        /* Opt-in: older builds re-armed the work TD onto the ED while it was
+         * still on the done queue and crashed XAPI (NextTD→0x7FFFFFFF). The
+         * inflight/WDH guard below makes this safe for Robotech; CS keeps it
+         * off and uses RECOMP_USB_XAPI_TD instead. */
         s_synth_enabled = (e && e[0] == '1' && !e[1]);
     }
     if (!s_synth_enabled || s_synth_ready)
@@ -905,7 +913,7 @@ static void ohci_synth_td_init(void)
     fflush(stderr);
 }
 
-static void ohci_synth_arm_ed(uint32_t ed, uint32_t ed0)
+static void ohci_synth_arm_ed(OhciController *hc, uint32_t ed, uint32_t ed0)
 {
     uint32_t head, tail;
     uint32_t info;
@@ -922,6 +930,13 @@ static void ohci_synth_arm_ed(uint32_t ed, uint32_t ed0)
         if (dir == 1u || ep == 2u)
             return; /* rumble OUT */
     }
+    /* Done-queue still owned by the driver — do not touch the work TD. */
+    if (s_synth_inflight || (hc->reg[HcInterruptStatus / 4] & INTR_WDH)) {
+        if (!(hc->reg[HcInterruptStatus / 4] & INTR_WDH))
+            s_synth_inflight = 0; /* WDH cleared elsewhere; allow re-arm */
+        else
+            return;
+    }
     head = rd32(ed + 8) & ED_PTR_MASK;
     tail = rd32(ed + 4) & ED_PTR_MASK;
     /* CS: interrupt EDs stay published with Skip set and head==tail forever.
@@ -932,6 +947,11 @@ static void ohci_synth_arm_ed(uint32_t ed, uint32_t ed0)
     }
     if (head != tail && head != 0)
         return; /* driver already has real work */
+    /* Keep the dummy tail's NextTD zero every arm — XAPI may peek at it. */
+    wr32(s_synth_tail_td + 0, 0);
+    wr32(s_synth_tail_td + 4, 0);
+    wr32(s_synth_tail_td + 8, 0);
+    wr32(s_synth_tail_td + 12, 0);
     /* IN TD, bufferRounding, NotAccessed CC (0xF<<28), 20-byte XID report. */
     info = (TD_DP_IN << 19) | TD_ROUNDING | (0xFu << 28);
     wr32(s_synth_work_td + 0, info);
@@ -940,6 +960,7 @@ static void ohci_synth_arm_ed(uint32_t ed, uint32_t ed0)
     wr32(s_synth_work_td + 12, s_synth_buf + 19u);
     wr32(ed + 4, s_synth_tail_td);                 /* TailP */
     wr32(ed + 8, s_synth_work_td);                 /* HeadP */
+    s_synth_inflight = 1;
 }
 
 /* The periodic list for the current frame.
@@ -984,7 +1005,7 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
             uint32_t walk = ed;
             int guard = 0;
             while (walk && guest_ok(walk, 16) && ++guard < 8) {
-                ohci_synth_arm_ed(walk, rd32(walk));
+                ohci_synth_arm_ed(hc, walk, rd32(walk));
                 walk = rd32(walk + 12) & ED_PTR_MASK;
             }
         }

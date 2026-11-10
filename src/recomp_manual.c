@@ -21,6 +21,10 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
+#include <windows.h>
+
+#include "recomp/recomp_types.h"
+#include "xbox_memory_layout.h"
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -41,13 +45,6 @@
 extern volatile uint32_t g_icall_trace[16];
 extern volatile uint32_t g_icall_trace_idx;
 extern volatile uint64_t g_icall_count;
-
-typedef void (*recomp_func_t)(void);
-
-/* ── Register state (defined in xbox_memory_layout.c) ──────── */
-
-extern uint32_t g_eax;
-extern ptrdiff_t g_xbox_mem_offset;
 
 /* ── Manual function overrides ─────────────────────────────── */
 
@@ -85,17 +82,244 @@ extern ptrdiff_t g_xbox_mem_offset;
  *       g_eax = result;
  *   }
  */
+/* D3D KickOff helpers (Xbox VA in the D3D section).
+ *
+ * KickOff @ 0x155730 sets PFB flush (inline hard-spin at loc_00155774), then
+ * loops on 0x156840 until DMA_GET catches PUT. Sleep(1) on every busy poll
+ * over-yielded (many kicks/frame) and still left GET stuck around flip ~1000
+ * with MAD~0 / draws frozen. Strategy:
+ *   1) Override full KickOff so the inline PFB spin cannot BusyLoop.
+ *   2) Clear PFB ourselves via xbox_Nv2aAckBusyBits (D3D11 owns the work).
+ *   3) Wait on PUT vs channel GET only (skip sticky 0x400700 secondary).
+ *   4) After a short QPC budget, snap GET to PUT so the guest can leave
+ *      KickOff; PB/DX11 continue asynchronously.
+ * Callers PUSH a return address; every override path must g_esp += 4 (or
+ * call the original, which does). */
+extern void sub_00155730(void);
+extern void sub_001556F0(void);
+extern void xbox_Nv2aAckBusyBits(void);
+
+#define RBX_NV2A_USER_DMA_PUT 0x800040u
+#define RBX_NV2A_USER_DMA_GET 0x800044u
+
+static int rbx_d3d_dma_busy(uint32_t device)
+{
+    uint32_t pb, put, get;
+    if (!device)
+        return 0;
+    pb = MEM32(device + 0x23BCu);
+    if (!pb)
+        return 0;
+    put = MEM32(device + 0x2Cu) & 0x0FFFFFFFu;
+    get = MEM32(pb + 0x44u) & 0x0FFFFFFFu;
+    return put != get;
+}
+
+static void rbx_d3d_force_get_catchup(uint32_t device)
+{
+    uint32_t pb, put;
+    volatile uint32_t *hw_put;
+    volatile uint32_t *hw_get;
+    static LONG s_log;
+
+    if (!device)
+        return;
+    pb = MEM32(device + 0x23BCu);
+    put = MEM32(device + 0x2Cu) & 0x0FFFFFFFu;
+    if (pb)
+        MEM32(pb + 0x44u) = put;
+    hw_put = xbox_Nv2aRegPtr(RBX_NV2A_USER_DMA_PUT);
+    hw_get = xbox_Nv2aRegPtr(RBX_NV2A_USER_DMA_GET);
+    if (hw_put && hw_get)
+        *hw_get = *hw_put;
+    if (InterlockedIncrement(&s_log) <= 8) {
+        fprintf(stderr, "[RBX] KickOff GET catch-up put=0x%08X (forced)\n", put);
+        fflush(stderr);
+    }
+}
+
+/* Called from gen KickOff / 0x1556F0 PFB hard-spins (direct calls, not ABI). */
+void rbx_d3d_pfb_spin_yield(void)
+{
+    static LONG s_n;
+    LONG n = InterlockedIncrement(&s_n);
+    xbox_Nv2aKickHint();
+    xbox_Nv2aAckBusyBits();
+    if ((n % 4096) == 1) {
+        fprintf(stderr, "[RBX] PFB spin yield #%ld\n", (long)n);
+        fflush(stderr);
+    }
+    SwitchToThread();
+}
+
+/* Called from gen KickOff when 0x156840 still reports busy after one yield. */
+void rbx_d3d_kick_get_yield(void)
+{
+    uint32_t device = MEM32(0x00166B48u);
+    xbox_Nv2aKickHint();
+    rbx_d3d_force_get_catchup(device);
+    SwitchToThread();
+}
+
+static void rbx_d3d_wait_pfb(uint32_t regs)
+{
+    int spins = 0;
+    xbox_Nv2aKickHint();
+    MEM32(regs + 0x100410u) |= 0x00010000u;
+    while (MEM32(regs + 0x100410u) & 0x00010000u) {
+        xbox_Nv2aKickHint();
+        if (++spins >= 16) {
+            xbox_Nv2aAckBusyBits();
+            break;
+        }
+        YieldProcessor();
+    }
+    if (MEM32(regs + 0x100410u) & 0x00010000u)
+        xbox_Nv2aAckBusyBits();
+}
+
+/* Wait until GET catches PUT, or force catch-up after ~budget_ms. */
+static void rbx_d3d_wait_get(uint32_t device, int budget_ms)
+{
+    LARGE_INTEGER t0, t, freq;
+    int spins = 0;
+
+    if (!rbx_d3d_dma_busy(device))
+        return;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+    for (;;) {
+        xbox_Nv2aKickHint();
+        if (!rbx_d3d_dma_busy(device))
+            return;
+        if (++spins < 512) {
+            YieldProcessor();
+            continue;
+        }
+        spins = 0;
+        SwitchToThread();
+        QueryPerformanceCounter(&t);
+        if ((t.QuadPart - t0.QuadPart) * 1000 >= freq.QuadPart * (LONGLONG)budget_ms) {
+            rbx_d3d_force_get_catchup(device);
+            return;
+        }
+    }
+}
+
+static void rbx_d3d_busy_check_yield(void)
+{
+    uint32_t device = MEM32(0x00166B48u);
+    /* PUT vs channel GET only — original also returns busy when
+     * regs[0x400700] != 0 after GET catches, which can stick forever here. */
+    if (rbx_d3d_dma_busy(device)) {
+        g_eax = 1;
+        xbox_Nv2aKickHint();
+        SwitchToThread();
+    } else {
+        g_eax = 0;
+    }
+    g_esp += 4;
+}
+
+static void rbx_d3d_kick_pfb_yield(void)
+{
+    uint32_t device = MEM32(0x00166B48u);
+    uint32_t regs;
+    if (!device) {
+        sub_001556F0();
+        return;
+    }
+    regs = MEM32(device + 0x23c0u);
+    if (!regs) {
+        sub_001556F0();
+        return;
+    }
+    rbx_d3d_wait_pfb(regs);
+    g_esp += 4;
+}
+
+/* Full KickOff — replaces sub_00155730 so the inline PFB spin yields. */
+static void rbx_d3d_kickoff_yield(void)
+{
+    uint32_t self = g_ecx;
+    uint32_t put;
+    uint32_t flags;
+    uint32_t device;
+    uint32_t regs;
+    uint32_t pb;
+    static LONG s_kick_n;
+    LONG n0 = InterlockedIncrement(&s_kick_n);
+    if (n0 <= 8 || (n0 % 512) == 0) {
+        fprintf(stderr, "[RBX] KickOff enter #%ld ecx=0x%08X\n", (long)n0, self);
+        fflush(stderr);
+    }
+
+    if ((MEM8(self + 8) & 4u) != 0)
+        put = MEM32(self + 0x35Cu);
+    else
+        put = MEM32(self);
+    MEM32(self + 0x2Cu) = put;
+
+    flags = MEM32(self + 8);
+    if (((flags >> 8) & 0x20u) != 0) {
+        /* Rare channel-reset path — keep original (includes esp pop). */
+        g_ecx = self;
+        sub_00155730();
+        return;
+    }
+
+    device = MEM32(0x00166B48u);
+    regs = device ? MEM32(device + 0x23C0u) : 0;
+    if (!regs) {
+        g_ecx = self;
+        sub_00155730();
+        return;
+    }
+    rbx_d3d_wait_pfb(regs);
+
+    pb = MEM32(self + 0x23BCu);
+    MEM32(pb + 0x40u) = put & 0x0FFFFFFFu;
+
+    if (MEM32(0x00166B4Cu) != 0) {
+        uint32_t get0 = pb ? (MEM32(pb + 0x44u) & 0x0FFFFFFFu) : 0;
+        int busy0 = rbx_d3d_dma_busy(self);
+        /* ~4 ms: long enough for a hot ack/walker tick, short enough that a
+         * stuck GET cannot freeze the Ch1 cinematic for minutes. */
+        rbx_d3d_wait_get(self, 4);
+        if ((n0 % 256) == 1) {
+            uint32_t get1 = pb ? (MEM32(pb + 0x44u) & 0x0FFFFFFFu) : 0;
+            fprintf(stderr,
+                    "[RBX] KickOff #%ld put=0x%08X get0=0x%08X get1=0x%08X busy0=%d gate=0x%08X\n",
+                    (long)n0, put & 0x0FFFFFFFu, get0, get1, busy0,
+                    MEM32(0x00166B4Cu));
+            fflush(stderr);
+        }
+        recomp_rmw_or32(self + 8, 0x2000u);
+    } else if ((n0 % 256) == 1) {
+        fprintf(stderr, "[RBX] KickOff gate 0x166B4C=0 (no GET wait) put=0x%08X\n",
+                put & 0x0FFFFFFFu);
+        fflush(stderr);
+    }
+
+    g_ecx = self;
+    g_esp += 4;
+}
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
-    /*
-     * TODO: Add your overrides here. Examples:
-     *
-     * if (xbox_va == 0x00012345) return traced_sub_00012345;
-     * if (xbox_va == 0x00067890) return stub_00067890;
-     * if (xbox_va == 0x000ABCDE) return fixed_sub_000ABCDE;
-     */
-
-    (void)xbox_va;
+    if (xbox_va == 0x00155730u) {
+        static LONG s_look;
+        LONG n = InterlockedIncrement(&s_look);
+        if (n <= 16 || (n % 1024) == 0) {
+            fprintf(stderr, "[RBX] lookup 0x155730 -> kickoff_yield (#%ld)\n", (long)n);
+            fflush(stderr);
+        }
+        return rbx_d3d_kickoff_yield;
+    }
+    if (xbox_va == 0x00156840u)
+        return rbx_d3d_busy_check_yield;
+    if (xbox_va == 0x001556F0u)
+        return rbx_d3d_kick_pfb_yield;
     return (recomp_func_t)0;
 }
 

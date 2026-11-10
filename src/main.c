@@ -320,10 +320,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             { "RECOMP_USB", "1" },
             /* Stable USB pad 0 for interactive keyboard-as-pad (avoid hot-plug AV). */
             { "RECOMP_USB_PADS", "1" },
-            { "RECOMP_FENCE_EXEC", "1" },
+            /* Off for Ch1 bring-up: FENCE_EXEC held the guest on unpublished
+             * fences while the cinematic walker crawled (~draws freeze at
+             * 331). Opt in once HUD flight is solid. */
+            { "RECOMP_FENCE_EXEC", "0" },
             { "RECOMP_TITLE_KEVENTS", "1" },
             { "RECOMP_VBLANK", "paced" },
-            { "RECOMP_FLIP_PACING", "edge" },
+            /* edge + slow mission frames held FLIP_STALL (no PFB ack) so
+             * KickOff BusyLoop spun for the whole frame — Ch1 soft hang.
+             * Off unless the launcher opts in. */
+            { "RECOMP_FLIP_PACING", "0" },
+            /* Present vsync wait stacked with keyed-mutex contention on the
+             * FB thread; guest pacing is enough for bring-up. */
+            { "RECOMP_PRESENT_VSYNC", "0" },
             { "RECOMP_HEAP_RECLAIM", "1" },
             { "RECOMP_AC97_READY", "1" },
             /* Keep MmAllocateContiguousMemory out of the loaded image range so
@@ -355,10 +364,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             if (ac97 && ac97[0] == '0' && ac97[1] == '\0')
                 _putenv_s("RECOMP_AC97_READY", "");
         }
-        fprintf(stderr, "[BOOT] PB_EXEC=%s FB_WINDOW=%s FENCE_EXEC=%s\n",
-                getenv("RECOMP_PB_EXEC") ? getenv("RECOMP_PB_EXEC") : "(off)",
-                getenv("RECOMP_FB_WINDOW") ? "1" : "(off)",
-                getenv("RECOMP_FENCE_EXEC") ? "1" : "(off)");
+        {
+            const char *fe = getenv("RECOMP_FENCE_EXEC");
+            fprintf(stderr, "[BOOT] PB_EXEC=%s FB_WINDOW=%s FENCE_EXEC=%s\n",
+                    getenv("RECOMP_PB_EXEC") ? getenv("RECOMP_PB_EXEC") : "(off)",
+                    getenv("RECOMP_FB_WINDOW") ? "1" : "(off)",
+                    (fe && *fe && strcmp(fe, "0")) ? fe : "(off)");
+        }
     }
 
     /* Install VEH handler (first handler in chain) */

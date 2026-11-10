@@ -1199,9 +1199,18 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  * keeps the counts (a project defines recomp_call_profile_hit). Diffing the counts
  * of two situations shows which functions one of them runs and the other does not. */
 void recomp_call_profile_hit(uint32_t va);
-#define RECOMP_ABI_CALL(va, fn) do { recomp_call_profile_hit(va); (fn)(); } while(0)
+#define RECOMP_ABI_CALL(va, fn) do { \
+    recomp_func_t _mfn = recomp_lookup_manual((uint32_t)(va)); \
+    recomp_call_profile_hit(va); \
+    if (_mfn) (_mfn)(); else (fn)(); \
+} while (0)
 #else
-#define RECOMP_ABI_CALL(va, fn) (fn)()
+/* Prefer recomp_lookup_manual so project overrides (e.g. yielding D3D
+ * BusyLoop) apply to direct calls, not only RECOMP_ICALL. */
+#define RECOMP_ABI_CALL(va, fn) do { \
+    recomp_func_t _mfn = recomp_lookup_manual((uint32_t)(va)); \
+    if (_mfn) (_mfn)(); else (fn)(); \
+} while (0)
 #endif
 
 /* A guarded arm of an indirect call. When a recorded run saw a call site

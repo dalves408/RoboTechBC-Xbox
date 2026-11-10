@@ -1934,8 +1934,11 @@ static void publish_frame(void)
             gpu_present_set_display_size(dw, dh);
         }
     }
-    if (FAILED(IDXGIKeyedMutex_AcquireSync(s_share_mutex, 0, 4))) return;   /* the window has it: the next flip's frame */
+    /* 0 ms: never block the PB/GPU thread on the window's present hold.
+     * A multi-ms wait here was part of the Ch1 BusyLoop/present death spiral. */
+    if (FAILED(IDXGIKeyedMutex_AcquireSync(s_share_mutex, 0, 0))) return;
     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_share, (ID3D11Resource *)rt->tex);
+    ID3D11DeviceContext_Flush(s_ctx);
     IDXGIKeyedMutex_ReleaseSync(s_share_mutex, 0);
     rt->shown_dirty = 0;
     gpu_present_frame_ready();
