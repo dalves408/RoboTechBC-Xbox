@@ -76,9 +76,21 @@ static struct { Nv2aCombiner key; ID3D11PixelShader *shader; } s_rc_cache[128];
 static unsigned s_rc_next;
 #define CB_RING 1024
 #define VB_RING 3
+/* NHLHitz-style ext stream for RC: float V0 + d1/tex/fog (COLOR UNORM on
+ * stream 0 was unread on mission VSH batches while TEXCOORD floats worked). */
+typedef struct {
+    float v0[4];
+    float d1[4];
+    float tc[4][4];
+    float fog;
+    float pad[3]; /* 112-byte stride (16B align); fog @96 */
+} RcVertExt;
+#define XVB_BYTES ((VB_BYTES / (uint32_t)sizeof(Nv2aVertex)) * (uint32_t)sizeof(RcVertExt))
 static ID3D11Buffer *s_vb, *s_cb;                /* current vertex buffer / first constant buffer */
 static ID3D11Buffer *s_vbr[VB_RING], *s_cbr[CB_RING];  /* rings: no buffer is DISCARDed twice within a ring cycle (Intel drivers corrupt queued draws otherwise) */
+static ID3D11Buffer *s_xvb, *s_xvbr[VB_RING];
 static unsigned s_vb_i, s_cb_i;
+static uint32_t s_xvb_off;
 static unsigned s_vendor, s_flush_mode, s_flush_tex; /* RECOMP_GPU_FLUSH_TEX=1: flush before and after every texture (re)creation */        /* RECOMP_GPU_FLUSH: 0 none, 1 P8 512-wide glyph draws, 2 all textured draws, 3 every draw; default 3 on Intel (0x8086), 0 elsewhere */
 static unsigned long s_defer_n; static struct { IUnknown *o; uint32_t f; } s_grave[4096];
 static ID3D11RasterizerState *s_rs;
@@ -193,6 +205,10 @@ static int gb_init(void)
     bd.ByteWidth = VB_BYTES; bd.Usage = D3D11_USAGE_DYNAMIC; bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     for (unsigned vi = 0; vi < VB_RING; vi++) ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_vbr[vi]); s_vb = s_vbr[0];
+    /* RC dual-VB ext ring (float V0 + d1/tex/fog); IL/VS still lazy in initialize_combiners. */
+    bd.ByteWidth = XVB_BYTES;
+    for (unsigned vi = 0; vi < VB_RING; vi++) ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_xvbr[vi]);
+    s_xvb = s_xvbr[0]; s_xvb_off = 0;
     /* Room for either simple Cb (32) or RcDrawCb (48); D3D CBs are 16-byte aligned. */
     bd.ByteWidth = sizeof(RcDrawCb); bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     for (unsigned ci = 0; ci < CB_RING; ci++) ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cbr[ci]); s_cb = s_cbr[0];
@@ -251,21 +267,24 @@ static int initialize_combiners(void)
 {
     ID3DBlob *v = NULL, *err = NULL;
     D3D11_BUFFER_DESC bd;
-    /* float4 POSITION packs x,y,z,rhw. Diffuse is TEXCOORD7 (not COLOR): the
-     * COLOR semantic was unread on mission RC draws (T0*V0 → black) while
-     * menus (T0-only) still looked fine. */
+    /* Stream 0: Nv2aVertex head (pos/rhw/COLOR/uv). Stream 1: RcVertExt
+     * (float V0 + d1/tex/fog) — NHLHitz dual-VB pattern so mission batches
+     * actually fetch V0 (UNORM COLOR @16 alone stayed unread). */
     D3D11_INPUT_ELEMENT_DESC e[] = {
-        { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT,    0,  0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 7, DXGI_FORMAT_B8G8R8A8_UNORM,        0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,       0,  0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "RHW",      0, DXGI_FORMAT_R32_FLOAT,             0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "COLOR",    0, DXGI_FORMAT_B8G8R8A8_UNORM,        0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,          0, 20, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 1, DXGI_FORMAT_R32G32B32A32_FLOAT,    0, 28, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT,    0, 44, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 3, DXGI_FORMAT_R32G32B32A32_FLOAT,    0, 60, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 4, DXGI_FORMAT_R32G32B32A32_FLOAT,    0, 76, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 5, DXGI_FORMAT_R32G32B32A32_FLOAT,    0, 92, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 6, DXGI_FORMAT_R32_FLOAT,             0,108, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 7, DXGI_FORMAT_R32G32B32A32_FLOAT,    1,  0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 1, DXGI_FORMAT_R32G32B32A32_FLOAT,    1, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT,    1, 32, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 3, DXGI_FORMAT_R32G32B32A32_FLOAT,    1, 48, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 4, DXGI_FORMAT_R32G32B32A32_FLOAT,    1, 64, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 5, DXGI_FORMAT_R32G32B32A32_FLOAT,    1, 80, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 6, DXGI_FORMAT_R32_FLOAT,             1, 96, D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
     HRESULT hr;
+    unsigned vi;
     if (s_rc_vs) return 1;
     hr = D3DCompile(k_hlsl_rc, sizeof(k_hlsl_rc) - 1, "rbx_rc", NULL, NULL, "vs_rc", "vs_5_0",
                     D3DCOMPILE_ENABLE_STRICTNESS, 0, &v, &err);
@@ -275,11 +294,25 @@ static int initialize_combiners(void)
     }
     if (FAILED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(v),
                ID3D10Blob_GetBufferSize(v), NULL, &s_rc_vs))
-     || FAILED(ID3D11Device_CreateInputLayout(s_dev, e, 9, ID3D10Blob_GetBufferPointer(v),
+     || FAILED(ID3D11Device_CreateInputLayout(s_dev, e, 11, ID3D10Blob_GetBufferPointer(v),
                ID3D10Blob_GetBufferSize(v), &s_rc_il))) {
         SAFE_REL(v); SAFE_REL(s_rc_vs); SAFE_REL(s_rc_il); return 0;
     }
     SAFE_REL(v);
+    if (!s_xvb) {
+        memset(&bd, 0, sizeof bd);
+        bd.ByteWidth = XVB_BYTES;
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        for (vi = 0; vi < VB_RING; vi++) {
+            if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_xvbr[vi]))) {
+                SAFE_REL(s_rc_vs); SAFE_REL(s_rc_il); return 0;
+            }
+        }
+        s_xvb = s_xvbr[s_vb_i % VB_RING];
+        s_xvb_off = 0;
+    }
     memset(&bd, 0, sizeof bd);
     bd.ByteWidth = sizeof(RcParams);
     bd.Usage = D3D11_USAGE_DYNAMIC;
@@ -288,7 +321,7 @@ static int initialize_combiners(void)
     if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_rc_cb))) {
         SAFE_REL(s_rc_vs); SAFE_REL(s_rc_il); return 0;
     }
-    fprintf(stderr, "[RBX DX11] register combiners enabled (four texture stages)\n");
+    fprintf(stderr, "[RBX DX11] register combiners enabled (dual-VB V0 float + four stages)\n");
     return 1;
 }
 
@@ -1322,8 +1355,9 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     const Nv2aRenderState *r = b->state;
     D3D11_MAPPED_SUBRESOURCE m;
     D3D11_VIEWPORT vp;
-    uint32_t i, kept = 0, need;
+    uint32_t i, kept = 0, need, xneed;
     Nv2aVertex *dst;
+    RcVertExt *xdst = NULL;
     Cb cb;
     ID3D11ShaderResourceView *srv;
     ID3D11SamplerState *smp = NULL;
@@ -1332,7 +1366,8 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     ID3D11BlendState *bs;
     ID3D11DepthStencilState *dss;
     UINT stride = sizeof(Nv2aVertex), off = 0;
-    int layer_draw = 0;
+    UINT xstride = (UINT)sizeof(RcVertExt), xoff = 0;
+    int layer_draw = 0, packed_ext = 0;
 
     if (!gb_ready() || !b->count) return;
     if (s_fh < 0) s_fh = getenv("RECOMP_GPU_FRAMEHASH") != NULL;
@@ -1365,12 +1400,25 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     if (!rt) return;
     ds = get_ds(s, r->zeta_va);
     need = b->count * (uint32_t)sizeof(Nv2aVertex);
-    if (need > VB_BYTES) return;
-    if (s_vb_off + need > VB_BYTES) { s_vb_off = 0; s_vb_i = (s_vb_i + 1) % VB_RING; s_vb = s_vbr[s_vb_i]; }
+    xneed = b->combiner ? b->count * (uint32_t)sizeof(RcVertExt) : 0;
+    if (need > VB_BYTES || xneed > XVB_BYTES) return;
+    if (s_vb_off + need > VB_BYTES) {
+        s_vb_off = 0; s_vb_i = (s_vb_i + 1) % VB_RING; s_vb = s_vbr[s_vb_i];
+        s_xvb = s_xvbr[s_vb_i]; s_xvb_off = 0;
+    }
+    if (xneed && s_xvb && s_xvb_off + xneed > XVB_BYTES) s_xvb_off = 0;
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vb, 0,
                s_vb_off == 0 ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &m)))
         return;
     dst = (Nv2aVertex *)((uint8_t *)m.pData + s_vb_off);
+    if (xneed && s_xvb) {
+        D3D11_MAPPED_SUBRESOURCE xm;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_xvb, 0,
+                       s_xvb_off == 0 ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &xm))) {
+            xdst = (RcVertExt *)((uint8_t *)xm.pData + s_xvb_off);
+            packed_ext = 1;
+        }
+    }
     for (i = 0; i + 2 < b->count; i += 3) {
         const Nv2aVertex *v = &b->vertices[i];
         float area;
@@ -1395,16 +1443,55 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
                 if (fabsf(t1[0]) + fabsf(t1[1]) + fabsf(t1[2]) < 1e-6f
                     && fabsf(t0[0]) + fabsf(t0[1]) + fabsf(t0[2]) > 1e-6f)
                     memcpy(t1, t0, sizeof dst[0].tex[0]);
-                /* Pack D3DCOLOR into d1 as float RGBA for the RC VS (V0). */
-                dst[kept + k].d1[0] = ((d >> 16) & 255u) / 255.0f;
-                dst[kept + k].d1[1] = ((d >> 8) & 255u) / 255.0f;
-                dst[kept + k].d1[2] = (d & 255u) / 255.0f;
-                dst[kept + k].d1[3] = ((d >> 24) & 255u) / 255.0f;
+                if (packed_ext && xdst) {
+                    RcVertExt *xe = &xdst[kept + k];
+                    static int force_v0 = -1;
+                    if (force_v0 < 0)
+                        force_v0 = getenv("RECOMP_GPU_FORCEV0") != NULL;
+                    if (force_v0) {
+                        xe->v0[0] = 0.95f; xe->v0[1] = 0.75f;
+                        xe->v0[2] = 0.35f; xe->v0[3] = 1.0f;
+                    } else {
+                        xe->v0[0] = ((d >> 16) & 255u) / 255.0f;
+                        xe->v0[1] = ((d >> 8) & 255u) / 255.0f;
+                        xe->v0[2] = (d & 255u) / 255.0f;
+                        xe->v0[3] = ((d >> 24) & 255u) / 255.0f;
+                    }
+                    memcpy(xe->d1, dst[kept + k].d1, sizeof xe->d1);
+                    memcpy(xe->tc, dst[kept + k].tex, sizeof xe->tc);
+                    xe->fog = dst[kept + k].fog;
+                    xe->pad[0] = xe->pad[1] = xe->pad[2] = 0.0f;
+                }
             }
         }
         kept += 3;
     }
+    /* SKIPBLACK must read dst before Unmap. */
+    if (kept && b->combiner) {
+        static int skipblk = -1, nblk;
+        if (skipblk < 0) {
+            const char *e = getenv("RECOMP_GPU_SKIPBLACK");
+            skipblk = !(e && e[0] == '0');
+        }
+        if (skipblk && b->combiner->color_icw[0] == 0x00002004u) {
+            uint32_t k, dmax = 0;
+            for (k = 0; k < kept; k++) {
+                uint32_t d = dst[k].diffuse & 0x00FFFFFFu;
+                if (d > dmax) dmax = d;
+            }
+            if (dmax == 0) {
+                if (nblk++ < 12)
+                    fprintf(stderr, "[RBX DX11] skip black-V0 pass n=%u\n", kept);
+                ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
+                if (packed_ext && s_xvb)
+                    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_xvb, 0);
+                return;
+            }
+        }
+    }
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
+    if (packed_ext && s_xvb)
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_xvb, 0);
     if (!kept) return;
 
     {
@@ -1445,27 +1532,8 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
                       rc1fix++;
                   }
               } }
-            /* Cel-outline / black-V0 pass (ic0=00002004) redraws the same mesh
-             * in black after the lit pass and paints Ch1 near-black. Skip by
-             * default; RECOMP_GPU_SKIPBLACK=0 restores the hardware pass. */
-            { static int skipblk = -1, nblk;
-              if (skipblk < 0) {
-                  const char *e = getenv("RECOMP_GPU_SKIPBLACK");
-                  skipblk = !(e && e[0] == '0');
-              }
-              if (skipblk && c_local.color_icw[0] == 0x00002004u) {
-                  uint32_t k, dmax = 0;
-                  for (k = 0; k < kept; k++) {
-                      uint32_t d = dst[k].diffuse & 0x00FFFFFFu;
-                      if (d > dmax) dmax = d;
-                  }
-                  if (dmax == 0) {
-                      if (nblk++ < 12)
-                          fprintf(stderr, "[RBX DX11] skip black-V0 pass n=%u\n", kept);
-                      return;
-                  }
-              } }
-            if (!initialize_combiners() || !(s_rc_ps = combiner_shader(c)))
+            /* Black-V0 cel pass skipped above (pre-Unmap). */
+            if (!initialize_combiners() || !(s_rc_ps = combiner_shader(c)) || !packed_ext)
                 use_rc = 0;
             else {
                 memset(&rc, 0, sizeof rc);
@@ -1693,7 +1761,22 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
         ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
         ID3D11DeviceContext_IASetInputLayout(s_ctx, use_rc ? s_rc_il : s_il);
         ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &off);
+        if (use_rc && packed_ext && s_xvb) {
+            ID3D11Buffer *vbs[2];
+            UINT strs[2], offs[2];
+            UINT first = s_vb_off / (UINT)sizeof(Nv2aVertex);
+            UINT xfirst = s_xvb_off / (UINT)sizeof(RcVertExt);
+            if (xfirst < first) first = xfirst;
+            vbs[0] = s_vb; vbs[1] = s_xvb;
+            strs[0] = stride; strs[1] = xstride;
+            offs[0] = s_vb_off - first * (UINT)sizeof(Nv2aVertex);
+            offs[1] = s_xvb_off - first * (UINT)sizeof(RcVertExt);
+            ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 2, vbs, strs, offs);
+            off = first; /* StartVertexLocation */
+        } else {
+            ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &off);
+            off = s_vb_off / (UINT)sizeof(Nv2aVertex);
+        }
         ID3D11DeviceContext_VSSetShader(s_ctx, use_rc ? s_rc_vs : s_vs, NULL, 0);
         ID3D11DeviceContext_PSSetShader(s_ctx, use_rc ? s_rc_ps : s_ps, NULL, 0);
         ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &cbuf);
@@ -1712,10 +1795,11 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
             ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &srv);
             ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &smp);
         }
-        ID3D11DeviceContext_Draw(s_ctx, kept, s_vb_off / (UINT)sizeof(Nv2aVertex));
+        ID3D11DeviceContext_Draw(s_ctx, kept, off);
         if (s_flush_mode && (s_flush_mode >= 3 || ((!use_rc) && cb.textured && (s_flush_mode >= 2 || (b->texture && b->texture->color == 0x0B && b->texture->width == 512))))) ID3D11DeviceContext_Flush(s_ctx);
         if (td_probe) probe_after_draw(rt, srv, b);
         s_vb_off += kept * (uint32_t)sizeof(Nv2aVertex);
+        if (use_rc && packed_ext) s_xvb_off += kept * (uint32_t)sizeof(RcVertExt);
         rt->dirty = 1; rt->shown_dirty = 1;
         st_draws++; st_tris += kept / 3;
     }
