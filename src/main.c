@@ -318,9 +318,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
              * AV'd mid-mission (pb_walk_segment @ 0x8F800000). BlockOnTime
              * multi-second sleeps are capped by RECOMP_SWM5_PACE_MS instead. */
             { "RECOMP_PB_WALK", "dma" },
-            /* Wake D3D fence event at least every N ms during PB exec so
-             * KeWait(0x00166454) cannot stretch to seconds (Ch1 cinematic). */
-            { "RECOMP_SWM5_PACE_MS", "16" },
+            /* Mid-walk IdleWake early-signals the D3D fence and races menu
+             * UI pushbuffers (white glyph boxes). Off for interactive/bat;
+             * Ch1 probes set RECOMP_SWM5_PACE_MS=16 (+ optional PACE_THREAD). */
+            { "RECOMP_SWM5_PACE_MS", "0" },
             { "RECOMP_FB_WINDOW", "1" },
             { "RECOMP_KEYBOARD", "1" },
             { "RECOMP_USB", "1" },
@@ -336,9 +337,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             /* VBLANK_CATCHUP stays off by default (menu timing); probe with =1. */
             { "RECOMP_TITLE_KEVENTS", "1" },
             { "RECOMP_VBLANK", "paced" },
-            /* Isolate paced vblank from timer-thread DPC drains (mission
-             * spikes were 0.3–1.4 s while the schedule was otherwise locked). */
-            { "RECOMP_VBLANK_THREAD", "1" },
+            /* VBLANK_THREAD opt-in (mission probes only) — default off so
+             * title menus keep their paced-timer timing. */
             /* Cap timer-thread DPC drain slices (ms) after IRQL unstick floods. */
             { "RECOMP_TIMER_DPC_MS", "3" },
             /* Keep the paced-vblank timer above raster workers so mission
