@@ -76,6 +76,16 @@ loc_001557A5: ;
     Apply-Replace ([ref]$t) $oldGet $newGet ([ref]$changed)
 }
 
+# BlockOnFence (0x1558D0) is wrapped by sub_001558D0 in recomp_manual.c, which
+# re-checks the fence after D3D's event wait (spurious wakes overwrote the ring).
+if ($t -notmatch 'void sub_001558D0_orig\(void\)') {
+    $re = [regex]'void sub_001558D0\(void\)(\r?\n)\{'
+    if ($re.IsMatch($t)) {
+        $t = $re.Replace($t, '/* RBX: renamed; wrapped by sub_001558D0 in src/recomp_manual.c (BlockOnFence recheck). */$1void sub_001558D0_orig(void)$1{', 1)
+        $changed = $true
+    }
+}
+
 if ($changed) {
     [IO.File]::WriteAllText($path, $t)
     Write-Output "patched $path"
