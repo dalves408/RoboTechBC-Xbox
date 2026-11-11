@@ -314,7 +314,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     {
         struct { const char *name; const char *value; } defs[] = {
             { "RECOMP_PB_EXEC", "1" },
+            /* dma GET publish is required for ring fidelity; segment scan
+             * AV'd mid-mission (pb_walk_segment @ 0x8F800000). BlockOnTime
+             * multi-second sleeps are capped by RECOMP_SWM5_PACE_MS instead. */
             { "RECOMP_PB_WALK", "dma" },
+            /* Wake D3D fence event at least every N ms during PB exec so
+             * KeWait(0x00166454) cannot stretch to seconds (Ch1 cinematic). */
+            { "RECOMP_SWM5_PACE_MS", "16" },
             { "RECOMP_FB_WINDOW", "1" },
             { "RECOMP_KEYBOARD", "1" },
             { "RECOMP_USB", "1" },
@@ -330,6 +336,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             /* VBLANK_CATCHUP stays off by default (menu timing); probe with =1. */
             { "RECOMP_TITLE_KEVENTS", "1" },
             { "RECOMP_VBLANK", "paced" },
+            /* Keep the paced-vblank timer above raster workers so mission
+             * frames that burn all cores cannot open multi-second vblank gaps. */
+            { "RECOMP_TIMER_PRIO", "2" },
             /* edge + slow mission frames held FLIP_STALL (no PFB ack) so
              * KickOff BusyLoop spun for the whole frame — Ch1 soft hang.
              * Off unless the launcher opts in. */
