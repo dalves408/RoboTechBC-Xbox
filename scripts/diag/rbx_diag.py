@@ -35,6 +35,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 EXE = ROOT / "build" / "RelWithDebInfo" / "robotech_bc_recomp.exe"
 OUT_ROOT = ROOT / "analysis" / "diag"
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # stackdump.py
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -167,7 +168,7 @@ ANOMALY_PATTERNS = {
     "gpu_unhandled": re.compile(r"([1-9]\d*) unhandled methods \((\d+) distinct\)"),
     "stub_called": re.compile(r"\[(?:KERNEL|FILE|STUB)\][^\n]*\bstub\b", re.I),
     "unresolved": re.compile(r"(unresolved|UNRESOLVED|no such function|missing import)", re.I),
-    "audio_underrun": re.compile(r"(underrun|underflow|starv)", re.I),
+    "audio_underrun": re.compile(r"(underflow|\b(?:starves|underruns)=[1-9]|(?<![a-z_])(?:underrun|starv)(?!\w*=0\b))", re.I),
     "dx_error": re.compile(r"(HRESULT|E_FAIL|DXGI_ERROR|device removed|shader compile)", re.I),
     "watchdog": re.compile(r"(WATCHDOG|watchdog|HANG|deadlock)", re.I),
 }
@@ -300,6 +301,14 @@ def main() -> int:
                     hangs.append({"t": round(el, 1), "at_abs": now, "hung_flag": hung,
                                   "cpu_cores": s["cpu_cores"], "title": title})
                     print(f"[diag] !! no frame progress {a.hang_secs:.0f}s at t={el:.0f}s cpu={s['cpu_cores']} cores", flush=True)
+                    try:
+                        from stackdump import dump_stacks
+                        sp = out / f"hang_t{int(el):04d}_stacks.txt"
+                        sp.write_text(dump_stacks(pp.pid))
+                        hangs[-1]["stacks"] = str(sp)
+                        print(f"[diag]    thread stacks -> {sp}", flush=True)
+                    except Exception as e:
+                        print(f"[diag]    stack dump failed: {e}", flush=True)
 
                 while pending and el >= pending[0][0]:
                     _, vk, hold, name = pending.pop(0)
