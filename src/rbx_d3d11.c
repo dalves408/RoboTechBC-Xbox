@@ -1352,6 +1352,7 @@ static void probe_after_draw(Rt *rt, ID3D11ShaderResourceView *srv, const Nv2aBa
     }
 }
 
+extern int g_rbx_precull;   /* executor: this batch was back-face culled with exact strip parity */
 static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
 {
     Rt *rt;
@@ -1449,7 +1450,7 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
         if (!(v[0].rhw > 0 && v[1].rhw > 0 && v[2].rhw > 0)) continue;
         area = (v[1].x - v[0].x) * (v[2].y - v[0].y) - (v[1].y - v[0].y) * (v[2].x - v[0].x);
         if (!(fabsf(area) > 0.0f) || !isfinite(area)) continue;
-        if (s_cull_on && r->cull_enable) {
+        if (s_cull_on && r->cull_enable && !g_rbx_precull) {
             int front = is_front(strip_odd ? -area : area, r->front_face);
             if ((r->cull_face == 0x405 && !front) || (r->cull_face == 0x404 && front) || r->cull_face == 0x408) {
                 st_culled++;

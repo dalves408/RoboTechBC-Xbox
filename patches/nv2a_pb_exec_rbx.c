@@ -31,6 +31,7 @@
  * has not given us any vertices". RECOMP_FB_DUMP=<prefix> writes the surface to
  * <prefix>NNN.bmp, so the result can be looked at without a display.
  */
+#include <emmintrin.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -2198,14 +2199,28 @@ static Nv2aVertex *backend_slot(void)
 static float fog_factor(float d);
 static int batch_uses_program(void);
 
+/* RBX: texture-unit-0 coordinate scale, set once per batch at xf_done. */
+static float s_bx_su = 1.0f, s_bx_sv = 1.0f;
+/* RBX: back-face culling in the executor, where the strip parity is exact
+ * (s_xf_odd), instead of after conversion in the back end, which had to guess
+ * it from repeated vertices. g_rbx_precull tells the back end the batch it is
+ * handed was already culled. RECOMP_GPU_CULL=0 turns culling off in both. */
+static int s_xf_odd;
+int g_rbx_precull;
+static int xf_cull_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *c = getenv("RECOMP_GPU_CULL");
+        on = !(c && c[0] == '0');
+    }
+    return on;
+}
+
 static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
 {
-    float su = 1.0f, sv = 1.0f;
+    const float su = s_bx_su, sv = s_bx_sv;
 
-    if (tex_size_from_format(s_gpu.texs[0].color)) {
-        su = (float)s_gpu.texs[0].width;
-        sv = (float)s_gpu.texs[0].height;
-    }
     o->x = v->pos[0];
     o->y = v->pos[1];
     o->z = v->pos[2];
@@ -2463,13 +2478,14 @@ static int depth_pass(float z, float stored)
 
 static uint32_t pack_color(const float c[4])
 {
-    int i;
-    uint32_t b[4];
-    for (i = 0; i < 4; i++) {
-        float f = c[i] < 0.0f ? 0.0f : (c[i] > 1.0f ? 1.0f : c[i]);
-        b[i] = (uint32_t)(f * 255.0f + 0.5f);
-    }
-    return (b[3] << 24) | (b[0] << 16) | (b[1] << 8) | b[2];
+    /* RBX: SSE form of clamp(c,0,1)*255+0.5 truncated; max_ps maps NaN to 0. */
+    __m128 f = _mm_min_ps(_mm_max_ps(_mm_loadu_ps(c), _mm_setzero_ps()), _mm_set1_ps(1.0f));
+    __m128i b = _mm_cvttps_epi32(_mm_add_ps(_mm_mul_ps(f, _mm_set1_ps(255.0f)), _mm_set1_ps(0.5f)));
+    uint32_t r = (uint32_t)_mm_cvtsi128_si32(b);
+    uint32_t g = (uint32_t)_mm_cvtsi128_si32(_mm_srli_si128(b, 4));
+    uint32_t bl = (uint32_t)_mm_cvtsi128_si32(_mm_srli_si128(b, 8));
+    uint32_t a = (uint32_t)_mm_cvtsi128_si32(_mm_srli_si128(b, 12));
+    return (a << 24) | (r << 16) | (g << 8) | bl;
 }
 
 static uint32_t modulate(uint32_t t, const float c[4])
@@ -2941,6 +2957,41 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     if ((++s_xf_pace & 0x3Fu) == 0)
         swm5_pace_wake();
 
+    if (backend_draws()) {
+        /* RBX: a back end rasterises -- skip the CPU-raster setup (memset of
+         * XfTri etc.); same rejections as the general path below. */
+        const float *pa = va->pos, *pb = vb->pos, *pc = vc->pos;
+        uint32_t bpp = surface_bpp();
+        float ar;
+        Nv2aVertex *o;
+
+        if (bpp != 4 && bpp != 2)
+            return;
+        if (pa[3] <= 0.0f || pb[3] <= 0.0f || pc[3] <= 0.0f) {
+            s_gpu.tris_behind++;
+            return;
+        }
+        ar = (pb[0] - pa[0]) * (pc[1] - pa[1]) - (pb[1] - pa[1]) * (pc[0] - pa[0]);
+        if (ar == 0.0f || ar != ar) {
+            s_gpu.xf_degenerate++;
+            return;
+        }
+        if (s_reg[0x0308 / 4] && xf_cull_on()) {       /* SET_CULL_FACE_ENABLE */
+            uint32_t cf = s_reg[0x039C / 4], ff = s_reg[0x03A0 / 4];
+            float sa = s_xf_odd ? -ar : ar;
+            /* y grows downwards in surface pixels: positive area is clockwise. */
+            int front = ff == 0x901 ? sa < 0.0f : sa > 0.0f;
+            if ((cf == 0x405 && !front) || (cf == 0x404 && front) || cf == 0x408)
+                return;
+        }
+        if ((o = backend_slot()) != NULL) {
+            backend_from_xf(va, &o[0]);
+            backend_from_xf(vb, &o[1]);
+            backend_from_xf(vc, &o[2]);
+            s_bcount += 3;
+        }
+        return;
+    }
     if (no_rc < 0)
         no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
     memset(&T, 0, sizeof T);
@@ -3232,11 +3283,12 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
  * only batch-constant state and guest memory, and the decoded interpreter is
  * reentrant -- unless the program writes constants (CXT_WRITE), or a debug
  * mode (dump / verify / reference interpreter) is on, which stay serial.
+ * Fixed-function batches (ffp_vertex) only read batch state, so they go too.
  * RECOMP_XF_THREADS=n workers (default: min(cores/2-1, 3), max 7; 0 = off). */
 static uint32_t s_rbx_cxt_write;
 #if defined(_WIN32)
 #define XP_MAXW 7
-#define XP_CHUNK 32
+#define XP_CHUNK 16
 static int s_xp_nw = -1;
 static HANDLE s_xp_go[XP_MAXW];
 /* Claim word: batch generation in the high half, next index in the low half,
@@ -3358,9 +3410,23 @@ static void raster_batch_program(void)
          * most vertices several times, and the state is fixed for the batch. */
         enum { VC = 256 };
         uint32_t tag[VC], slot[VC];
+        /* RECOMP_XF_STATS: where vertex-program work goes (serial vs pool). */
+        static int xst = -1;
+        static unsigned long long st_b, st_pb, st_sb, st_su, st_cx, st_ffp, st_small;
+        if (xst < 0) xst = getenv("RECOMP_XF_STATS") != NULL;
+        if (xst) {
+            st_b++;
+            if (!batch_uses_program()) st_ffp++;
+            else if (s_rbx_cxt_write) st_cx++;
+            else if (n < 48) st_small++;
+            if ((st_b & 0xFFFF) == 0)
+                fprintf(stderr, "[XF STATS] batches %llu par %llu ser %llu (ser uniq verts %llu)"
+                                " ffp %llu cxt %llu small %llu\n", st_b, st_pb, st_sb, st_su,
+                        st_ffp, st_cx, st_small);
+        }
         memset(tag, 0xFF, sizeof tag);
 #if defined(_WIN32)
-        if (n >= 128 && batch_uses_program() && !s_rbx_cxt_write && xp_workers() > 0) {
+        if (n >= 48 && !(batch_uses_program() && s_rbx_cxt_write) && xp_workers() > 0) {
             static uint32_t *src, *uniq;
             uint32_t nu = 0;
             if (!src) src = (uint32_t *)malloc(NV_MAX_INDICES * sizeof *src);
@@ -3381,6 +3447,7 @@ static void raster_batch_program(void)
                 }
                 for (i = 0; i < n; i++)
                     if (src[i] != i) s_xf[i] = s_xf[src[i]];
+                if (xst) st_pb++;
                 goto xf_done;
             }
         }
@@ -3392,13 +3459,21 @@ static void raster_batch_program(void)
                 g_pb_t_xf += pb_ticks() - t0;
                 return; }                                /* no program loaded */
             tag[h] = ix; slot[h] = i;
+            if (xst) st_su++;
         }
+        if (xst) st_sb++;
     }
 xf_done:
     t1 = pb_ticks();
     g_pb_t_xf += t1 - t0;
     g_pb_n_xfverts += n;
     xf_set_viewport();
+    if (tex_size_from_format(s_gpu.texs[0].color)) {
+        s_bx_su = (float)s_gpu.texs[0].width;
+        s_bx_sv = (float)s_gpu.texs[0].height;
+    } else {
+        s_bx_su = s_bx_sv = 1.0f;
+    }
     {
         const VertexAttr *tc = texcoord_attr();
         s_xf_no_tex = !batch_uses_program() && !(tc->offset && tc->stride);
@@ -3519,8 +3594,11 @@ xf_done:
         /* RBX-17: do NOT flip odd triangles here. That "DX11 cull" experiment
          * painted white boxes behind every menu glyph (UI strips). Host cull
          * for 3D strips belongs in the backend, not by rewriting NV2A order. */
-        for (i = 0; i + 2 < n; i++)
+        for (i = 0; i + 2 < n; i++) {
+            s_xf_odd = (int)(i & 1);
             raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+        }
+        s_xf_odd = 0;
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
@@ -3546,8 +3624,11 @@ xf_done:
     xf_queue_flush();
     t0 = pb_ticks();
     g_pb_t_clip += t0 - t1;
-    if (backend_draws())
+    if (backend_draws()) {
+        g_rbx_precull = 1;
         backend_flush(!s_xf_no_tex);
+        g_rbx_precull = 0;
+    }
     g_pb_t_flush += pb_ticks() - t0;
 }
 
