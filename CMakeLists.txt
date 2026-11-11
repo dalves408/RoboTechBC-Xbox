@@ -57,13 +57,15 @@ if(EXISTS "${_RBX_PBEXEC}" AND TARGET xbox_kernel)
     set(_K_FILTERED "")
     foreach(_s IN LISTS _K_SOURCES)
         get_filename_component(_sn "${_s}" NAME)
-        if(NOT _sn STREQUAL "nv2a_pb_exec.c")
+        if(NOT _sn STREQUAL "nv2a_pb_exec.c" AND NOT _sn STREQUAL "nv2a_pb_scan.c")
             list(APPEND _K_FILTERED "${_s}")
         endif()
     endforeach()
     set_property(TARGET xbox_kernel PROPERTY SOURCES ${_K_FILTERED})
-    target_sources(xbox_kernel PRIVATE "${_RBX_PBEXEC}")
-    message(STATUS "Robotech: linking pinned NV2A executor (${_RBX_PBEXEC})")
+    # Pinned pushbuffer walk too (patches/nv2a_pb_scan_rbx.c): a mid-walk GET
+    # rewrite must not drop the rest of a frame's commands.
+    target_sources(xbox_kernel PRIVATE "${_RBX_PBEXEC}" "${CMAKE_CURRENT_SOURCE_DIR}/patches/nv2a_pb_scan_rbx.c")
+    message(STATUS "Robotech: linking pinned NV2A executor (${_RBX_PBEXEC}) and pushbuffer walk")
 endif()
 
 file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")

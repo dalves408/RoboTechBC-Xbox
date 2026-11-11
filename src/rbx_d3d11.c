@@ -1985,7 +1985,12 @@ static void present_dump(Rt *rt)
             on = 1;
         }
     }
-    if (!on || (n++ % every)) return;
+    if (!on) return;
+    { /* RECOMP_GPU_PRESDUMP_SECS=lo-hi: only dump inside that window (seconds since the first present) */
+      static int w = -1; static unsigned lo, hi; static DWORD t0; DWORD sec;
+      if (w < 0) { const char *e = getenv("RECOMP_GPU_PRESDUMP_SECS"); w = e && sscanf(e, "%u-%u", &lo, &hi) == 2; t0 = GetTickCount(); }
+      sec = (GetTickCount() - t0) / 1000; if (w && (sec < lo || sec >= hi)) return; }
+    if (n++ % every) return;
     ID3D11Texture2D_GetDesc(rt->tex, &td);
     if (!st || sw != td.Width || sh != td.Height) {
         SAFE_REL(st);
@@ -2193,6 +2198,28 @@ static void prof_line_dump(void)
         g_prof_lines[bi].n = 0;
     }
 }
+/* RECOMP_PROF_CHAINS=1: per-thread histogram of full call chains (finds what a waiting thread waits on) */
+static int s_prof_chains;
+typedef struct { char txt[700]; unsigned n; } ProfChain;
+static ProfChain s_pchain[64][24];
+static void prof_chain_add(unsigned ti, const CONTEXT *c0)
+{
+    char w[700]; CONTEXT u = *c0; int f; unsigned k; w[0] = 0;
+    __try {
+        for (f = 0; f < 10; f++) {
+            DWORD64 base, ef; PVOID hd; PRUNTIME_FUNCTION rf; char b3[sizeof(SYMBOL_INFO) + 128]; SYMBOL_INFO *s3 = (SYMBOL_INFO *)b3; DWORD64 d3 = 0;
+            memset(b3, 0, sizeof b3); s3->SizeOfStruct = sizeof(SYMBOL_INFO); s3->MaxNameLen = 127;
+            if (strlen(w) > 600) break;
+            if (SymFromAddr(GetCurrentProcess(), u.Rip, &d3, s3)) strncat(w, s3->Name, 50); else strcat(w, "?");
+            strcat(w, " < ");
+            rf = RtlLookupFunctionEntry(u.Rip, &base, NULL); if (!rf) break;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, u.Rip, rf, &u, &hd, &ef, NULL);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    if (ti >= 64) return;
+    for (k = 0; k < 24 && s_pchain[ti][k].n; k++) if (!strcmp(s_pchain[ti][k].txt, w)) { s_pchain[ti][k].n++; return; }
+    if (k < 24) { strcpy(s_pchain[ti][k].txt, w); s_pchain[ti][k].n = 1; }
+}
 static DWORD WINAPI gb_prof_thread(LPVOID p)
 {
     unsigned lo = 0, hi = 0; DWORD t0 = GetTickCount(); DWORD self = GetCurrentThreadId();
@@ -2200,6 +2227,7 @@ static DWORD WINAPI gb_prof_thread(LPVOID p)
     static DWORD tids[MAXT]; static unsigned nt = 0; static ProfB *bk[MAXT]; static unsigned nb[MAXT]; static unsigned tot[MAXT];
     unsigned i, last_enum = 0;
     sscanf((const char *)p, "%u-%u", &lo, &hi);
+    s_prof_chains = getenv("RECOMP_PROF_CHAINS") && atoi(getenv("RECOMP_PROF_CHAINS"));
     while ((GetTickCount() - t0) / 1000 < lo) Sleep(100);
     SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS); SymInitialize(GetCurrentProcess(), NULL, TRUE);
     { /* pick the 4 busiest threads over 2 s so sampling does not perturb the run */
@@ -2208,7 +2236,9 @@ static DWORD WINAPI gb_prof_thread(LPVOID p)
         for (k = 0; k < n; k++) { HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, ids[k]); FILETIME a, b, kt, ut; t1[k] = 0; if (h) { if (GetThreadTimes(h, &a, &b, &kt, &ut)) t1[k] = ((unsigned long long)kt.dwHighDateTime << 32 | kt.dwLowDateTime) + ((unsigned long long)ut.dwHighDateTime << 32 | ut.dwLowDateTime); CloseHandle(h); } }
         Sleep(2000);
         for (k = 0; k < n; k++) { HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, ids[k]); FILETIME a, b, kt, ut; unsigned long long v = 0; if (h) { if (GetThreadTimes(h, &a, &b, &kt, &ut)) v = ((unsigned long long)kt.dwHighDateTime << 32 | kt.dwLowDateTime) + ((unsigned long long)ut.dwHighDateTime << 32 | ut.dwLowDateTime); CloseHandle(h); } t1[k] = v - t1[k]; }
-        for (j = 0; j < 4; j++) { unsigned bi = 0; unsigned long long bv = 0; for (k = 0; k < n; k++) if (t1[k] > bv) { bv = t1[k]; bi = k; } if (bv < 1000000ULL) break; fprintf(stderr, "[PROF] watching thread %lu cpu=%llu ms/2s\n", ids[bi], bv / 10000); tids[nt] = ids[bi]; bk[nt] = (ProfB *)calloc(MAXA, sizeof(ProfB)); nt++; t1[bi] = 0; }
+        unsigned ntop = getenv("RECOMP_PROF_TOP") ? (unsigned)atoi(getenv("RECOMP_PROF_TOP")) : 4; if (ntop > MAXT) ntop = MAXT;
+        static unsigned char used[256];
+        for (j = 0; j < ntop; j++) { unsigned bi = 0; unsigned long long bv = 0; int got = 0; for (k = 0; k < n; k++) if (!used[k] && (!got || t1[k] > bv)) { bv = t1[k]; bi = k; got = 1; } if (!got || (ntop <= 4 && bv < 1000000ULL)) break; used[bi] = 1; fprintf(stderr, "[PROF] watching thread %lu cpu=%llu ms/2s\n", ids[bi], bv / 10000); tids[nt] = ids[bi]; bk[nt] = (ProfB *)calloc(MAXA, sizeof(ProfB)); nt++; t1[bi] = 0; }
     }
     while ((GetTickCount() - t0) / 1000 < hi) {
         if (0) {
@@ -2223,6 +2253,7 @@ static DWORD WINAPI gb_prof_thread(LPVOID p)
                 CONTEXT c; memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_CONTROL;
                 if (GetThreadContext(h, &c)) {
                     if (i == 0) prof_line_add(c.Rip);
+                    if (s_prof_chains && (tot[i] % 10) == 0) prof_chain_add(i, &c);
                     DWORD64 a = c.Rip, disp = 0; char buf[sizeof(SYMBOL_INFO) + 256]; SYMBOL_INFO *si = (SYMBOL_INFO *)buf; unsigned k;
                     memset(buf, 0, sizeof buf); si->SizeOfStruct = sizeof(SYMBOL_INFO); si->MaxNameLen = 255;
                     if (SymFromAddr(GetCurrentProcess(), a, &disp, si)) a = si->Address; else a &= ~0xFFULL;
@@ -2260,6 +2291,8 @@ static DWORD WINAPI gb_prof_thread(LPVOID p)
         }
     }
     { int q; for (q = 0; q < g_prof_chain_n; q++) fprintf(stderr, "[PROF] WriteFile chain: %s\n", g_prof_chain[q]); }
+    if (s_prof_chains) for (i = 0; i < nt && i < 64; i++) { unsigned r, k; fprintf(stderr, "[PROF] chains thread %lu\n", tids[i]);
+        for (r = 0; r < 5; r++) { unsigned bi = 0, bn = 0; for (k = 0; k < 24; k++) if (s_pchain[i][k].n > bn) { bn = s_pchain[i][k].n; bi = k; } if (!bn) break; fprintf(stderr, "[PROF]   x%u %s\n", bn, s_pchain[i][bi].txt); s_pchain[i][bi].n = 0; } }
     fflush(stderr);
     return 0;
 }

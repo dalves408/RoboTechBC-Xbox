@@ -205,7 +205,10 @@ def parse_keys(spec: str):
     out = []
     for item in filter(None, (s.strip() for s in spec.split(","))):
         t, k, *h = item.split(":")
-        out.append((float(t), VK[k.lower()], int(h[0]) if h else 150, k))
+        vk = VK.get(k.lower()) or (ord(k.upper()) if len(k) == 1 and k.isalnum() else None)
+        if vk is None:
+            raise SystemExit(f"unknown key {k!r}")
+        out.append((float(t), vk, int(h[0]) if h else 150, k))
     return sorted(out)
 
 
@@ -244,6 +247,9 @@ def main() -> int:
     for kv in a.env:
         k, _, v = kv.partition("=")
         env[k] = v
+        if k == "RECOMP_GPU_PRESDUMP":   # "<abs prefix>:<every>"; the dumper does not mkdir
+            pre = v.rsplit(":", 1)[0] if v.count(":") > 1 else v
+            Path(pre).parent.mkdir(parents=True, exist_ok=True)
 
     keys = parse_keys(a.keys) if a.keys else []
     print(f"[diag] out={out}\n[diag] launching {a.exe}", flush=True)

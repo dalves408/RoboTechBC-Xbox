@@ -306,6 +306,60 @@ static void rbx_d3d_kickoff_yield(void)
     g_esp += 4;
 }
 
+/* D3D BlockOnFence (0x1558D0, args: fence, flags; ret 8). When the GPU is far
+ * from the fence it patches software method 5 into the pushbuffer after the
+ * fence and sleeps on the PGRAPH event -- and returns as soon as that event is
+ * set, without looking at the fence again. The runtime also sets the event
+ * outside method 5 (IdleWake after each consumed kick, RBX-17), which then
+ * released D3D before the walk had reached the fence: MakeSpace took the
+ * unread ring as free and overwrote commands the walk had not read (menu
+ * flashes, "[PB] bad target" resyncs). Re-check the fence before returning;
+ * a spurious wake now only costs a short spin. RECOMP_FENCE_RECHECK=0 = off. */
+extern void sub_001558D0_orig(void);
+void sub_001558D0(void)
+{
+    static int on = -1;
+    static LONG s_spurious, s_timeouts;
+    uint32_t target = MEM32(g_esp + 4);
+    uint32_t dev, fence_va, counter;
+    DWORD t0;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_FENCE_RECHECK");
+        on = !(e && e[0] == '0');
+    }
+    sub_001558D0_orig();
+    if (!on)
+        return;
+    dev = MEM32(0x00166B48u);
+    if (!dev)
+        return;
+    fence_va = MEM32(dev + 0x34u);
+    counter = MEM32(dev + 0x30u);
+    if (counter - target >= counter - MEM32(fence_va))
+        return;
+    {
+        LONG n = InterlockedIncrement(&s_spurious);
+        if (n <= 4 || (n & (n - 1)) == 0) {
+            fprintf(stderr, "[RBX] BlockOnFence woke early: fence=%08X target=%08X counter=%08X (#%ld)\n",
+                    MEM32(fence_va), target, counter, (long)n);
+            fflush(stderr);
+        }
+    }
+    t0 = GetTickCount();
+    while (counter - target < counter - MEM32(fence_va)) {
+        if (GetTickCount() - t0 > 2000u) {
+            LONG n = InterlockedIncrement(&s_timeouts);
+            if (n <= 8) {
+                fprintf(stderr, "[RBX] BlockOnFence recheck timeout fence=%08X target=%08X\n",
+                        MEM32(fence_va), target);
+                fflush(stderr);
+            }
+            break;
+        }
+        Sleep(0);
+    }
+}
+
 /* RECOMP_XPP_TRACE=1: log the title's calls into XAPI's peripheral (XPP)
  * entry points -- args off the guest stack and eax on return -- so input
  * bring-up can see which of XGetDevices / XInputOpen / XInputGetState the

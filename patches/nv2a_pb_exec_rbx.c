@@ -4353,13 +4353,50 @@ static void flip_hold_report(void)
     h->held_ns = 0;
 }
 
+/* RECOMP_PB_FLIPSUM=1: one line per FLIP_STALL summarising the methods since
+ * the last one, so a frame that lost work can be compared with its
+ * neighbours (methods, BEGINs, clears, surface changes, software methods,
+ * vertex-program words/loads/starts, per-subchannel counts). */
+static int s_fsum = -1;
+static unsigned fs_m, fs_beg, fs_clr, fs_surf, fs_nop, fs_pw, fs_pl, fs_ps, fs_sub[8];
+static uint32_t fs_surf_last[4], fs_nop_last[4];
+static void flipsum_note(uint32_t subch, uint32_t method, uint32_t param)
+{
+    fs_m++; fs_sub[subch & 7]++;
+    if (subch) return;
+    if (method == 0x17FC && param) fs_beg++;
+    else if (method == 0x1D94) fs_clr++;
+    else if (method == 0x0210) fs_surf_last[fs_surf++ & 3] = param;
+    else if (method == 0x0100 && param) fs_nop_last[fs_nop++ & 3] = param;
+    else if (method >= 0x0B00 && method < 0x0B80) fs_pw++;
+    else if (method == 0x1E9C) fs_pl++;
+    else if (method == 0x1EA0) fs_ps++;
+}
+static void flipsum_flip(void)
+{
+    fprintf(stderr, "[FSUM] m=%u beg=%u clr=%u surf=%u(%08X,%08X) nop=%u(%08X,%08X) pw=%u pl=%u ps=%u sub=%u/%u/%u/%u/%u/%u/%u/%u\n",
+            fs_m, fs_beg, fs_clr, fs_surf, fs_surf_last[0], fs_surf_last[1], fs_nop, fs_nop_last[0], fs_nop_last[1],
+            fs_pw, fs_pl, fs_ps, fs_sub[0], fs_sub[1], fs_sub[2], fs_sub[3], fs_sub[4], fs_sub[5], fs_sub[6], fs_sub[7]);
+    fs_m = fs_beg = fs_clr = fs_surf = fs_nop = fs_pw = fs_pl = fs_ps = 0;
+    memset(fs_sub, 0, sizeof fs_sub);
+    memset(fs_surf_last, 0, sizeof fs_surf_last); memset(fs_nop_last, 0, sizeof fs_nop_last);
+}
+
+uint32_t g_rbx_last_sem;   /* last BACK_END_WRITE_SEMAPHORE_RELEASE the walk executed */
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
 
+    if (s_fsum) {
+        if (s_fsum < 0) s_fsum = getenv("RECOMP_PB_FLIPSUM") != NULL;
+        if (s_fsum) flipsum_note(subch, method, param);
+    }
+
     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
      * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
      * held 0xFF000000 at times, which put the write outside guest memory). */
+    if (subch == 0 && method == 0x1D70) g_rbx_last_sem = param;
     if (subch == 0 && method == 0x1D70) {                    /* fence-exec: see xbox_Nv2aFenceExecMode */
         extern int xbox_Nv2aFenceExecMode(void);
         static int fx_log;
@@ -4694,6 +4731,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         uint64_t stall_ns = xbox_HostNowNs();
         int clock_ok;
         uint32_t stall_vbl;
+        if (s_fsum > 0) flipsum_flip();
         (void)flip_clock(stall_ns, &clock_ok);
         stall_vbl = s_walk_vbl;
         if (s_ftrace == 2)
