@@ -332,9 +332,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
              * fences while the cinematic walker crawled (~draws freeze at
              * 331). Opt in once HUD flight is solid. */
             { "RECOMP_FENCE_EXEC", "0" },
-            /* Clear leaked DISPATCH depth (guest ret 0) so GPU/OHCI IRQs
-             * are not held off for the whole cinematic. */
-            { "RECOMP_IRQL_UNSTICK", "1" },
+            /* One-CPU DISPATCH_LEVEL semantics: a raised thread and a DPC
+             * never run side by side. Without it XAPI's USB enumeration DPC
+             * reports the pad inserted, the title thread calls XInputOpen
+             * before that DPC has finished, gets DEVICE_NOT_CONNECTED and
+             * never retries: no controller input at all. The old
+             * RECOMP_IRQL_UNSTICK=1 default zeroed the depth under the gate
+             * and is no longer set. */
+            { "RECOMP_DISPATCH_GATE", "1" },
             /* VBLANK_CATCHUP stays off by default (menu timing); probe with =1. */
             { "RECOMP_TITLE_KEVENTS", "1" },
             { "RECOMP_VBLANK", "paced" },
@@ -376,6 +381,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         for (i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
             if (!getenv(defs[i].name))
                 _putenv_s(defs[i].name, defs[i].value);
+        }
+        /* The toolkit reads RECOMP_IRQL_UNSTICK as present/absent. */
+        {
+            const char *v = getenv("RECOMP_IRQL_UNSTICK");
+            if (v && strcmp(v, "0") == 0)
+                _putenv_s("RECOMP_IRQL_UNSTICK", "");
         }
         /* RECOMP_AC97_READY=0 means "force off": presence gates the APU. */
         {

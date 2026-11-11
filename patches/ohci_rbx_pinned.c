@@ -1068,6 +1068,8 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
                     ed = rd32(ed + 12) & ED_PTR_MASK;
                 }
             }
+            fprintf(stderr, " hcca=%08X done=%08X slots", hcca, rd32(hcca + HCCA_DONE_HEAD));
+            for (slot = 0; slot < 32u; slot += 4u) fprintf(stderr, " %08X", rd32(hcca + slot * 4u));
             fprintf(stderr, "\n");
             /* A raised IRQL that never drops holds every interrupt off until
              * the forced-delivery timeout, which looks like a slow pad. Name

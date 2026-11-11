@@ -19,6 +19,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
 #include <windows.h>
@@ -304,6 +305,55 @@ static void rbx_d3d_kickoff_yield(void)
     g_ecx = self;
     g_esp += 4;
 }
+
+/* RECOMP_XPP_TRACE=1: log the title's calls into XAPI's peripheral (XPP)
+ * entry points -- args off the guest stack and eax on return -- so input
+ * bring-up can see which of XGetDevices / XInputOpen / XInputGetState the
+ * title actually reaches and what each one hands back.
+ *
+ * Generated code calls these directly, so the hook is link-time: build with
+ * -DRBX_XPP_TRACE after renaming each listed definition in src/recomp/gen to
+ * sub_00XXXXXX_orig. Known: 187F4F XInputOpen, 18825A XGetDevices,
+ * 18827C XGetDeviceChanges, 188233 XdReportDeviceInsertionRemoval,
+ * 18AF89 USBD enumeration-stage completion (DPC). */
+#ifdef RBX_XPP_TRACE
+#define XPP_LIST(X) X(187F4F) X(187FA5) X(187FB1) X(18818E) X(1881FD) \
+                    X(188255) X(18825A) X(18827C) X(18879E) X(1888D0) X(18AF89) X(188233) X(188320) X(189376)
+#define XPP_EXT(v) extern void sub_00##v##_orig(void);
+XPP_LIST(XPP_EXT)
+static void xpp_log(uint32_t va, recomp_func_t fn, volatile LONG *cnt)
+{
+    uint32_t sp = g_esp, ra = MEM32(sp);
+    uint32_t a1 = MEM32(sp + 4), a2 = MEM32(sp + 8), a3 = MEM32(sp + 12), a4 = MEM32(sp + 16);
+    uint32_t c1 = g_ecx;
+    uint32_t pre[8] = {0};
+    if (c1 >= 0x10000u && c1 < 0x04000000u) {
+        for (int k = 0; k < 6; k++) pre[k] = MEM32(c1 + 4 * k);
+        if (pre[4] >= 0x10000u && pre[4] < 0x04000000u) {
+            pre[6] = MEM32(pre[4] + 0x14);
+            if (pre[6] >= 0x10000u && pre[6] < 0x04000000u)
+                pre[7] = MEM32(pre[6] + 4 * ((pre[1] >> 24) & 0xFF));
+        }
+    }
+    LONG n = InterlockedIncrement(cnt);
+    fn();
+    if (n <= 12 || (n & (n - 1)) == 0) {
+        fprintf(stderr, "[XPP] %08X #%ld ra=%08X ecx=%08X args %08X %08X %08X %08X -> eax=%08X\n",
+                va, (long)n, ra, c1, a1, a2, a3, a4, g_eax);
+        if (a1 >= 0x10000u && a1 < 0x04000000u)
+            fprintf(stderr, "[XPP]    *a1 = %08X %08X %08X %08X %08X %08X\n",
+                    MEM32(a1), MEM32(a1 + 4), MEM32(a1 + 8), MEM32(a1 + 12),
+                    MEM32(a1 + 16), MEM32(a1 + 20));
+        if (c1 >= 0x10000u && c1 < 0x04000000u)
+            fprintf(stderr, "[XPP]    pre *ecx = %08X %08X %08X %08X %08X %08X tbl=%08X ent=%08X\n",
+                    pre[0], pre[1], pre[2], pre[3], pre[4], pre[5], pre[6], pre[7]);
+        fflush(stderr);
+    }
+}
+#define XPP_WRAP(v) static volatile LONG xpp_n_##v; \
+    void sub_00##v(void) { xpp_log(0x00##v##u, sub_00##v##_orig, &xpp_n_##v); }
+XPP_LIST(XPP_WRAP)
+#endif /* RBX_XPP_TRACE */
 
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {

@@ -1664,10 +1664,13 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
                     r->cull_enable, r->cull_face,
                     mc ? mc->stage_program : 0, mc ? mc->color_icw[0] : 0, mc ? mc->alpha_icw[0] : 0,
                     mc ? mc->color_ocw[0] : 0, mc ? mc->alpha_ocw[0] : 0, mc ? mc->final0 : 0, mc ? mc->final1 : 0);
-                                if (b->count <= 12 && b->texture)
-                                  for (unsigned vi = 0; vi < b->count; vi++) { const Nv2aVertex *q = &b->vertices[vi];
-                                    fprintf(stderr, "   v%u xyz=%.1f,%.1f,%.2f rhw=%g dif=%08X uv=%.1f,%.1f t0=%.2f,%.2f,%.2f,%.2f wh=%ux%u au=%u av=%u\n", vi, q->x, q->y, q->z, q->rhw, q->diffuse, q->u, q->v,
-                                            q->tex[0][0], q->tex[0][1], q->tex[0][2], q->tex[0][3], b->texture->width, b->texture->height, b->texture->addr_u, b->texture->addr_v); }
+            fprintf(stderr, "   blend en=%u src=%X dst=%X eq=%X col=%08X  atest en=%u func=%X ref=%u  cmask=%08X\n",
+                    (unsigned)r->blend_enable, (unsigned)r->blend_src, (unsigned)r->blend_dst, (unsigned)r->blend_eq, (unsigned)r->blend_color,
+                    (unsigned)r->alpha_test_enable, (unsigned)r->alpha_func, (unsigned)r->alpha_ref, (unsigned)r->color_mask);
+            if (b->count <= 12 && b->texture)
+              for (unsigned vi = 0; vi < b->count; vi++) { const Nv2aVertex *q = &b->vertices[vi];
+                fprintf(stderr, "   v%u xyz=%.1f,%.1f,%.2f rhw=%g dif=%08X uv=%.1f,%.1f t0=%.2f,%.2f,%.2f,%.2f wh=%ux%u au=%u av=%u\n", vi, q->x, q->y, q->z, q->rhw, q->diffuse, q->u, q->v,
+                        q->tex[0][0], q->tex[0][1], q->tex[0][2], q->tex[0][3], b->texture->width, b->texture->height, b->texture->addr_u, b->texture->addr_v); }
           } }
 
         /* Mission lighting audit: RECOMP_GPU_MISSDIFF=1. f>=450 ≈ Ch1 after CONTINUE. */
@@ -1949,6 +1952,50 @@ static void share_close(void)
     s_share_w = s_share_h = 0;
 }
 
+/* RECOMP_GPU_PRESDUMP=<prefix>[:every]: writes exactly what the window is given (the presented D3D target, not guest
+ * memory) as <prefix>_f<frame>.bmp, 24-bit, every N-th published frame (default 30). */
+static void present_dump(Rt *rt)
+{
+    static int on = -1; static unsigned every = 30, n; static char pfx[400];
+    static ID3D11Texture2D *st; static uint32_t sw, sh;
+    D3D11_TEXTURE2D_DESC td; D3D11_MAPPED_SUBRESOURCE m; FILE *f; char path[460]; uint32_t x, y;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_PRESDUMP"), *c;
+        on = 0;
+        if (e && *e) {
+            c = strrchr(e, ':');
+            if (c && c > e + 2 && atoi(c + 1) > 0) { every = (unsigned)atoi(c + 1); snprintf(pfx, sizeof pfx, "%.*s", (int)(c - e), e); }
+            else snprintf(pfx, sizeof pfx, "%s", e);
+            on = 1;
+        }
+    }
+    if (!on || (n++ % every)) return;
+    ID3D11Texture2D_GetDesc(rt->tex, &td);
+    if (!st || sw != td.Width || sh != td.Height) {
+        SAFE_REL(st);
+        td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ; td.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st))) { st = NULL; return; }
+        sw = td.Width; sh = td.Height;
+    }
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)rt->tex);
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &m))) return;
+    snprintf(path, sizeof path, "%s_f%06u.bmp", pfx, s_frame);
+    if ((f = fopen(path, "wb")) != NULL) {
+        uint32_t row = (sw * 3 + 3) & ~3u, size = 54 + row * sh;
+        uint8_t h[54] = { 'B', 'M' }, *line = (uint8_t *)calloc(1, row);
+        *(uint32_t *)(h + 2) = size; *(uint32_t *)(h + 10) = 54; *(uint32_t *)(h + 14) = 40;
+        *(int32_t *)(h + 18) = (int32_t)sw; *(int32_t *)(h + 22) = -(int32_t)sh; *(uint16_t *)(h + 26) = 1; *(uint16_t *)(h + 28) = 24;
+        fwrite(h, 1, 54, f);
+        for (y = 0; y < sh && line; y++) {
+            const uint8_t *src = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
+            for (x = 0; x < sw; x++) { line[x * 3] = src[x * 4]; line[x * 3 + 1] = src[x * 4 + 1]; line[x * 3 + 2] = src[x * 4 + 2]; }
+            fwrite(line, 1, row, f);
+        }
+        free(line); fclose(f);
+    }
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+}
+
 static void publish_frame(void)
 {
     uint32_t va = g_nv2a_flip_va;
@@ -2000,6 +2047,7 @@ static void publish_frame(void)
     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_share, (ID3D11Resource *)rt->tex);
     ID3D11DeviceContext_Flush(s_ctx);
     IDXGIKeyedMutex_ReleaseSync(s_share_mutex, 0);
+    present_dump(rt);
     rt->shown_dirty = 0;
     gpu_present_frame_ready();
 }
