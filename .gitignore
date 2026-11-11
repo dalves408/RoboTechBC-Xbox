@@ -37,6 +37,9 @@ __pycache__/
 # Generated recompiled code
 src/recomp/gen/
 
+# Shared toolkit junction (lives at <tools>\tools\xboxrecomp; not this repo)
+tools/
+
 # Game files / disc images (keep local; do not publish)
 game_files/
 *.xbe
@@ -44,13 +47,40 @@ game_files/
 *.xiso
 *.xiso.iso
 *.SXWad
+*.bik
 
-# Analysis logs (large / regenerable)
+# Analysis logs + probe dumps (keep analysis/default_analysis.json)
 analysis/*.log
 analysis/disc_manifest.json
+analysis/**/*.bmp
+analysis/**/*.png
+analysis/**/*.err
+analysis/**/*.out
+analysis/**/*.pad
+analysis/**/*.pid
+analysis/**/*_frames/
+analysis/bat_*/
+analysis/ch1_*/
+analysis/console_focus_proof/
+analysis/diagfix*
+analysis/diag-*
+analysis/dx11*/
+analysis/fb/
+analysis/gameplay*/
+analysis/gdi_*/
+analysis/newgame*/
+analysis/vsh*/
 
-# Interactive playtest screenshots (F12 / PrintScreen via test_game.bat)
+# Runtime logs
+xbox_kernel.log
+*.log
+
+# Interactive playtest screenshots (Delete key via test_game.bat)
 screenshots/
+*.bmp
+
+# Local misc / non-source
+media/
 
 # IDE / OS
 .vscode/

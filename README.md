@@ -1,36 +1,69 @@
-# Robotech: Battlecry (Xbox) → Windows recomp
+# Robotech: Battlecry (Xbox → Windows)
 
-the build PC working tree for statically recompiling the original Xbox **Robotech: Battlecry** disc with [xboxrecomp](https://github.com/sp00nznet/xboxrecomp), following the same layout as `<tools>\other xboxrecomp projects` and `<tools>\Redcard 2003`.
+Windows recompilation / port of the original Xbox **Robotech: Battlecry** disc, built with [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) and a DX11 present path.
 
-This tree contains **no redistributable game content** in git terms; the local ISO and `game_files\` stay on the build PC.
+This repository holds the **game project** sources, scripts, and pinned USB patches. It does **not** ship the commercial disc, extracted `game_files\`, or the shared xboxrecomp toolkit tree (on the build PC that toolkit is a local junction at `tools\xboxrecomp` → `<tools>\tools\xboxrecomp`).
 
-## Disc (local)
+## Current status (2026-11-10)
 
-| Item | Path |
+| Area | State |
 | --- | --- |
-| XISO | `<repo>\Robotech - Battlecry (USA).xiso.iso` |
-| Extracted | `<repo>\game_files\` |
-| Main XBE | `game_files\default.xbe` |
+| Title / menus | Working on `test_game.bat` (DX11, letterboxed 4:3). |
+| Controls | Working (bak OHCI, keyboard + USB pad). |
+| Ch1 cinematic → HUD | Non-destructive skip via `RECOMP_M101_CINE_SHORT=1` (serves `m101_f.lvl.cine_short`; pristine `m101_f.lvl` stays untouched). |
+| Ch1 flight | HUD + actors; world readable after a brief white flash. **Open:** residual bright water / cyan quads; no long hang-free proof yet. |
+| FPS mode | Not started yet. |
 
-Verified XBE facts (`analysis\default_analysis.json`):
+## Disc (local only — gitignored)
 
-| Property | Value |
+| Item | Path / name |
 | --- | --- |
-| Title | Robotech: Battlecry |
-| Title ID | `544D0002` |
-| Entry point | `0x0001319F` |
-| XDK libs | `1.0.4721` (D3D8, not LTCG) |
-| Sections | 26 (includes D3D, DSOUND, many BINK*, XPP, DOLBY) |
-| `default.xbe` SHA-256 | `2fc8745a72d495626307d644e80f36ec48e216e0132c3c0394446f51f94400b3` |
+| XISO | `Robotech - Battlecry (USA).xiso.iso` |
+| Extracted tree | `game_files\` |
+| Main XBE | `game_files\default.xbe` (Title ID `544D0002`) |
 
-## Toolchain on the build PC
+## Play (the build PC)
 
-- Visual Studio 2022 Build Tools + MSVC
-- CMake, Python 3.12, Git
-- `extract-xiso` at `<tools>\tools\xiso\artifacts\extract-xiso.exe`
-- Shared toolkit junction: `tools\xboxrecomp` → `<tools>\tools\xboxrecomp` (v0.16.0)
+Double-click or run:
 
-## Commands
+```bat
+test_game.bat
+```
+
+That launcher:
+
+- Runs `build\RelWithDebInfo\robotech_bc_recomp.exe`
+- Keeps **full intros** (restores any stashed Binks)
+- Forces `RECOMP_SWM5_PACE_MS=0` (non-zero early-signals the D3D fence and breaks menus into white-box glyphs)
+- Pins **bak OHCI** from `patches\ohci.c.dx11bak` and rebuilds if the shared toolkit `ohci.c` drifted
+- Clears `RECOMP_USB_SYNTH_TD` / `RECOMP_USB_XAPI_TD` (do **not** enable these for this title)
+
+### Controls
+
+| Input | Pad |
+| --- | --- |
+| Arrows | D-pad |
+| Enter / Z | A (confirm / skip intro) |
+| Esc / X | B |
+| Space | START (skip intro / Attract) |
+| WASD | Left stick |
+| Delete | Screenshot → `screenshots\shot_*.bmp` |
+
+Keys work even when the console keeps focus (raw INPUTSINK + async). Enter/Space/Z skip guest Bink/Attract once the pad map is open (~20–40s in). Wait through logos to the title menu.
+
+### Agent / bring-up: short Ch1 cinematic
+
+For faster Ch1 HUD entry without dirtying the level:
+
+```powershell
+cd "<repo>"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_m101_cine_overlay.ps1 -Mode Mild
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\drive_ch1_overlay.ps1 -Mode Mild
+```
+
+## Build from scratch
+
+Needs Visual Studio 2022 Build Tools (MSVC), CMake, Python 3.12, Git, `extract-xiso`, and a local xboxrecomp checkout linked or copied as `tools\xboxrecomp`.
 
 ```powershell
 cd "<repo>"
@@ -38,19 +71,26 @@ cd "<repo>"
 .\scripts\extract_disc.ps1
 .\.venv\Scripts\python.exe scripts\pipeline.py --lift
 .\scripts\build.ps1 -Configuration RelWithDebInfo
-.\.venv\Scripts\python.exe scripts\run_game.py --configuration RelWithDebInfo --seconds 60
+.\test_game.bat
 ```
 
-## Milestone status (2026-11-09)
+## Hard constraints (do not regress)
 
-- **Boots** RelWithDebInfo `build\RelWithDebInfo\robotech_bc_recomp.exe`; 640×480 window opens.
-- D3D init needed `xbox_Nv2aMirrorFence(0x00166B48, 0x30, 0x34)` in `src/main.c`.
-- Logo/intro Binks are slow; use `.\scripts\skip_boot_movies.ps1` for menu bring-up.
-- With movies skipped: loads `menu_f.lvl`, skins, theme; menu tick `0x0001FF70` seeded/lifted.
-- **Still black on screen** — menu state runs, presented FB dump is empty. Next: present/flip path.
+1. **No `RECOMP_USB_SYNTH_TD` / `RECOMP_USB_XAPI_TD`** — SYNTH crashes this title’s XAPI ISR; keep bak OHCI pinned.
+2. **`RECOMP_SWM5_PACE_MS=0`** on the tester’s menu play path.
+3. **Full intros** for interactive testing unless explicitly asked to skip.
+4. **Never leave `m101_f.lvl` dirty** — use the `m101_f.lvl.cine_short` overlay (`RECOMP_M101_CINE_SHORT`).
 
-```powershell
-.\scripts\skip_boot_movies.ps1
-$env:RECOMP_AC97_READY='1'; $env:RECOMP_FB_WINDOW='1'; $env:RECOMP_KEYBOARD='1'
-.\.venv\Scripts\python.exe scripts\run_game.py --configuration RelWithDebInfo
-```
+## Layout
+
+| Path | Role |
+| --- | --- |
+| `src\` | Host entry (`main.c`), DX11 present (`rbx_d3d11.c`), recomp stubs |
+| `scripts\` | Setup, extract, lift/build, Ch1 drive helpers |
+| `patches\` | Pinned bak OHCI (`ohci.c.dx11bak`, `ohci_rbx_pinned.c`) |
+| `docs\` | Milestone notes checked into this tree |
+| `test_game.bat` | Interactive play launcher |
+
+## License / ownership
+
+Robotech: Battlecry is a commercial game. Provide your own legally obtained Xbox ISO. This repo publishes only recomp/port engineering work — not game assets or binaries.
