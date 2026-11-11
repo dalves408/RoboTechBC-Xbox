@@ -336,6 +336,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             /* VBLANK_CATCHUP stays off by default (menu timing); probe with =1. */
             { "RECOMP_TITLE_KEVENTS", "1" },
             { "RECOMP_VBLANK", "paced" },
+            /* Isolate paced vblank from timer-thread DPC drains (mission
+             * spikes were 0.3–1.4 s while the schedule was otherwise locked). */
+            { "RECOMP_VBLANK_THREAD", "1" },
+            /* Cap timer-thread DPC drain slices (ms) after IRQL unstick floods. */
+            { "RECOMP_TIMER_DPC_MS", "3" },
             /* Keep the paced-vblank timer above raster workers so mission
              * frames that burn all cores cannot open multi-second vblank gaps. */
             { "RECOMP_TIMER_PRIO", "2" },
