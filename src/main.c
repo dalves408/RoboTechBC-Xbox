@@ -320,7 +320,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             { "RECOMP_PB_WALK", "dma" },
             /* Mid-walk IdleWake early-signals the D3D fence and races menu
              * UI pushbuffers (white glyph boxes). Off for interactive/bat;
-             * Ch1 probes set RECOMP_SWM5_PACE_MS=16 (+ optional PACE_THREAD). */
+             * Ch1 probes set RECOMP_SWM5_PACE_MS=16 (+ PACE_THREAD) and gate
+             * with RECOMP_SWM5_PACE_ENABLE so menus stay clean until m101. */
             { "RECOMP_SWM5_PACE_MS", "0" },
             { "RECOMP_FB_WINDOW", "1" },
             { "RECOMP_KEYBOARD", "1" },
