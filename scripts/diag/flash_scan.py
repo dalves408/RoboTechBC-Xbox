@@ -28,7 +28,14 @@ def main():
     if len(files) < 3:
         print("need >= 3 frames")
         return
-    imgs = [load(f) for f in files]
+    imgs, ok = [], []
+    for f in files:
+        try:
+            imgs.append(load(f))
+            ok.append(f)
+        except OSError:  # last dump truncated when the process was killed
+            pass
+    files = ok
     flashes = 0
     for i in range(len(imgs)):
         luma = imgs[i].mean()
