@@ -48,6 +48,24 @@ if(EXISTS "${_RBX_OHCI_BAK}" AND TARGET xbox_usb)
     message(STATUS "Robotech: linking pinned bak OHCI (${_RBX_OHCI_PIN})")
 endif()
 
+# Project-pinned NV2A pushbuffer executor (vertex cache, hot-path trims;
+# see the header of patches/nv2a_pb_exec_rbx.c). Re-sync it by hand when the
+# shared toolkit's nv2a_pb_exec.c gains fixes this title needs.
+set(_RBX_PBEXEC "${CMAKE_CURRENT_SOURCE_DIR}/patches/nv2a_pb_exec_rbx.c")
+if(EXISTS "${_RBX_PBEXEC}" AND TARGET xbox_kernel)
+    get_target_property(_K_SOURCES xbox_kernel SOURCES)
+    set(_K_FILTERED "")
+    foreach(_s IN LISTS _K_SOURCES)
+        get_filename_component(_sn "${_s}" NAME)
+        if(NOT _sn STREQUAL "nv2a_pb_exec.c")
+            list(APPEND _K_FILTERED "${_s}")
+        endif()
+    endforeach()
+    set_property(TARGET xbox_kernel PROPERTY SOURCES ${_K_FILTERED})
+    target_sources(xbox_kernel PRIVATE "${_RBX_PBEXEC}")
+    message(STATUS "Robotech: linking pinned NV2A executor (${_RBX_PBEXEC})")
+endif()
+
 file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 
 set(GAME_SOURCES

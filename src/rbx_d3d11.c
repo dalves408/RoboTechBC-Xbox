@@ -1361,8 +1361,14 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     D3D11_VIEWPORT vp;
     uint32_t i, kept = 0, need, xneed;
     int strip_odd = 0;
-    Nv2aVertex *dst;
-    RcVertExt *xdst = NULL;
+    /* Built in CPU memory and copied into the mapped buffers in one go: the
+     * mapped pointers are write-combined, and the loop below reads back
+     * what it wrote (strip test, t1 fix-up, ext copy, SKIPBLACK). Reads
+     * from WC memory are uncached -- that was ~85% of mission CPU time. */
+    static Nv2aVertex *s_stage_v;
+    static RcVertExt *s_stage_x;
+    Nv2aVertex *dst, *mdst;
+    RcVertExt *xdst = NULL, *mxdst = NULL;
     Cb cb;
     ID3D11ShaderResourceView *srv;
     ID3D11SamplerState *smp = NULL;
@@ -1415,12 +1421,17 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vb, 0,
                s_vb_off == 0 ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &m)))
         return;
-    dst = (Nv2aVertex *)((uint8_t *)m.pData + s_vb_off);
+    if (!s_stage_v) s_stage_v = (Nv2aVertex *)malloc(VB_BYTES);
+    if (!s_stage_x) s_stage_x = (RcVertExt *)malloc(XVB_BYTES);
+    if (!s_stage_v || !s_stage_x) { ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0); return; }
+    mdst = (Nv2aVertex *)((uint8_t *)m.pData + s_vb_off);
+    dst = s_stage_v;
     if (xneed && s_xvb) {
         D3D11_MAPPED_SUBRESOURCE xm;
         if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_xvb, 0,
                        s_xvb_off == 0 ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &xm))) {
-            xdst = (RcVertExt *)((uint8_t *)xm.pData + s_xvb_off);
+            mxdst = (RcVertExt *)((uint8_t *)xm.pData + s_xvb_off);
+            xdst = s_stage_x;
             packed_ext = 1;
         }
     }
@@ -1507,6 +1518,10 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
                 return;
             }
         }
+    }
+    if (kept) {
+        memcpy(mdst, dst, kept * sizeof *dst);
+        if (packed_ext && mxdst) memcpy(mxdst, xdst, kept * sizeof *xdst);
     }
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
     if (packed_ext && s_xvb)
@@ -2140,6 +2155,43 @@ static const Nv2aBackend s_backend = { gb_clear, gb_draw, gb_flip };
 #pragma comment(lib, "dbghelp.lib")
 typedef struct { DWORD64 a, b; unsigned n; } ProfB;
 static char g_prof_chain[8][1200]; static int g_prof_chain_n;
+/* RECOMP_PROF line histogram for the busiest thread: source line of each sample. */
+typedef struct { char file[96]; DWORD line; unsigned n; } ProfLine;
+static ProfLine g_prof_lines[2048]; static unsigned g_prof_nlines;
+static void prof_line_add(DWORD64 rip)
+{
+    IMAGEHLP_LINE64 ln; DWORD d = 0; unsigned k; const char *f;
+    memset(&ln, 0, sizeof ln); ln.SizeOfStruct = sizeof ln;
+    if (!SymGetLineFromAddr64(GetCurrentProcess(), rip, &d, &ln) || !ln.FileName) return;
+    f = strrchr(ln.FileName, '\\'); f = f ? f + 1 : ln.FileName;
+    for (k = 0; k < g_prof_nlines; k++)
+        if (g_prof_lines[k].line == ln.LineNumber && !strcmp(g_prof_lines[k].file, f)) { g_prof_lines[k].n++; return; }
+    if (g_prof_nlines < 2048) { ProfLine *q = &g_prof_lines[g_prof_nlines++]; strncpy(q->file, f, sizeof q->file - 1); q->line = ln.LineNumber; q->n = 1; }
+}
+static void prof_line_dump(void)
+{
+    unsigned r, k, tot = 0;
+    for (k = 0; k < g_prof_nlines; k++) tot += g_prof_lines[k].n;
+    if (!tot) return;
+    fprintf(stderr, "[PROF] lines of busiest thread (%u samples with line info):\n", tot);
+    {   /* per-file totals */
+        char fn[64][96]; unsigned fc[64], nf = 0, j;
+        for (k = 0; k < g_prof_nlines; k++) {
+            for (j = 0; j < nf; j++) if (!strcmp(fn[j], g_prof_lines[k].file)) break;
+            if (j == nf && nf < 64) { strcpy(fn[nf], g_prof_lines[k].file); fc[nf++] = 0; }
+            if (j < nf) fc[j] += g_prof_lines[k].n;
+        }
+        for (j = 0; j < nf; j++) if (fc[j] * 200 >= tot)
+            fprintf(stderr, "[PROF]   file %5.1f%% %s\n", 100.0 * fc[j] / tot, fn[j]);
+    }
+    for (r = 0; r < 30; r++) {
+        unsigned bi = 0, bn = 0;
+        for (k = 0; k < g_prof_nlines; k++) if (g_prof_lines[k].n > bn) { bn = g_prof_lines[k].n; bi = k; }
+        if (!bn) break;
+        fprintf(stderr, "[PROF]   %5.1f%% %s:%lu\n", 100.0 * bn / tot, g_prof_lines[bi].file, (unsigned long)g_prof_lines[bi].line);
+        g_prof_lines[bi].n = 0;
+    }
+}
 static DWORD WINAPI gb_prof_thread(LPVOID p)
 {
     unsigned lo = 0, hi = 0; DWORD t0 = GetTickCount(); DWORD self = GetCurrentThreadId();
@@ -2169,6 +2221,7 @@ static DWORD WINAPI gb_prof_thread(LPVOID p)
             if (SuspendThread(h) != (DWORD)-1) {
                 CONTEXT c; memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_CONTROL;
                 if (GetThreadContext(h, &c)) {
+                    if (i == 0) prof_line_add(c.Rip);
                     DWORD64 a = c.Rip, disp = 0; char buf[sizeof(SYMBOL_INFO) + 256]; SYMBOL_INFO *si = (SYMBOL_INFO *)buf; unsigned k;
                     memset(buf, 0, sizeof buf); si->SizeOfStruct = sizeof(SYMBOL_INFO); si->MaxNameLen = 255;
                     if (SymFromAddr(GetCurrentProcess(), a, &disp, si)) a = si->Address; else a &= ~0xFFULL;
@@ -2192,6 +2245,7 @@ static DWORD WINAPI gb_prof_thread(LPVOID p)
         }
         Sleep(1);
     }
+    prof_line_dump();
     for (i = 0; i < nt; i++) {
         unsigned r, k; if (tot[i] < 50) continue;
         fprintf(stderr, "[PROF] thread %lu samples=%u\n", tids[i], tot[i]);
