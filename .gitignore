@@ -88,3 +88,5 @@ media/
 *.swp
 Thumbs.db
 .DS_Store
+
+analysis/

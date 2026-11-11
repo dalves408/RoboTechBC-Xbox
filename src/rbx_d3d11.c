@@ -681,6 +681,9 @@ static ID3D11BlendState *get_blend(const Nv2aRenderState *r)
     d.RenderTarget[0].SrcBlendAlpha = blend_factor(r->blend_src, 1);
     d.RenderTarget[0].DestBlendAlpha = blend_factor(r->blend_dst, 1);
     d.RenderTarget[0].BlendOpAlpha = blend_op(r->blend_eq);
+    /* Presentation treats the target's alpha as opacity, so alpha blending must not write it (stray alpha showed as white panels). */
+    { static int ka = -1; if (ka < 0) ka = getenv("RECOMP_GPU_RAWALPHA") == NULL;
+      if (ka) { d.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO; d.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE; d.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD; } }
     d.RenderTarget[0].RenderTargetWriteMask =
         (uint8_t)(((r->color_mask & 0x00010000) ? 1 : 0) | ((r->color_mask & 0x100) ? 2 : 0) |
                   ((r->color_mask & 1) ? 4 : 0) | ((r->color_mask & 0x01000000) ? 8 : 0));
@@ -1113,7 +1116,7 @@ decode:
         if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &e->tex))) { fprintf(stderr, "[RBX DX11] CreateTexture2D failed %ux%u fmt=%02X\n", t->width, t->height, t->color); free(argb); e->tex = NULL; return s_white_srv; }
         { static int tl = -1; static unsigned nlog;
           if (tl < 0) tl = getenv("RECOMP_GPU_TEXLOG") ? 1 : 0;
-          if (tl && nlog < 400) { nlog++;
+          if (tl && nlog < 400 && t->width < 512) { nlog++;
               fprintf(stderr, "[TEXLOG] f%u new tex off=%08X %ux%u fmt=%02X pitch=%u pal=%08X hash=%016llX", s_frame, t->offset, t->width, t->height, t->color, t->pitch, t->palette, (unsigned long long)h);
               if (t->color == 0x0B && t->palette) { const uint32_t *pp = (const uint32_t *)(mem + t->palette); unsigned a0 = 0, aw = 0, k; for (k = 0; k < 256; k++) { if ((pp[k] >> 24) == 0) a0++; if (pp[k] == 0xFFFFFFFFu) aw++; } fprintf(stderr, " pal: alpha0=%u white=%u e0=%08X e1=%08X e255=%08X palhash=%016llX", a0, aw, pp[0], pp[1], pp[255], (unsigned long long)hash_bytes(mem + t->palette, 1024)); }
               { unsigned a0 = 0, aw = 0; size_t k, np = (size_t)t->width * t->height; for (k = 0; k < np; k++) { if ((argb[k] >> 24) == 0) a0++; else if (argb[k] == 0xFFFFFFFFu) aw++; } fprintf(stderr, " decoded: alpha0=%u%% white=%u%%\n", (unsigned)(a0 * 100ull / np), (unsigned)(aw * 100ull / np)); }
@@ -1144,6 +1147,7 @@ static void texdump_poll(void)
     if (!dir || !flag) return;
     f = fopen(flag, "rb");
     s_texdump_on = f != NULL;
+    { static int last = -1; if (last != s_texdump_on) { last = s_texdump_on; fprintf(stderr, "[TEXDUMP] %s flag=%s dir=%s\n", s_texdump_on ? "on" : "off", flag, dir); } }
     if (f) fclose(f);
 }
 static void texdump(const Nv2aTexture *t)
@@ -1508,6 +1512,22 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     if (packed_ext && s_xvb)
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_xvb, 0);
     if (!kept) return;
+    /* RECOMP_GPU_DRAWCAP=lo:hold: from frame lo, only the first N draws of each frame render, N growing by 1
+     * every `hold` frames; each change is logged with wall-clock ms so framebuffer dumps can be matched. */
+    { static unsigned cap_lo, cap_hold, cap_idx, cap_last = ~0u, cap_n; static int cap_on = -1;
+      if (cap_on < 0) { const char *e = getenv("RECOMP_GPU_DRAWCAP"); cap_on = (e && sscanf(e, "%u:%u", &cap_lo, &cap_hold) == 2 && cap_hold) ? 1 : 0; }
+      if (cap_on && s_frame >= cap_lo) {
+          if (s_frame != cap_last) {
+              cap_last = s_frame; cap_idx = 0;
+              if (cap_n != 1 + (s_frame - cap_lo) / cap_hold) {
+                  FILETIME ft; ULARGE_INTEGER u;
+                  cap_n = 1 + (s_frame - cap_lo) / cap_hold;
+                  GetSystemTimeAsFileTime(&ft); u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+                  fprintf(stderr, "[DRAWCAP] t=%llu cap=%u frame=%u\n", (unsigned long long)(u.QuadPart / 10000), cap_n, s_frame);
+              }
+          }
+          if (getenv("RECOMP_GPU_CAPONLY") ? (cap_idx++ + 1 != (unsigned)atoi(getenv("RECOMP_GPU_CAPONLY"))) : (cap_idx++ >= cap_n)) return;
+      } }
 
     {
         int use_rc = b->combiner != NULL;
@@ -1628,6 +1648,27 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
                             b->stages && (b->stage_valid & 1) ? b->stages[0].offset : 0); }
             }
         }
+
+        /* RECOMP_GPU_DRAWLOG=lo-hi: one line per draw for frames lo..hi (UI/menu glitch hunting). */
+        { static unsigned dl_lo = 1, dl_hi = 0, dl_n; static int dl = -1;
+          if (dl < 0) { const char *e = getenv("RECOMP_GPU_DRAWLOG"); dl = (e && sscanf(e, "%u-%u", &dl_lo, &dl_hi) == 2) ? 1 : 0; }
+          if (dl && s_frame >= dl_lo && s_frame <= dl_hi && dl_n++ < 4000) {
+            const Nv2aCombiner *mc = use_rc ? b->combiner : NULL;
+            const Nv2aVertex *v0 = &b->vertices[0];
+            fprintf(stderr, "[DRAWLOG] f%u rc=%d n=%u rt=%08X %ux%u c0=%08X tex=%s off=%08X fmt=%02X bl=%u %X/%X eq=%X at=%u/%X/%u dt=%u/%X dw=%u cm=%08X cull=%u/%X sp=%08X ic=%08X ai=%08X oc=%08X ao=%08X fin=%08X/%08X\n",
+                    s_frame, use_rc, kept, s->color_va, s->width, s->height, v0->diffuse,
+                    b->texture ? "Y" : "n", b->texture ? b->texture->offset : 0, b->texture ? b->texture->color : 0,
+                    r->blend_enable, r->blend_src, r->blend_dst, r->blend_eq,
+                    r->alpha_test_enable, r->alpha_func, r->alpha_ref,
+                    r->depth_test_enable, r->depth_func, r->depth_write, r->color_mask,
+                    r->cull_enable, r->cull_face,
+                    mc ? mc->stage_program : 0, mc ? mc->color_icw[0] : 0, mc ? mc->alpha_icw[0] : 0,
+                    mc ? mc->color_ocw[0] : 0, mc ? mc->alpha_ocw[0] : 0, mc ? mc->final0 : 0, mc ? mc->final1 : 0);
+                                if (b->count <= 12 && b->texture)
+                                  for (unsigned vi = 0; vi < b->count; vi++) { const Nv2aVertex *q = &b->vertices[vi];
+                                    fprintf(stderr, "   v%u xyz=%.1f,%.1f,%.2f rhw=%g dif=%08X uv=%.1f,%.1f t0=%.2f,%.2f,%.2f,%.2f wh=%ux%u au=%u av=%u\n", vi, q->x, q->y, q->z, q->rhw, q->diffuse, q->u, q->v,
+                                            q->tex[0][0], q->tex[0][1], q->tex[0][2], q->tex[0][3], b->texture->width, b->texture->height, b->texture->addr_u, b->texture->addr_v); }
+          } }
 
         /* Mission lighting audit: RECOMP_GPU_MISSDIFF=1. f>=450 ≈ Ch1 after CONTINUE. */
         { static int md = -1; if (md < 0) md = getenv("RECOMP_GPU_MISSDIFF") != NULL;
