@@ -64,6 +64,21 @@ set "RECOMP_KEY_SCRIPT="
 set "RECOMP_WATCHDOG_SECS="
 set "RECOMP_FMV_DUMP="
 
+rem Menu-safe: clear Ch1/probe leftovers that Explorer/user env can inherit.
+rem Non-zero SWM5_PACE_MS early-signals the D3D fence → white-box glyph menus.
+set "RECOMP_SWM5_PACE_MS=0"
+set "RECOMP_SWM5_PACE_ENABLE="
+set "RECOMP_SWM5_PACE_THREAD="
+set "RECOMP_VBLANK_THREAD="
+set "RECOMP_PAD_HOLD_MASK="
+set "RECOMP_PAD_HOLD_ENABLE="
+set "RECOMP_GPU_SKIPBLACK="
+set "RECOMP_WATCH="
+set "RECOMP_KERNEL_WATCH="
+set "RECOMP_PEEK="
+set "RECOMP_TIMER_DPC_MS="
+set "RECOMP_FLIP_PACING=0"
+
 set "RECOMP_FB_SHOT_DIR=%CD%\screenshots"
 set "RECOMP_ERR_LOG=%CD%\screenshots\test_game.err.log"
 if not exist "%RECOMP_FB_SHOT_DIR%" mkdir "%RECOMP_FB_SHOT_DIR%"
