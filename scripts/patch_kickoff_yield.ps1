@@ -92,3 +92,19 @@ if ($changed) {
 } else {
     Write-Output "already patched: $path"
 }
+
+# 0x1166C (shared epilogue of 0x11370/0x11424) is implemented in
+# recomp_manual.c; the lifter's unresolved stub for it never restored edi,
+# which froze the mission's fixed-step loop.
+$stubs = Join-Path $root 'src\recomp\gen\recomp_stubs_unresolved.c'
+if (Test-Path $stubs) {
+    $st = [IO.File]::ReadAllText($stubs)
+    $old = 'void sub_0001166C(void) {'
+    if ($st.Contains($old)) {
+        $st = $st.Replace($old, 'void sub_0001166C_stub(void) { /* RBX: real one in src/recomp_manual.c */')
+        [IO.File]::WriteAllText($stubs, $st)
+        Write-Output "patched $stubs"
+    } else {
+        Write-Output "already patched: $stubs"
+    }
+}

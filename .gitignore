@@ -90,3 +90,4 @@ Thumbs.db
 .DS_Store
 
 analysis/
+build_abi/

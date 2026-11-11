@@ -81,6 +81,14 @@ add_executable(${PROJECT_NAME} WIN32
     ${RECOMP_GEN_SOURCES}
 )
 
+# -DRBX_ABI_CHECK=ON (use a separate build dir): every lifted direct call checks
+# that ebx/esi/edi survive it; src/recomp_manual.c logs offenders as [ABI].
+option(RBX_ABI_CHECK "Check callee-saved registers across lifted calls" OFF)
+if(RBX_ABI_CHECK)
+    set_source_files_properties(${RECOMP_GEN_SOURCES} PROPERTIES COMPILE_DEFINITIONS RECOMP_ABI_CHECK)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE RBX_ABI_CHECK)
+endif()
+
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
 target_include_directories(${PROJECT_NAME} PRIVATE

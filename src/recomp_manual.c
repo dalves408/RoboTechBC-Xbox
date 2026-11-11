@@ -360,6 +360,32 @@ void sub_001558D0(void)
     }
 }
 
+/* 0x1166C is the shared tail of 0x11370 (the mission's per-frame callback,
+ * third argument of the fixed-step loop 0x10FC80) and 0x11424:
+ *
+ *     cmp  [0x1BC410], edi
+ *     pop  edi
+ *     jne  0x12440        ; tail call
+ *     ret
+ *
+ * The lifter did not see it as an entry point and left an unresolved stub
+ * that only pops 4 bytes. That never restored edi (0x11370 zeroes it), so the
+ * fixed-step loop's update pointer became NULL and the mission froze on its
+ * first frame; esp also drifted by 4 per frame and 0x12440 never ran.
+ * scripts/patch_kickoff_yield.ps1 renames the generated stub out of the way. */
+void sub_00012440(void);
+void sub_0001166C(void)
+{
+    int same = MEM32(0x1BC410u) == g_edi;
+    g_edi = MEM32(g_esp);
+    g_esp += 4;
+    if (same) {
+        g_esp += 4;
+        return;
+    }
+    sub_00012440();
+}
+
 /* RECOMP_XPP_TRACE=1: log the title's calls into XAPI's peripheral (XPP)
  * entry points -- args off the guest stack and eax on return -- so input
  * bring-up can see which of XGetDevices / XInputOpen / XInputGetState the
@@ -466,19 +492,23 @@ void recomp_icall_fail_log(uint32_t va)
  */
 void recomp_icall_not_code_log(uint32_t va)
 {
-    enum { SLOTS = 16 };
-    static uint32_t seen[SLOTS];
+    enum { SLOTS = 32 };
+    static uint32_t seen[SLOTS], seen_ret[SLOTS];
     static uint64_t hits[SLOTS];
     static int count;
     int i;
+    /* Every caller pushes the guest return address just before this check,
+     * so it identifies the call site (the target alone is usually just 0). */
+    uint32_t ret = MEM32(g_esp);
 
     for (i = 0; i < count; i++)
-        if (seen[i] == va)
+        if (seen[i] == va && seen_ret[i] == ret)
             break;
     if (i == count) {
         if (count == SLOTS)
             return;
         seen[count] = va;
+        seen_ret[count] = ret;
         hits[count] = 0;
         count++;
     }
@@ -495,11 +525,49 @@ void recomp_icall_not_code_log(uint32_t va)
             return;
     }
     fprintf(stderr, "[ICALL] target 0x%08X is not code -- skipped %llu time(s) "
-                    "(null or wild function pointer, at call #%llu)\n",
-            va, (unsigned long long)hits[i],
+                    "(null or wild function pointer, ret 0x%08X, at call #%llu)\n",
+            va, (unsigned long long)hits[i], ret,
             (unsigned long long)g_icall_count);
     fflush(stderr);
 }
+
+#ifdef RBX_ABI_CHECK
+/* Built with -DRBX_ABI_CHECK=ON: a lifted callee returned without restoring
+ * ebx/esi/edi (or popped too little). Reported per callee at 1, 10, 100...
+ * hits, with the caller's return address, so the routine corrupting a hot
+ * loop stands out. */
+void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+                              uint32_t edi0, uint32_t esp0)
+{
+    enum { SLOTS = 1024 };
+    static uint32_t seen[SLOTS];
+    static uint64_t hits[SLOTS];
+    static int count;
+    uint64_t n;
+    int i;
+
+    for (i = 0; i < count; i++)
+        if (seen[i] == va)
+            break;
+    if (i == count) {
+        if (count == SLOTS)
+            return;
+        seen[count++] = va;
+    }
+    n = ++hits[i];
+    while (n >= 10 && n % 10 == 0)
+        n /= 10;
+    if (n != 1)
+        return;
+    fprintf(stderr, "[ABI] sub_%08X x%llu:%s%s%s%s ebx %08X->%08X esi %08X->%08X "
+                    "edi %08X->%08X esp %08X->%08X ret %08X\n",
+            va, (unsigned long long)hits[i],
+            g_ebx != ebx0 ? " ebx" : "", g_esi != esi0 ? " esi" : "",
+            g_edi != edi0 ? " edi" : "", g_esp < esp0 + 4 ? " esp" : "",
+            ebx0, g_ebx, esi0, g_esi, edi0, g_edi, esp0, g_esp, MEM32(esp0));
+    fflush(stderr);
+}
+#endif
 
 /* ── Untranslated instructions ───────────────────────────────────────────
  *
