@@ -4,7 +4,7 @@ Windows recompilation / port of the original Xbox **Robotech: Battlecry** disc, 
 
 This repository holds the **game project** sources, scripts, and pinned USB patches. It does **not** ship the commercial disc, extracted `game_files\`, or the shared xboxrecomp toolkit tree (on the build PC that toolkit is a local junction at `tools\xboxrecomp` → `<tools>\tools\xboxrecomp`).
 
-## Current status
+## Current status (2026-11-11)
 
 | Area | State |
 | --- | --- |
@@ -46,20 +46,20 @@ That launcher:
 | Enter / Z | A (confirm / skip intro) |
 | Esc / X | B |
 | Space | START (skip intro / Attract) |
-| WASD | Left stick |
+| WASD / keypad 8462 | Left stick |
+| IJKL | Right stick |
+| C / V | X / Y |
+| Q / E | White / Black |
+| 1 / 3 | Left / right trigger |
+| Shift / Ctrl | Left / right stick click |
+| Backspace | BACK |
 | Delete | Screenshot → `screenshots\shot_*.bmp` |
 
 Keys work even when the console keeps focus (raw INPUTSINK + async). Enter/Space/Z skip guest Bink/Attract once the pad map is open (~20–40s in). Wait through logos to the title menu.
 
-### Agent / bring-up: short Ch1 cinematic
+### Short Ch1 cinematic overlay (obsolete)
 
-For faster Ch1 HUD entry without dirtying the level:
-
-```powershell
-cd "<repo>"
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_m101_cine_overlay.ps1 -Mode Mild
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\drive_ch1_overlay.ps1 -Mode Mild
-```
+`scripts\build_m101_cine_overlay.ps1` / `scripts\drive_ch1_overlay.ps1` (`RECOMP_M101_CINE_SHORT`) were a workaround for the frozen Ch1 cinematic. That freeze is fixed (stub 0x1166C), so the overlay is no longer needed; the scripts are kept for reference only.
 
 ## Build from scratch
 
@@ -106,7 +106,8 @@ Output goes to `analysis\diag\<name>\` (`report.json`, `shots\`, `stderr.log`, `
 | Path | Role |
 | --- | --- |
 | `src\` | Host entry (`main.c`), DX11 present (`rbx_d3d11.c`), recomp stubs |
-| `scripts\` | Setup, extract, lift/build, Ch1 drive helpers |
+| `scripts\` | Setup, extract, lift/build, gen patcher, Ch1 drive helpers |
+| `scripts\diag\` | Diagnostic harness, stack dumper, flash scanner |
 | `patches\` | Pinned bak OHCI (`ohci.c.dx11bak`, `ohci_rbx_pinned.c`) |
 | `docs\` | Milestone notes checked into this tree |
 | `test_game.bat` | Interactive play launcher |
