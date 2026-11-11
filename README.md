@@ -4,15 +4,15 @@ Windows recompilation / port of the original Xbox **Robotech: Battlecry** disc, 
 
 This repository holds the **game project** sources, scripts, and pinned USB patches. It does **not** ship the commercial disc, extracted `game_files\`, or the shared xboxrecomp toolkit tree (on the build PC that toolkit is a local junction at `tools\xboxrecomp` → `<tools>\tools\xboxrecomp`).
 
-## Current status (2026-11-10)
+## Current status
 
 | Area | State |
 | --- | --- |
-| Title / menus | Working on `test_game.bat` (DX11, letterboxed 4:3). |
-| Controls | Working (bak OHCI, keyboard + USB pad). |
-| Ch1 cinematic → HUD | Non-destructive skip via `RECOMP_M101_CINE_SHORT=1` (serves `m101_f.lvl.cine_short`; pristine `m101_f.lvl` stays untouched). |
-| Ch1 flight | HUD + actors; world readable after a brief white flash. **Open:** residual bright water / cyan quads; no long hang-free proof yet. |
-| FPS mode | Not started yet. |
+| Title / menus | Working (DX11, letterboxed 4:3). Menu flashing fixed (BlockOnFence spurious-wake recheck). 130+ fps. |
+| Controls | Working (bak OHCI, keyboard + USB pad); verified in-mission (stick, START pause menu). |
+| Ch1 mission | Plays live: world, HUD, radar, enemies, weapons. 60–80 fps (min 59 over a 100 s soak), no hangs. The previous "frozen cinematic" was the unresolved stub at 0x1166C (see `src/recomp_manual.c`), so the `RECOMP_M101_CINE_SHORT` overlay is no longer needed — it was a workaround, not a fix. |
+| Audio | Music, SFX and VO play; no underruns or clipping in the mix. |
+| Open | A rare (~1 in 13 runs) main-menu stall; `rbx_diag.py` now dumps all thread stacks when it recurs. |
 
 ## Disc (local only — gitignored)
 
@@ -74,12 +74,32 @@ cd "<repo>"
 .\test_game.bat
 ```
 
+## Diagnostics
+
+```powershell
+# Boot, skip intros, play into Ch1; screenshots, fps/CPU timeline, log anomalies, hang stacks
+$keys=((6..30 | ? { $_ % 2 -eq 0 } | % { "${_}:enter:150" })) -join ','
+python scripts\diag\rbx_diag.py --secs 100 --shot-every 4 --audio --name run1 --keys $keys
+```
+
+Output goes to `analysis\diag\<name>\` (`report.json`, `shots\`, `stderr.log`, `hang_t*_stacks.txt`).
+
+| Tool | Use |
+| --- | --- |
+| `scripts\diag\rbx_diag.py` | Harness: timed keys, fps/CPU/threads, frozen-frame + hang detection, audio WAV analysis. |
+| `scripts\diag\stackdump.py <pid>` | Symbolized stacks of every thread (guest functions show as `sub_XXXXXXXX`). |
+| `scripts\diag\flash_scan.py` | Finds flashing frames in a `RECOMP_GPU_PRESDUMP` capture. |
+| `-DRBX_ABI_CHECK=ON` (CMake) | Diagnostic build that reports lifted functions which fail to restore ebx/esi/edi/esp. |
+| `RECOMP_STUB_LOG=1` | Logs when an unresolved lifter stub is reached. |
+| `RECOMP_PROF=lo-hi` | Samples the busiest thread between those seconds and prints hot source lines. |
+
 ## Hard constraints (do not regress)
 
 1. **No `RECOMP_USB_SYNTH_TD` / `RECOMP_USB_XAPI_TD`** — SYNTH crashes this title’s XAPI ISR; keep bak OHCI pinned.
 2. **`RECOMP_SWM5_PACE_MS=0`** on the tester’s menu play path.
 3. **Full intros** for interactive testing unless explicitly asked to skip.
-4. **Never leave `m101_f.lvl` dirty** — use the `m101_f.lvl.cine_short` overlay (`RECOMP_M101_CINE_SHORT`).
+4. **Never leave `m101_f.lvl` dirty.**
+5. **Run `scripts\patch_kickoff_yield.ps1` after every lift** (`build.ps1` does it): it re-applies the hand fixes to the gitignored `src\recomp\gen`.
 
 ## Layout
 
