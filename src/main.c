@@ -327,6 +327,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             /* Clear leaked DISPATCH depth (guest ret 0) so GPU/OHCI IRQs
              * are not held off for the whole cinematic. */
             { "RECOMP_IRQL_UNSTICK", "1" },
+            /* VBLANK_CATCHUP stays off by default (menu timing); probe with =1. */
             { "RECOMP_TITLE_KEVENTS", "1" },
             { "RECOMP_VBLANK", "paced" },
             /* edge + slow mission frames held FLIP_STALL (no PFB ack) so
