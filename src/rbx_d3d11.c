@@ -1356,6 +1356,7 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     D3D11_MAPPED_SUBRESOURCE m;
     D3D11_VIEWPORT vp;
     uint32_t i, kept = 0, need, xneed;
+    int strip_odd = 0;
     Nv2aVertex *dst;
     RcVertExt *xdst = NULL;
     Cb cb;
@@ -1422,11 +1423,19 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     for (i = 0; i + 2 < b->count; i += 3) {
         const Nv2aVertex *v = &b->vertices[i];
         float area;
+        /* The executor flattens triangle strips without flipping odd triangles, so their
+         * winding alternates. A triangle that reuses the previous one's v1,v2 as its v0,v1
+         * is the next strip triangle (quads/fans never do): flip its winding for culling
+         * only, otherwise the second half of every full-screen strip quad is culled. */
+        if (i >= 3 && !memcmp(&v[0], &v[-2], sizeof v[0]) && !memcmp(&v[1], &v[-1], sizeof v[0]))
+            strip_odd ^= 1;
+        else
+            strip_odd = 0;
         if (!(v[0].rhw > 0 && v[1].rhw > 0 && v[2].rhw > 0)) continue;
         area = (v[1].x - v[0].x) * (v[2].y - v[0].y) - (v[1].y - v[0].y) * (v[2].x - v[0].x);
         if (!(fabsf(area) > 0.0f) || !isfinite(area)) continue;
         if (s_cull_on && r->cull_enable) {
-            int front = is_front(area, r->front_face);
+            int front = is_front(strip_odd ? -area : area, r->front_face);
             if ((r->cull_face == 0x405 && !front) || (r->cull_face == 0x404 && front) || r->cull_face == 0x408) {
                 st_culled++;
                 continue;
@@ -1516,27 +1525,37 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
             /* Snapshot: batch.combiner points at the live PB state. */
             Nv2aCombiner c_local = *c;
             c = &c_local;
-            /* Stage1 ic1=0919390C is lerp(R0,T1,T1.a). With oT1==0 that samples
-             * opaque black at UV(0,0) and kills the fill. Skip stage1 when the
-             * batch's original oT1 is ~zero (before t1←t0 reuse), or RC1SKIP=1. */
+            /* Stage1 ic1=0919390C is lerp(R0,T1,T1.a). Packed verts already
+             * reuse t1←t0 when oT1 was zero (above), so stage1 can run and
+             * darken/modulate the lit fill. Auto-skipping on t1_zero left
+             * stage0-only T0×white V0 → giant bright water/chrome quads.
+             * Skip stage1 only when RECOMP_GPU_RC1SKIP=1, or when both oT0
+             * and oT1 are ~zero (nothing to remap — UV(0,0) black risk). */
             { static int rc1skip = -1, rc1fix = 0;
-              int t1_zero = 1;
+              int t1_zero = 1, t0_zero = 1;
               unsigned k;
               if (rc1skip < 0) rc1skip = getenv("RECOMP_GPU_RC1SKIP") != NULL;
               for (k = 0; k < b->count; k++) {
+                  const float *t0 = b->vertices[k].tex[0];
                   const float *t1 = b->vertices[k].tex[1];
-                  if (fabsf(t1[0]) + fabsf(t1[1]) + fabsf(t1[2]) > 1e-5f) { t1_zero = 0; break; }
+                  if (fabsf(t1[0]) + fabsf(t1[1]) + fabsf(t1[2]) > 1e-5f) t1_zero = 0;
+                  if (fabsf(t0[0]) + fabsf(t0[1]) + fabsf(t0[2]) > 1e-5f) t0_zero = 0;
               }
               if ((c_local.control & 255u) >= 2u
                   && c_local.color_icw[1] == 0x0919390Cu
-                  && (rc1skip || t1_zero)) {
+                  && (rc1skip || (t1_zero && t0_zero))) {
                   c_local.control = (c_local.control & ~255u) | 1u;
                   c_local.stage_program = c_local.stage_program & 31u;
                   if (rc1fix < 12) {
-                      fprintf(stderr, "[RBX DX11] RC stage1 skip (ic1=0919390C t1_zero=%d env=%d) n=%u\n",
-                              t1_zero, rc1skip, kept);
+                      fprintf(stderr, "[RBX DX11] RC stage1 skip (ic1=0919390C t1_zero=%d t0_zero=%d env=%d) n=%u\n",
+                              t1_zero, t0_zero, rc1skip, kept);
                       rc1fix++;
                   }
+              } else if ((c_local.control & 255u) >= 2u
+                         && c_local.color_icw[1] == 0x0919390Cu
+                         && t1_zero && !t0_zero && rc1fix < 12) {
+                  fprintf(stderr, "[RBX DX11] RC stage1 keep via t1<-t0 (ic1=0919390C) n=%u\n", kept);
+                  rc1fix++;
               } }
             /* Black-V0 cel pass skipped above (pre-Unmap). */
             if (!initialize_combiners() || !(s_rc_ps = combiner_shader(c)) || !packed_ext)
