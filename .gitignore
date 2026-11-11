@@ -91,3 +91,6 @@ Thumbs.db
 
 analysis/
 build_abi/
+
+# Packaged test releases (contain disc data - never commit)
+dist/

@@ -229,6 +229,7 @@ def main() -> int:
     ap.add_argument("--env", action="append", default=[], help="extra KEY=VALUE env")
     ap.add_argument("--hang-secs", type=float, default=15, help="no frame progress for this long = hang")
     ap.add_argument("--exe", default=str(EXE))
+    ap.add_argument("--cwd", default=str(ROOT), help="working dir (must hold game_files\\); e.g. an unzipped release")
     a = ap.parse_args()
 
     out = OUT_ROOT / a.name
@@ -259,7 +260,7 @@ def main() -> int:
     thr_total = {}
     exited = None
     with errlog.open("wb") as ef, (out / "stdout.log").open("wb") as of:
-        proc = subprocess.Popen([a.exe], cwd=str(ROOT), env=env, stdout=of, stderr=ef)
+        proc = subprocess.Popen([a.exe], cwd=a.cwd, env=env, stdout=of, stderr=ef)
         pp = psutil.Process(proc.pid)
         handle = kernel32.OpenProcess(0x1000 | 0x0400, False, proc.pid)
         last_cpu, last_t = proc_cpu_seconds(handle), time.time()

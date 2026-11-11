@@ -74,6 +74,14 @@ cd "<repo>"
 .\test_game.bat
 ```
 
+## Private test release
+
+```powershell
+python scripts\package_release.py --version 1.0
+```
+
+Writes `dist\RobotechBC_Recomp_v<ver>_test.zip` (+ `.sha256`): exe, pdb, `vcruntime140.dll`, `D3DCompiler_47.dll`, the disc `game_files\` (bring-up leftovers excluded), `Play.bat` (sets the play env; saves to `saves\`, logs to `logs\`) and `README.txt`. It contains game data: private testing on owned machines only, never commit or share `dist\`. Test an unzipped copy with `rbx_diag.py --exe <dir>\robotech_bc_recomp.exe --cwd <dir>`.
+
 ## Diagnostics
 
 ```powershell
