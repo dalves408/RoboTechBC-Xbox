@@ -68,6 +68,24 @@ if(EXISTS "${_RBX_PBEXEC}" AND TARGET xbox_kernel)
     message(STATUS "Robotech: linking pinned NV2A executor (${_RBX_PBEXEC}) and pushbuffer walk")
 endif()
 
+# Project-pinned APU voice processor (see the header of
+# patches/apu_vp_rbx.c): waits out a title's VOICE_LOCK instead of skipping
+# the voice's frame, which garbled the Bink movie audio.
+set(_RBX_APUVP "${CMAKE_CURRENT_SOURCE_DIR}/patches/apu_vp_rbx.c")
+if(EXISTS "${_RBX_APUVP}" AND TARGET xbox_apu)
+    get_target_property(_APU_SOURCES xbox_apu SOURCES)
+    set(_APU_FILTERED "")
+    foreach(_s IN LISTS _APU_SOURCES)
+        get_filename_component(_sn "${_s}" NAME)
+        if(NOT _sn STREQUAL "apu_vp.c")
+            list(APPEND _APU_FILTERED "${_s}")
+        endif()
+    endforeach()
+    set_property(TARGET xbox_apu PROPERTY SOURCES ${_APU_FILTERED})
+    target_sources(xbox_apu PRIVATE "${_RBX_APUVP}")
+    message(STATUS "Robotech: linking pinned APU voice processor (${_RBX_APUVP})")
+endif()
+
 file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 
 set(GAME_SOURCES

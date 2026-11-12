@@ -11,7 +11,7 @@ This repository holds the **game project** sources, scripts, and pinned USB patc
 | Title / menus | Working (DX11, letterboxed 4:3). Menu flashing fixed (BlockOnFence spurious-wake recheck). 130+ fps. |
 | Controls | Working (bak OHCI, keyboard + USB pad); verified in-mission (stick, START pause menu). |
 | Ch1 mission | Plays live: world, HUD, radar, enemies, weapons. 60–80 fps (min 59 over a 100 s soak), no hangs. The previous "frozen cinematic" was the unresolved stub at 0x1166C (see `src/recomp_manual.c`), so the `RECOMP_M101_CINE_SHORT` overlay is no longer needed — it was a workaround, not a fix. |
-| Audio | Music, SFX and VO play; no underruns or clipping in the mix. |
+| Audio | Music, SFX and VO play; no underruns or clipping in the mix. Intro movie (Bink) audio is in sync and clean: the pinned voice processor (`patches\apu_vp_rbx.c`) waits out the title's VOICE_LOCK instead of skipping frames, which previously made the movie stream drift and get overwritten. |
 | Open | A rare (~1 in 13 runs) main-menu stall; `rbx_diag.py` now dumps all thread stacks when it recurs. |
 
 ## Disc (local only — gitignored)
