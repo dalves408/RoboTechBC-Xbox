@@ -74,6 +74,9 @@ analysis/vsh*/
 # Runtime logs
 xbox_kernel.log
 *.log
+/SaveData/
+/settings.ini
+/texture_pack/
 
 # Interactive playtest screenshots (Delete key via test_game.bat)
 screenshots/

@@ -3162,23 +3162,26 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
     static int near_z = -1;
     const Nv2aVshOutput *in[3];
     Nv2aVshOutput p0[8], p1[8];
-    int n = 3, i, j, pl, planes, inside = 1;
+    int n = 3, i, planes, inside = 1;
 
     if (near_z < 0) {
         const char *e = getenv("RECOMP_CLIP_NEAR_Z");
         near_z = !(e && e[0] == '0');
     }
     planes = near_z ? 2 : 1;
-    float cp[3][4];
     in[0] = a; in[1] = b; in[2] = c;
-    /* Clip-space positions only: the full vertices are copied just for the
-     * rare triangle that actually needs clipping (RBX: hot path). */
+    /* Only W and Z contribute to the near planes. Compute X and Y in
+     * clip space only for triangles that need polygon clipping. */
     for (i = 0; i < 3; i++) {
-        for (j = 0; j < 3; j++)
-            cp[i][j] = in[i]->pos[j] * in[i]->pos[3];
-        cp[i][3] = in[i]->pos[3];
-        for (pl = 0; pl < planes; pl++) {
-            float d = pl == 0 ? cp[i][3] - NV_CLIP_W : cp[i][2] - s_xf_o[2] * cp[i][3];
+        float w = in[i]->pos[3];
+        float d = w - NV_CLIP_W;
+        if (d != d || d - d != 0.0f)
+            return;
+        if (d < 0.0f)
+            inside = 0;
+        if (near_z) {
+            float z = in[i]->pos[2] * w;
+            d = z - s_xf_o[2] * w;
             if (d != d || d - d != 0.0f)
                 return;                       /* not finite: no position at all */
             if (d < 0.0f)
@@ -3191,7 +3194,8 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
     }
     for (i = 0; i < 3; i++) {
         p0[i] = *in[i];
-        memcpy(p0[i].pos, cp[i], sizeof cp[i]);
+        for (int j = 0; j < 3; j++)
+            p0[i].pos[j] *= p0[i].pos[3];
     }
     n = xf_clip_poly(p0, n, 0, p1);
     if (planes > 1 && n)
@@ -3204,7 +3208,7 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
     }
     /* Back to screen space: divide by the (now positive) w. */
     for (i = 0; i < n; i++)
-        for (j = 0; j < 3; j++)
+        for (int j = 0; j < 3; j++)
             p0[i].pos[j] /= p0[i].pos[3];
     for (i = 1; i + 1 < n; i++)
         raster_xf_triangle(&p0[0], &p0[i], &p0[i + 1]);
@@ -3284,7 +3288,8 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
  * reentrant -- unless the program writes constants (CXT_WRITE), or a debug
  * mode (dump / verify / reference interpreter) is on, which stay serial.
  * Fixed-function batches (ffp_vertex) only read batch state, so they go too.
- * RECOMP_XF_THREADS=n workers (default: min(cores/2-1, 3), max 7; 0 = off). */
+ * RECOMP_XF_THREADS=n workers (default: one on hosts with 4+ logical CPUs,
+ * max 7; 0 = off). */
 static uint32_t s_rbx_cxt_write;
 #if defined(_WIN32)
 #define XP_MAXW 7
@@ -3348,8 +3353,7 @@ static int xp_workers(void)
         SYSTEM_INFO si;
         int n, i;
         GetSystemInfo(&si);
-        n = e ? atoi(e) : (int)si.dwNumberOfProcessors / 2 - 1;
-        if (!e && n > 3) n = 3;
+        n = e ? atoi(e) : si.dwNumberOfProcessors >= 4;
         if (getenv("RECOMP_VSH_DUMP") || getenv("RECOMP_VSH_VERIFY") || getenv("RECOMP_VSH_NODECODE"))
             n = 0;
         if (n > XP_MAXW) n = XP_MAXW;
@@ -3373,15 +3377,25 @@ static int xp_transform(uint32_t *list, uint32_t n)
     int w = xp_workers(), i;
     LONG gen = s_xp_gen + 1;
     if (w > (int)(n / XP_CHUNK)) w = (int)(n / XP_CHUNK);
+    if (w == 0) {
+        for (uint32_t j = 0; j < n; j++) {
+            uint32_t at = list[j];
+            if (!transform_vertex(s_gpu.idx[at], &s_xf[at]))
+                return 0;
+        }
+        return 1;
+    }
+
+    /* Close the previous claim before changing its batch size and list.
+     * A worker can still be in xp_run after its final pending decrement. */
+    InterlockedExchange64(&s_xp_claim, ((LONG64)s_xp_gen << 32) | NV_MAX_INDICES);
     s_xp_list = list; s_xp_n = (LONG)n; s_xp_fail = 0;
     s_xp_pending = (LONG)n;
     InterlockedExchange64(&s_xp_claim, (LONG64)gen << 32);
-    if (w > 0) {
-        InterlockedExchange(&s_xp_gen, gen);
-        for (i = 0; i < w; i++)
-            if (s_xp_sleeping[i])
-                SetEvent(s_xp_go[i]);
-    }
+    InterlockedExchange(&s_xp_gen, gen);
+    for (i = 0; i < w; i++)
+        if (s_xp_sleeping[i])
+            SetEvent(s_xp_go[i]);
     xp_run(gen);
     while (s_xp_pending)
         YieldProcessor();
@@ -3400,6 +3414,9 @@ static void xf_set_viewport(void)
 
 static void raster_batch_program(void)
 {
+    /* Keep each cached transform in its original slot. Assemble primitives
+     * through the index map instead of expanding duplicate vertex payloads. */
+    static uint32_t vertex_slot[NV_MAX_INDICES];
     uint32_t i, n = s_gpu.idx_count;
     unsigned long long t0, t1;
 
@@ -3427,15 +3444,14 @@ static void raster_batch_program(void)
         memset(tag, 0xFF, sizeof tag);
 #if defined(_WIN32)
         if (n >= 48 && !(batch_uses_program() && s_rbx_cxt_write) && xp_workers() > 0) {
-            static uint32_t *src, *uniq;
+            static uint32_t *uniq;
             uint32_t nu = 0;
-            if (!src) src = (uint32_t *)malloc(NV_MAX_INDICES * sizeof *src);
             if (!uniq) uniq = (uint32_t *)malloc(NV_MAX_INDICES * sizeof *uniq);
-            if (src && uniq) {
+            if (uniq) {
                 for (i = 0; i < n; i++) {
                     uint32_t ix = s_gpu.idx[i], h = (ix * 2654435761u) >> 24;
-                    if (tag[h] == ix) { src[i] = slot[h]; continue; }
-                    tag[h] = ix; slot[h] = i; src[i] = i; uniq[nu++] = i;
+                    if (tag[h] == ix) { vertex_slot[i] = slot[h]; continue; }
+                    tag[h] = ix; slot[h] = i; vertex_slot[i] = i; uniq[nu++] = i;
                 }
                 /* The first vertex runs here: it decodes the program and settles
                  * every lazily-initialised static before the workers start. */
@@ -3445,8 +3461,6 @@ static void raster_batch_program(void)
                     g_pb_t_xf += pb_ticks() - t0;
                     return;
                 }
-                for (i = 0; i < n; i++)
-                    if (src[i] != i) s_xf[i] = s_xf[src[i]];
                 if (xst) st_pb++;
                 goto xf_done;
             }
@@ -3454,11 +3468,11 @@ static void raster_batch_program(void)
 #endif
         for (i = 0; i < n; i++) {
             uint32_t ix = s_gpu.idx[i], h = (ix * 2654435761u) >> 24;
-            if (tag[h] == ix) { s_xf[i] = s_xf[slot[h]]; continue; }
+            if (tag[h] == ix) { vertex_slot[i] = slot[h]; continue; }
             if (!transform_vertex(ix, &s_xf[i])) { g_dbg_xffail++;
                 g_pb_t_xf += pb_ticks() - t0;
                 return; }                                /* no program loaded */
-            tag[h] = ix; slot[h] = i;
+            tag[h] = ix; slot[h] = i; vertex_slot[i] = i;
             if (xst) st_su++;
         }
         if (xst) st_sb++;
@@ -3504,11 +3518,12 @@ xf_done:
                     m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
                     m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
             for (i = 0; i < n && i < 4; i++) {
+                const Nv2aVshOutput *vertex = &s_xf[vertex_slot[i]];
                 fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], in);
                 fprintf(stderr, "  [FFP]   v%u (%g %g %g %g) -> (%g %g %g, w %g)\n",
                         s_gpu.idx[i], in[0], in[1], in[2], in[3],
-                        s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
-                        s_xf[i].pos[3]);
+                        vertex->pos[0], vertex->pos[1], vertex->pos[2],
+                        vertex->pos[3]);
             }
         }
     }
@@ -3552,19 +3567,21 @@ xf_done:
                             c[0], c[1], c[2], c[3], 10);
                 }
             }
-            for (i = 0; i < 3; i++)
+            for (i = 0; i < 3; i++) {
+                const Nv2aVshOutput *vertex = &s_xf[vertex_slot[i]];
                 fprintf(stderr, "[VTRACE]   out%u pos %g %g %g %g"
                         " d0 %g %g %g %g d0w=%u d1 %g %g %g %g"
                         " t0 %g %g %g %g\n",
                         i,
-                        s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
-                        s_xf[i].pos[3],
-                        s_xf[i].d0[0], s_xf[i].d0[1], s_xf[i].d0[2],
-                        s_xf[i].d0[3], (unsigned)s_xf[i].d0_written,
-                        s_xf[i].d1[0], s_xf[i].d1[1], s_xf[i].d1[2],
-                        s_xf[i].d1[3],
-                        s_xf[i].tex[0][0], s_xf[i].tex[0][1],
-                        s_xf[i].tex[0][2], s_xf[i].tex[0][3]);
+                        vertex->pos[0], vertex->pos[1], vertex->pos[2],
+                        vertex->pos[3],
+                        vertex->d0[0], vertex->d0[1], vertex->d0[2],
+                        vertex->d0[3], (unsigned)vertex->d0_written,
+                        vertex->d1[0], vertex->d1[1], vertex->d1[2],
+                        vertex->d1[3],
+                        vertex->tex[0][0], vertex->tex[0][1],
+                        vertex->tex[0][2], vertex->tex[0][3]);
+            }
             fprintf(stderr, "[VTRACE]   attr3 size %u stride %u lit=%u"
                     " scene_amb %g %g %g\n",
                     s_gpu.attr[3].size, s_gpu.attr[3].stride,
@@ -3588,7 +3605,7 @@ xf_done:
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < n; i += 3)
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+            raster_xf_clipped(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+1]], &s_xf[vertex_slot[i+2]]);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
         /* RBX-17: do NOT flip odd triangles here. That "DX11 cull" experiment
@@ -3596,25 +3613,25 @@ xf_done:
          * for 3D strips belongs in the backend, not by rewriting NV2A order. */
         for (i = 0; i + 2 < n; i++) {
             s_xf_odd = (int)(i & 1);
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+            raster_xf_clipped(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+1]], &s_xf[vertex_slot[i+2]]);
         }
         s_xf_odd = 0;
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
         for (i = 1; i + 1 < n; i++)
-            raster_xf_clipped(&s_xf[0], &s_xf[i], &s_xf[i+1]);
+            raster_xf_clipped(&s_xf[vertex_slot[0]], &s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+1]]);
         break;
     case NV_PRIM_QUADS:
         for (i = 0; i + 3 < n; i += 4) {
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
-            raster_xf_clipped(&s_xf[i], &s_xf[i+2], &s_xf[i+3]);
+            raster_xf_clipped(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+1]], &s_xf[vertex_slot[i+2]]);
+            raster_xf_clipped(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+2]], &s_xf[vertex_slot[i+3]]);
         }
         break;
     case NV_PRIM_QUAD_STRIP:
         for (i = 0; i + 3 < n; i += 2) {
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+3]);
-            raster_xf_clipped(&s_xf[i], &s_xf[i+3], &s_xf[i+2]);
+            raster_xf_clipped(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+1]], &s_xf[vertex_slot[i+3]]);
+            raster_xf_clipped(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+3]], &s_xf[vertex_slot[i+2]]);
         }
         break;
     default:

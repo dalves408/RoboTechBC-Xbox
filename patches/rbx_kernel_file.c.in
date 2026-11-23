@@ -1,0 +1,13 @@
+#include "rbx_virtual_disk.h"
+
+#define CreateFileW rbx_disk_open
+#define ReadFile rbx_disk_read
+#define WriteFile rbx_disk_write
+#define CloseHandle rbx_disk_close
+#define SetFilePointerEx rbx_disk_seek
+#define GetFileInformationByHandle rbx_disk_info
+#define FlushFileBuffers rbx_disk_flush
+#define GetFileAttributesW rbx_disk_attributes
+#define CreateDirectoryW rbx_disk_mkdir
+#define DeleteFileW rbx_disk_delete
+#include "@XBOXRECOMP_DIR@/src/kernel/kernel_file.c"

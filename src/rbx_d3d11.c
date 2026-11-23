@@ -21,6 +21,7 @@ static unsigned long long gb_qf(void) { static LARGE_INTEGER f; if (!f.QuadPart)
 #include <stdint.h>
 #include "nv2a_backend.h"
 #include "rbx_rc_hlsl.h"
+#include "rbx_settings.h"
 #include "d3d/d3d8_swizzle.h"
 
 /* Sprite filter / overlay (MvC2-only) — no-ops for Robotech. */
@@ -28,7 +29,6 @@ static int sprite_filter_init(ID3D11Device *d, ID3D11DeviceContext *c) { (void)d
 static void sprite_filter_run(ID3D11ShaderResourceView *srv, uint32_t sw, uint32_t sh,
     ID3D11RenderTargetView *rtv, uint32_t dw, uint32_t dh, int on, int smooth, int sharpen)
 { (void)srv; (void)sw; (void)sh; (void)rtv; (void)dw; (void)dh; (void)on; (void)smooth; (void)sharpen; }
-static void mvc2_overlay_flip_wait(void) {}
 #define MVC2_DEBUG_ON_FLIP(va, w, h, pitch, bpp) ((void)0)
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -38,7 +38,8 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 #define VB_BYTES (8u * 1024u * 1024u)
 
 typedef struct { uint32_t va, w, h, bpp, pitch, dirty, used, aa_sx, aa_sy;
-                 ID3D11Texture2D *tex, *stage; ID3D11RenderTargetView *rtv; ID3D11ShaderResourceView *srv; uint32_t sampled;
+                 ID3D11Texture2D *tex, *stage, *msaa; ID3D11RenderTargetView *rtv; ID3D11ShaderResourceView *srv; uint32_t sampled;
+                 int resolve_pending;
                  /* deferred readback: the copy queued at the last flip (pstage, one of stage/stage2) and where it goes */
                  ID3D11Texture2D *stage2, *pstage; int pend; uint32_t pva, pw, ph, ppitch, pbpp;
                  /* down is the guest-sized copy written back to guest memory when the render scale is above 1 */
@@ -98,8 +99,8 @@ static ID3D11Texture2D *s_white;
 static ID3D11ShaderResourceView *s_white_srv;
 static uint32_t s_vb_off;
 /* F1 options, requested from the window's thread and applied at a flip. */
-static volatile int s_want_scale = 1;
 static int s_scale = 1, s_resets;
+static unsigned s_msaa = 1, s_msaa_mask = 1, s_aniso = 1, s_fps_limit;
 static ID3D11VertexShader *s_bl_vs;
 static ID3D11PixelShader *s_bl_ps;
 static ID3D11Buffer *s_bl_cb;
@@ -194,6 +195,14 @@ static int gb_init(void)
       hr = D3D11CreateDevice(NULL, warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                              nwant ? want : NULL, nwant, D3D11_SDK_VERSION, &s_dev, &fl, &s_ctx); }
     if (FAILED(hr)) { fprintf(stderr, "[RBX DX11] D3D11CreateDevice failed 0x%08lX\n", (unsigned long)hr); return 0; }
+    for (unsigned i = 1; i <= 3; i++) {
+        UINT color = 0, depth = 0;
+        if (SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(s_dev, DXGI_FORMAT_B8G8R8A8_UNORM, 1u << i, &color)) &&
+            SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(s_dev, DXGI_FORMAT_D24_UNORM_S8_UINT, 1u << i, &depth)) &&
+            color && depth)
+            s_msaa_mask |= 1u << i;
+    }
+    rbx_settings_msaa_supported(s_msaa_mask);
     hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "gb", NULL, NULL, "vs", "vs_4_0", 0, 0, &vsb, &err);
     if (FAILED(hr)) { fprintf(stderr, "[RBX DX11] vs: %s\n", err ? (char *)ID3D10Blob_GetBufferPointer(err) : "?"); return 0; }
     hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "gb", NULL, NULL, "ps", "ps_4_0", 0, 0, &psb, &err);
@@ -214,6 +223,7 @@ static int gb_init(void)
     for (unsigned ci = 0; ci < CB_RING; ci++) ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cbr[ci]); s_cb = s_cbr[0];
     memset(&rd, 0, sizeof rd);
     rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE; rd.ScissorEnable = FALSE;
+    rd.MultisampleEnable = TRUE;
     ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs);
     memset(&td, 0, sizeof td);
     td.Width = td.Height = 1; td.MipLevels = td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -407,9 +417,21 @@ static void blit(ID3D11ShaderResourceView *srv, ID3D11RenderTargetView *rtv, uin
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
 }
 
+static void rt_resolve(Rt *rt)
+{
+    if (!rt->resolve_pending) return;
+    ID3D11ShaderResourceView *none[4] = {0};
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, none);
+    ID3D11DeviceContext_ResolveSubresource(s_ctx, (ID3D11Resource *)rt->tex, 0,
+        (ID3D11Resource *)rt->msaa, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+    rt->resolve_pending = 0;
+}
+
 /* What a staging copy reads: the guest-sized image of this target. */
 static ID3D11Resource *rt_guest_image(Rt *rt)
 {
+    rt_resolve(rt);
     if (!rt->down) return (ID3D11Resource *)rt->tex;
     blit(rt->srv, rt->down_rtv, rt->w, rt->h, rt->w * (uint32_t)s_scale, rt->h * (uint32_t)s_scale);
     return (ID3D11Resource *)rt->down;
@@ -419,6 +441,8 @@ static void rt_release(Rt *r)
 {
     SAFE_REL(r->rtv); SAFE_REL(r->srv); SAFE_REL(r->tex); SAFE_REL(r->stage); SAFE_REL(r->stage2);
     SAFE_REL(r->down); SAFE_REL(r->down_rtv);
+    SAFE_REL(r->msaa);
+    r->resolve_pending = 0;
     r->pend = 0; r->pstage = NULL; r->shown_dirty = 0; r->dirty = 0;
 }
 
@@ -452,6 +476,7 @@ static void rt_seed_from_guest(Rt *rt, const Nv2aSurface *s)
     if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &t)) &&
         SUCCEEDED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t, NULL, &v))) {
         blit(v, rt->rtv, s->width * (uint32_t)s_scale, s->height * (uint32_t)s_scale, s->width, s->height);
+        rt->resolve_pending = rt->msaa != NULL;
     }
     SAFE_REL(v); SAFE_REL(t);
     free(px);
@@ -482,7 +507,21 @@ static Rt *get_rt(const Nv2aSurface *s)
     td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_rt[free_i].tex))) { rt_release(&s_rt[free_i]); return NULL; }
     ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_rt[free_i].tex, NULL, &s_rt[free_i].srv);
-    ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_rt[free_i].tex, NULL, &s_rt[free_i].rtv);
+    if (s_msaa > 1) {
+        td.SampleDesc.Count = s_msaa;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_rt[free_i].msaa))) {
+            rt_release(&s_rt[free_i]);
+            return NULL;
+        }
+        td.SampleDesc.Count = 1;
+    }
+    if (FAILED(ID3D11Device_CreateRenderTargetView(s_dev,
+            (ID3D11Resource *)(s_rt[free_i].msaa ? s_rt[free_i].msaa : s_rt[free_i].tex),
+            NULL, &s_rt[free_i].rtv))) {
+        rt_release(&s_rt[free_i]);
+        return NULL;
+    }
     td.Width = w; td.Height = h;
     if (s_scale > 1) {
         td.BindFlags = D3D11_BIND_RENDER_TARGET;
@@ -515,7 +554,7 @@ static Ds *get_ds(const Nv2aSurface *s, uint32_t zva)
     if (slot < 0) { slot = (int)(s_tick & 3); SAFE_REL(s_ds[slot].dsv); SAFE_REL(s_ds[slot].tex); }
     memset(&td, 0, sizeof td);
     td.Width = s->width * (uint32_t)s_scale; td.Height = s->height * (uint32_t)s_scale; td.MipLevels = td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+    td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; td.SampleDesc.Count = s_msaa; td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ds[slot].tex))) return NULL;
     ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)s_ds[slot].tex, NULL, &s_ds[slot].dsv);
@@ -528,7 +567,6 @@ static Ds *get_ds(const Nv2aSurface *s, uint32_t zva)
  * layer pixel is one sprite pixel and tiles have joined up into poses: the game stretches this art to 640x480, 5/3 across
  * and 15/7 down, and at that size a filter only sees uneven blocks. Any other draw, a clear or a flip ends the run: the layer is filtered
  * and laid over the picture. Depth is kept among the sprites only: the game draws them after the stage and over it. */
-static volatile int s_want_sf, s_want_smooth, s_want_sharpen;
 static int s_tex_from_pack;
 static int s_sf, s_smooth, s_sharpen, s_sf_dirty;
 static Rt *s_sf_rt;
@@ -739,7 +777,7 @@ static D3D11_TEXTURE_ADDRESS_MODE addr_mode(uint32_t m)
 static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
 {
     uint32_t minf = (t->filter >> 16) & 0xFF, magf = (t->filter >> 24) & 0xF;
-    uint32_t key[12] = { minf == 1 ? 1u : 0u, magf == 1 ? 1u : 0u, t->addr_u, t->addr_v };
+    uint32_t key[12] = { minf == 1 ? 1u : 0u, magf == 1 ? 1u : 0u, t->addr_u, t->addr_v, s_aniso };
     ID3D11SamplerState *s = (ID3D11SamplerState *)find_state(s_ss, &s_nss, 48, key, 12);
     D3D11_SAMPLER_DESC d;
     if (s) return s;
@@ -748,8 +786,11 @@ static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
     else if (key[0]) d.Filter = D3D11_FILTER_MIN_POINT_MAG_MIP_LINEAR;
     else if (key[1]) d.Filter = D3D11_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR;
     else d.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    if (!key[0] && !key[1] && s_aniso > 1) d.Filter = D3D11_FILTER_ANISOTROPIC;
     d.AddressU = addr_mode(t->addr_u); d.AddressV = addr_mode(t->addr_v); d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    d.MaxLOD = D3D11_FLOAT32_MAX; d.MaxAnisotropy = 1; d.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    d.MaxLOD = D3D11_FLOAT32_MAX;
+    d.MaxAnisotropy = d.Filter == D3D11_FILTER_ANISOTROPIC ? s_aniso : 1;
+    d.ComparisonFunc = D3D11_COMPARISON_NEVER;
     if (FAILED(ID3D11Device_CreateSamplerState(s_dev, &d, &s))) return NULL;
     if (s_nss < 48) { memcpy(s_ss[s_nss].key, key, sizeof key); s_ss[s_nss].obj = s; s_nss++; }
     return s;
@@ -828,7 +869,7 @@ static int tex_ok(const Nv2aTexture *t)
     return 0;
 }
 /* ---- hi-res texture pack ---------------------------------------------------
- * <16 hex digits of pixel_hash>_<16 hex digits of alpha_hash>*.dds or .png in %LOCALAPPDATA%\RoboTechBCRecomp\texture_pack or a texture_pack folder
+ * <16 hex digits of pixel_hash>_<16 hex digits of alpha_hash>*.dds or .png in the installation's texture_pack folder
  * next to the exe (subfolders allowed) replace the decoded texture of that hash, any size. The hash covers the decoded
  * colours only, so a pack can be made from the disc without running the game. The game can draw the same colours with
  * other alpha than the disc holds, so a replacement whose alpha_hash differs is not used: the original is drawn instead. The pack only holds stages and menus:
@@ -836,7 +877,6 @@ static int tex_ok(const Nv2aTexture *t)
 typedef struct { uint64_t hash, alpha; char path[MAX_PATH]; } PackEnt;
 static PackEnt *s_pack;
 static int s_npack, s_pack_cap, s_pack_scanned;
-static volatile int s_want_hires = 1;
 static int s_hires = 1;
 
 static void pack_scan(const char *dir, int depth)
@@ -851,8 +891,9 @@ static void pack_scan(const char *dir, int depth)
         if (fd.cFileName[0] == '.') continue;
         if (snprintf(sub, sizeof sub, "%s\\%s", dir, fd.cFileName) >= (int)sizeof sub) continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { if (depth < 4) pack_scan(sub, depth + 1); continue; }
-        if (n > 20 && (!_stricmp(fd.cFileName + n - 4, ".png") || !_stricmp(fd.cFileName + n - 4, ".dds")) && strspn(fd.cFileName, "0123456789abcdefABCDEF") == 16 && fd.cFileName[16] == '_'
-            && n > 38 && strspn(fd.cFileName + 17, "0123456789abcdefABCDEF") == 16) {
+        if (n >= 37 && (!_stricmp(fd.cFileName + n - 4, ".png") || !_stricmp(fd.cFileName + n - 4, ".dds"))
+            && strspn(fd.cFileName, "0123456789abcdefABCDEF") == 16 && fd.cFileName[16] == '_'
+            && strspn(fd.cFileName + 17, "0123456789abcdefABCDEF") == 16) {
             char hex[17];
             if (s_npack == s_pack_cap) {
                 int cap = s_pack_cap ? s_pack_cap * 2 : 1024;
@@ -873,9 +914,10 @@ static void pack_scan(const char *dir, int depth)
 
 static int pack_cmp(const void *a, const void *b)
 {
-    uint64_t x = ((const PackEnt *)a)->hash, y = ((const PackEnt *)b)->hash;
-    if (x != y) return x < y ? -1 : 1;
-    /* one hash in two forms: the .dds first, as it needs no decoding */
+    const PackEnt *left = a, *right = b;
+    if (left->hash != right->hash) return left->hash < right->hash ? -1 : 1;
+    if (left->alpha != right->alpha) return left->alpha < right->alpha ? -1 : 1;
+    /* Prefer the DDS when both files describe the same texture. */
     {
         const char *p = ((const PackEnt *)a)->path, *q = ((const PackEnt *)b)->path;
         int pd = !_stricmp(p + strlen(p) - 4, ".dds"), qd = !_stricmp(q + strlen(q) - 4, ".dds");
@@ -886,21 +928,21 @@ static int pack_cmp(const void *a, const void *b)
 int rbx_pack_count(void)
 {
     if (!s_pack_scanned) {
-        char dir[MAX_PATH], *sl;
+        char dir[MAX_PATH], working_pack[MAX_PATH], *sl;
         s_pack_scanned = 1;
-        if (GetEnvironmentVariableA("LOCALAPPDATA", dir, MAX_PATH) && strlen(dir) < MAX_PATH - 40) {
-            strcat(dir, "\\RoboTechBCRecomp\\texture_pack");
-            pack_scan(dir, 0);
-        }
+        DWORD len = GetFullPathNameA("texture_pack", MAX_PATH, working_pack, NULL);
+        pack_scan("texture_pack", 0);
         if (GetModuleFileNameA(NULL, dir, MAX_PATH) && (sl = strrchr(dir, '\\')) != NULL && (size_t)(sl - dir) < MAX_PATH - 20) {
             strcpy(sl, "\\texture_pack");
-            pack_scan(dir, 0);
+            if (!len || len >= MAX_PATH || _stricmp(dir, working_pack))
+                pack_scan(dir, 0);
         }
         if (s_npack) {
             int r, wr = 1;
             qsort(s_pack, (size_t)s_npack, sizeof *s_pack, pack_cmp);
             for (r = 1; r < s_npack; r++)
-                if (s_pack[r].hash != s_pack[wr - 1].hash) s_pack[wr++] = s_pack[r];
+                if (s_pack[r].hash != s_pack[wr - 1].hash ||
+                    s_pack[r].alpha != s_pack[wr - 1].alpha) s_pack[wr++] = s_pack[r];
             s_npack = wr;
         }
         fprintf(stderr, "[RBX DX11] hi-res texture pack: %d files\n", s_npack);
@@ -976,11 +1018,12 @@ static int pack_make_dds(const char *path, TexEnt *e)
 
 /* Make e's texture from the pack image of this hash. 0: none, so the guest's own is used. */
 static int s_gen_mips;
-static int pack_make(uint64_t hash, uint64_t alpha, TexEnt *e)
+static int pack_make(const uint32_t *argb, uint32_t width, uint32_t height, TexEnt *e)
 {
     static IWICImagingFactory *fac;
     static int fac_tried;
-    int lo = 0, hi, found = -1, ok = 0;
+    uint64_t hash = pixel_hash(argb, width, height), alpha;
+    int lo = 0, hi = s_npack, found, ok = 0;
     IWICBitmapDecoder *dec = NULL;
     IWICBitmapFrameDecode *fr = NULL;
     IWICFormatConverter *cv = NULL;
@@ -988,15 +1031,19 @@ static int pack_make(uint64_t hash, uint64_t alpha, TexEnt *e)
     UINT w = 0, h = 0;
     uint8_t *px = NULL;
 
-    for (hi = s_npack - 1; lo <= hi; ) {
+    while (lo < hi) {
         int m = (lo + hi) / 2;
-        if (s_pack[m].hash == hash) { found = m; break; }
-        if (s_pack[m].hash < hash) lo = m + 1; else hi = m - 1;
+        if (s_pack[m].hash < hash) lo = m + 1; else hi = m;
     }
-    if (found < 0) return 0;
-    if (s_pack[found].alpha != alpha) {
+    if (lo == s_npack || s_pack[lo].hash != hash) return 0;
+
+    alpha = alpha_hash(argb, width, height);
+    for (found = lo; found < s_npack && s_pack[found].hash == hash; found++) {
+        if (s_pack[found].alpha == alpha) break;
+    }
+    if (found == s_npack || s_pack[found].hash != hash) {
         static unsigned nd;
-        if (nd++ < 40) fprintf(stderr, "[RBX DX11] pack alpha differs, keeping the original: %s\n", s_pack[found].path);
+        if (nd++ < 40) fprintf(stderr, "[RBX DX11] pack alpha differs, keeping the original: %s\n", s_pack[lo].path);
         return 0;
     }
     {
@@ -1046,22 +1093,23 @@ static ID3D11ShaderResourceView *get_tex_slow(const Nv2aTexture *t)
     uint64_t h, th;
     uint32_t n = tex_bytes(t);
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    LARGE_INTEGER a, b, f;
+    LARGE_INTEGER hash_start, hash_end;
 
     if (!tex_ok(t)) return s_white_srv;
     s_noalpha = (t->color == 0x1E || t->color == 0x1F || t->color == 0x07) ? 1 : 0;
     for (i = 0; i < MAX_RT; i++)
         if (s_rt[i].tex && s_rt[i].srv && s_rt[i].va == t->offset && s_rt[i].w == t->width && s_rt[i].h == t->height) {
+            rt_resolve(&s_rt[i]);
             s_rt[i].sampled = s_frame + 1; st_rtsamples++;
             return s_rt[i].srv;
         }
-    QueryPerformanceCounter(&a);
+    QueryPerformanceCounter(&hash_start);
     th = hash_bytes(mem + t->offset, n);
     if (t->color == 0x0B && t->palette) h = th ^ (hash_bytes(mem + t->palette, 1024) * 31u);
     else h = th;
     st_th_full++;
-    QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f);
-    st_hash_ns_us += (uint32_t)((b.QuadPart - a.QuadPart) * 1000000 / f.QuadPart);
+    QueryPerformanceCounter(&hash_end);
+    st_hash_ns_us += (uint32_t)((hash_end.QuadPart - hash_start.QuadPart) * 1000000ULL / gb_qf());
     for (i = 0; i < MAX_TEX; i++) {
         TexEnt *e = &s_tx[i];
         if (!e->tex) { if (free_i < 0) free_i = i; continue; }
@@ -1105,7 +1153,12 @@ decode:
           } }
         q1 = qpc_us(); st_dec_us += q1 - q0;
         /* A slot rewritten this often is a sprite sheet, which no pack can hold: not worth hashing every version. */
-        if (s_hires && e->redecodes < 64 && rbx_pack_count() && pack_make(pixel_hash(argb, t->width, t->height), alpha_hash(argb, t->width, t->height), e)) { free(argb); e->from_pack = 1; goto made; }
+        if (s_hires && e->redecodes < 64 && rbx_pack_count() &&
+            pack_make(argb, t->width, t->height, e)) {
+            free(argb);
+            e->from_pack = 1;
+            goto made;
+        }
         e->from_pack = 0;
         memset(&td, 0, sizeof td);
         td.Width = t->width; td.Height = t->height; td.MipLevels = td.ArraySize = 1;
@@ -1113,7 +1166,18 @@ decode:
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         sd.pSysMem = argb; sd.SysMemPitch = t->width * 4; sd.SysMemSlicePitch = 0;
         if (s_flush_tex) ID3D11DeviceContext_Flush(s_ctx);
-        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &e->tex))) { fprintf(stderr, "[RBX DX11] CreateTexture2D failed %ux%u fmt=%02X\n", t->width, t->height, t->color); free(argb); e->tex = NULL; return s_white_srv; }
+        if (s_aniso > 1 && (t->width > 1 || t->height > 1)) {
+            D3D11_TEXTURE2D_DESC mip_td = td;
+            mip_td.MipLevels = 0;
+            mip_td.Usage = D3D11_USAGE_DEFAULT;
+            mip_td.BindFlags |= D3D11_BIND_RENDER_TARGET;
+            mip_td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+            if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &mip_td, NULL, &e->tex))) {
+                ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex, 0, NULL, argb, sd.SysMemPitch, 0);
+                s_gen_mips = 1;
+            }
+        }
+        if (!e->tex && FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &e->tex))) { fprintf(stderr, "[RBX DX11] CreateTexture2D failed %ux%u fmt=%02X\n", t->width, t->height, t->color); free(argb); e->tex = NULL; return s_white_srv; }
         { static int tl = -1; static unsigned nlog;
           if (tl < 0) tl = getenv("RECOMP_GPU_TEXLOG") ? 1 : 0;
           if (tl && nlog < 400 && t->width < 512) { nlog++;
@@ -1124,7 +1188,7 @@ decode:
         free(argb);
 made:
         ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex, NULL, &e->srv);
-        if (s_gen_mips) { s_gen_mips = 0; ID3D11DeviceContext_GenerateMips(s_ctx, e->srv); }
+        if (s_gen_mips) { s_gen_mips = 0; if (e->srv) ID3D11DeviceContext_GenerateMips(s_ctx, e->srv); }
         if (s_flush_tex) ID3D11DeviceContext_Flush(s_ctx);
         e->offset = t->offset; e->w = t->width; e->h = t->height; e->color = t->color; e->pitch = t->pitch;
         e->hash = h; e->used = s_tick;
@@ -1290,6 +1354,7 @@ static void gb_clear_impl(const Nv2aSurface *s, const Nv2aRenderState *rs, uint3
         c[0] = ((argb >> 16) & 255) / 255.0f; c[1] = ((argb >> 8) & 255) / 255.0f;
         c[2] = (argb & 255) / 255.0f; c[3] = ((argb >> 24) & 255) / 255.0f;
         ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rt->rtv, c);
+        rt->resolve_pending = rt->msaa != NULL;
         rt->dirty = 1; rt->shown_dirty = 1;
     }
     if ((flags & 3) && (ds = get_ds(s, rs->zeta_va)) != NULL) {
@@ -1886,6 +1951,7 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
         s_vb_off += kept * (uint32_t)sizeof(Nv2aVertex);
         if (use_rc && packed_ext) s_xvb_off += kept * (uint32_t)sizeof(RcVertExt);
         rt->dirty = 1; rt->shown_dirty = 1;
+        rt->resolve_pending = rt->msaa != NULL;
         st_draws++; st_tris += kept / 3;
     }
 }
@@ -1955,7 +2021,7 @@ extern volatile uint32_t g_nv2a_flip_va;
 extern void gpu_present_set_source(void *shared_handle, uint32_t width, uint32_t height);
 extern void gpu_present_set_display_size(uint32_t width, uint32_t height);
 extern void gpu_present_frame_ready(void);
-extern void mvc2_overlay_flip_wait(void);
+extern volatile LONG rbx_input_guest_frame;
 static ID3D11Texture2D *s_share;
 static IDXGIKeyedMutex *s_share_mutex;
 static uint32_t s_share_w, s_share_h;
@@ -1972,11 +2038,13 @@ static void share_close(void)
  * memory) as <prefix>_f<frame>.bmp, 24-bit, every N-th published frame (default 30). */
 static void present_dump(Rt *rt)
 {
-    static int on = -1; static unsigned every = 30, n; static char pfx[400];
+    static int on = -1, guest_frames; static unsigned every = 30, n; static char pfx[400];
     static ID3D11Texture2D *st; static uint32_t sw, sh;
     D3D11_TEXTURE2D_DESC td; D3D11_MAPPED_SUBRESOURCE m; FILE *f; char path[460]; uint32_t x, y;
     if (on < 0) {
         const char *e = getenv("RECOMP_GPU_PRESDUMP"), *c;
+        const char *frame_mode = getenv("RECOMP_GPU_PRESDUMP_FRAME");
+        guest_frames = frame_mode && frame_mode[0] == '1';
         on = 0;
         if (e && *e) {
             c = strrchr(e, ':');
@@ -1990,7 +2058,7 @@ static void present_dump(Rt *rt)
       static int w = -1; static unsigned lo, hi; static DWORD t0; DWORD sec;
       if (w < 0) { const char *e = getenv("RECOMP_GPU_PRESDUMP_SECS"); w = e && sscanf(e, "%u-%u", &lo, &hi) == 2; t0 = GetTickCount(); }
       sec = (GetTickCount() - t0) / 1000; if (w && (sec < lo || sec >= hi)) return; }
-    if (n++ % every) return;
+    if ((guest_frames ? s_frame : n++) % every) return;
     ID3D11Texture2D_GetDesc(rt->tex, &td);
     if (!st || sw != td.Width || sh != td.Height) {
         SAFE_REL(st);
@@ -2019,6 +2087,9 @@ static void present_dump(Rt *rt)
 
 static void publish_frame(void)
 {
+    static unsigned last_limit;
+    static unsigned long long next_frame;
+    LARGE_INTEGER now;
     uint32_t va = g_nv2a_flip_va;
     int i;
     Rt *rt = NULL;
@@ -2027,6 +2098,11 @@ static void publish_frame(void)
         if (s_rt[i].tex && s_rt[i].va == va) { rt = &s_rt[i]; break; }
     if (!rt) { if (s_share_on) { gpu_present_set_source(NULL, 0, 0); s_share_on = 0; } return; }
     if (!rt->shown_dirty && s_share_on) return;
+    if (s_fps_limit != last_limit) { next_frame = 0; last_limit = s_fps_limit; }
+    if (s_fps_limit) {
+        QueryPerformanceCounter(&now);
+        if ((unsigned long long)now.QuadPart < next_frame) return;
+    }
     {
         uint32_t w = rt->w * (uint32_t)s_scale, h = rt->h * (uint32_t)s_scale;
         if (w != s_share_w || h != s_share_h || !s_share) {
@@ -2065,36 +2141,47 @@ static void publish_frame(void)
     /* 0 ms: never block the PB/GPU thread on the window's present hold.
      * A multi-ms wait here was part of the Ch1 BusyLoop/present death spiral. */
     if (FAILED(IDXGIKeyedMutex_AcquireSync(s_share_mutex, 0, 0))) return;
+    rt_resolve(rt);
     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_share, (ID3D11Resource *)rt->tex);
     ID3D11DeviceContext_Flush(s_ctx);
     IDXGIKeyedMutex_ReleaseSync(s_share_mutex, 0);
     present_dump(rt);
     rt->shown_dirty = 0;
     gpu_present_frame_ready();
-}
-
-void rbx_video_request(int scale, int hires, int sprite_filter, int smooth, int sharpen)
-{
-    s_want_scale = scale; s_want_hires = hires; s_want_sf = sprite_filter; s_want_smooth = smooth; s_want_sharpen = sharpen;
+    if (s_fps_limit) {
+        unsigned long long interval = gb_qf() / s_fps_limit;
+        unsigned long long current = (unsigned long long)now.QuadPart;
+        next_frame = next_frame && current - next_frame < interval ? next_frame + interval : current + interval;
+    }
 }
 
 /* Between frames, on the pushbuffer thread. */
 static void video_apply(void)
 {
-    int scale = s_want_scale, hires = s_want_hires, i;
-    s_sf = s_want_sf; s_smooth = s_want_smooth; s_sharpen = s_want_sharpen;
-    if (hires != s_hires) {                 /* every texture is looked up in the pack again */
+    static const unsigned limits[] = {30, 60, 120, 144, 240, 360, 0};
+    unsigned options = rbx_settings_video();
+    int scale = (int)(options & 7) + 1, hires = (options >> 8) & 1, i;
+    unsigned aa = (options >> 3) & 3, aniso = 1u << ((options >> 5) & 7);
+    unsigned samples = s_msaa_mask & (1u << aa) ? 1u << aa : 1;
+    s_fps_limit = limits[(options >> 9) & 7];
+    if (hires != s_hires || (aniso > 1) != (s_aniso > 1)) {
         for (i = 0; i < MAX_TEX; i++) { DEFER_REL(s_tx[i].srv); DEFER_REL(s_tx[i].tex); s_tx[i].used = 0; }
         s_hires = hires;
     }
-    if (scale != s_scale) {
+    if (aniso != s_aniso) {
+        for (i = 0; i < s_nss; i++) DEFER_REL(s_ss[i].obj);
+        s_nss = 0;
+        s_aniso = aniso;
+    }
+    if (scale != s_scale || samples != s_msaa) {
         ID3D11RenderTargetView *none = NULL;
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &none, NULL);
         for (i = 0; i < MAX_RT; i++) { rt_release(&s_rt[i]); s_rt[i].va = 0; }
         for (i = 0; i < 4; i++) { SAFE_REL(s_ds[i].dsv); SAFE_REL(s_ds[i].tex); s_ds[i].va = 0; }
         s_scale = scale;
+        s_msaa = samples;
         s_resets++;
-        fprintf(stderr, "[RBX DX11] video: render scale %dx\n", s_scale);
+        fprintf(stderr, "[RBX DX11] video: render scale %dx, MSAA %ux\n", s_scale, s_msaa);
     }
 }
 
@@ -2105,6 +2192,7 @@ static void gb_flip_impl(void)
     unsigned long now;
     if (!s_inited || s_failed) return;
     s_frame++; s_tick++; st_flips++;
+    rbx_input_guest_frame = (LONG)s_frame;
     s_frame_for_grave = s_frame;
     texdump_poll();
     { unsigned long k = 0, keep = 0; for (; k < s_defer_n; k++) { if (s_grave[k].f + 2 <= s_frame) IUnknown_Release(s_grave[k].o); else s_grave[keep++] = s_grave[k]; } s_defer_n = keep; }
@@ -2142,7 +2230,7 @@ static void gb_flip_impl(void)
         last = now;
     }
     publish_frame();
-    mvc2_overlay_flip_wait();
+    rbx_settings_wait();
     video_apply();
 }
 

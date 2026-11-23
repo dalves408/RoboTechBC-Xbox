@@ -41,7 +41,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\skip_boot_movi
 
 rem --- host input / present (required for pad + keyboard menus) ---
 set "RECOMP_USB=1"
-set "RECOMP_USB_PADS=1"
 set "RECOMP_CONTIG_AVOID_IMAGE=1"
 set "RECOMP_KEYBOARD=1"
 set "RECOMP_KEYBOARD_FOCUS=0"
@@ -58,6 +57,7 @@ rem Do NOT set XAPI_TD — freelist address is wrong for this title.
 set "RECOMP_USB_SYNTH_TD="
 set "RECOMP_USB_XAPI_TD="
 set "RECOMP_PAD_SCRIPT="
+set "RECOMP_RBX_FRAME_PAD="
 set "RECOMP_PAD_LIVE="
 set "RECOMP_PAD_PRESS="
 set "RECOMP_KEY_SCRIPT="
@@ -80,6 +80,7 @@ set "RECOMP_TIMER_DPC_MS="
 set "RECOMP_FLIP_PACING=0"
 
 set "RECOMP_FB_SHOT_DIR=%CD%\screenshots"
+set "RECOMP_SAVE_DIR="
 set "RECOMP_ERR_LOG=%CD%\screenshots\test_game.err.log"
 if not exist "%RECOMP_FB_SHOT_DIR%" mkdir "%RECOMP_FB_SHOT_DIR%"
 
@@ -92,7 +93,9 @@ echo.
 echo  Controls (console may keep focus — raw + async still work):
 echo    Arrows     D-pad
 echo    Enter / Z  A ^(confirm / skip intro^)
-echo    Esc / X    B
+echo    X          B
+echo    F1         Video settings
+echo    Esc        Quit confirmation
 echo    Space      START ^(skip intro / Attract^)
 echo    WASD       left stick
 echo    Delete     Screenshot -^> %RECOMP_FB_SHOT_DIR%\shot_*.bmp

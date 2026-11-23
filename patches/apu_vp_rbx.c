@@ -105,10 +105,24 @@ static float clampf(float v, float mn, float mx)
     return v;
 }
 
+enum { VP_VOLUME_MUTE = 0xFFF };
+static INIT_ONCE s_volume_once = INIT_ONCE_STATIC_INIT;
+static float s_volume_gain[VP_VOLUME_MUTE + 1];
+
+static BOOL CALLBACK init_volume_gain(PINIT_ONCE once, PVOID parameter, PVOID *context)
+{
+    (void)once;
+    (void)parameter;
+    (void)context;
+    for (unsigned vol = 0; vol < VP_VOLUME_MUTE; vol++) {
+        s_volume_gain[vol] = powf(10.0f, vol / (64.0f * -20.0f));
+    }
+    return TRUE;
+}
+
 static float attenuate(uint16_t vol)
 {
-    vol &= 0xFFF;
-    return (vol == 0xFFF) ? 0.0f : powf(10.0f, vol / (64.0f * -20.0f));
+    return s_volume_gain[vol & VP_VOLUME_MUTE];
 }
 
 /* ============================================================
@@ -1242,6 +1256,34 @@ static void vp_ring_report(unsigned secs)
  * Sample fetching from voice buffers
  * ============================================================ */
 
+typedef struct {
+    unsigned channels;
+    uint32_t encoded[18];
+    int16_t decoded[(ADPCM_SAMPLES_PER_BLOCK + 1) * 2];
+} VpAdpcmBlock;
+
+/* Each VP thread keeps one standard block per voice. Compare the bytes
+ * fetched from guest memory, so buffer rewrites and remaps need no hooks. */
+static __declspec(thread) VpAdpcmBlock s_adpcm_cache[MCPX_HW_MAX_VOICES];
+
+static const int16_t *vp_decode_adpcm(unsigned voice, const uint32_t *encoded,
+                                    size_t bytes, unsigned channels,
+                                    bool stream, int16_t *scratch)
+{
+    if (!stream && bytes == 36u * channels) {
+        VpAdpcmBlock *entry = &s_adpcm_cache[voice];
+        if (entry->channels != channels || memcmp(entry->encoded, encoded, bytes) != 0) {
+            adpcm_decode_block(entry->decoded, (const uint8_t *)encoded, bytes, channels);
+            memcpy(entry->encoded, encoded, bytes);
+            entry->channels = channels;
+        }
+        return entry->decoded;
+    }
+
+    adpcm_decode_block(scratch, (const uint8_t *)encoded, bytes, channels);
+    return scratch;
+}
+
 static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                        int num_samples_requested)
 {
@@ -1284,7 +1326,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     int adpcm_block_index = -1;
     /* Room for the largest block the MCPX accepts (see the check below). */
     uint32_t adpcm_block[36 * ADPCM_MAX_BLOCKS / 4];
-    int16_t adpcm_decoded[65 * ADPCM_MAX_BLOCKS * 2];
+    int16_t adpcm_scratch[65 * ADPCM_MAX_BLOCKS * 2];
+    const int16_t *adpcm_decoded = adpcm_scratch;
 
     voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_NEW_VOICE, 0);
@@ -1391,8 +1434,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                         linear_addr += 4;
                     }
                 }
-                adpcm_decode_block(adpcm_decoded, (uint8_t *)adpcm_block,
-                                   block_size, channels);
+                adpcm_decoded = vp_decode_adpcm(v, adpcm_block, block_size, channels,
+                                               stream, adpcm_scratch);
                 adpcm_block_index = block_index;
             }
 
@@ -1515,16 +1558,21 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
     if (!(rate > 0.0f)) rate = 1.0f;
     step = 1.0f / rate;
 
-    if (!f->rs_have) {
-        got = voice_get_samples(d, v, src, 2);
-        /* A first fetch that gets one sample returns no output and drops
-         * that sample: the next call fetches two afresh. A voice whose
-         * stream starts one sample at a time loses its first sample. */
-        if (got < 2) return got < 0 ? got : 0;
-        f->rs_last[0] = src[0][0]; f->rs_last[1] = src[0][1];
-        f->rs_next[0] = src[1][0]; f->rs_next[1] = src[1][1];
+    /* Keep the first source frame if a streaming voice only supplied one.
+     * The next fetch completes the interpolation pair without losing it. */
+    if (f->rs_have < 2) {
+        got = voice_get_samples(d, v, src, 2 - f->rs_have);
+        if (got <= 0) return got;
+        if (f->rs_have == 0) {
+            memcpy(f->rs_last, src[0], sizeof f->rs_last);
+            f->rs_have = 1;
+            if (--got == 0) return 0;
+            memcpy(f->rs_next, src[1], sizeof f->rs_next);
+        } else {
+            memcpy(f->rs_next, src[0], sizeof f->rs_next);
+        }
         f->rs_pos = 0.0f;
-        f->rs_have = 1;
+        f->rs_have = 2;
     }
 
     /* Source samples the next requested_num outputs will step past, exactly:
@@ -1835,6 +1883,7 @@ static void vp_trace_positions(MCPXAPUState *d)
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    InitOnceExecuteOnce(&s_volume_once, init_volume_gain, NULL, NULL);
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     for (int list = 0; list < 3; list++) {

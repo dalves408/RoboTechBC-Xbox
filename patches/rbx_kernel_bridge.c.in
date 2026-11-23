@@ -1,0 +1,5 @@
+#include "rbx_virtual_disk.h"
+
+#define GetFileSizeEx rbx_disk_size
+#define DuplicateHandle rbx_disk_duplicate
+#include "@XBOXRECOMP_DIR@/src/kernel/kernel_bridge.c"

@@ -1,0 +1,38 @@
+#include <windows.h>
+
+/* The toolkit only uses CreateFileW here to initialize its disk images.
+ * Its directory setup and partition table encoder are still shared. */
+#define CreateFileW(...) INVALID_HANDLE_VALUE
+#include "@XBOXRECOMP_DIR@/src/kernel/kernel_path.c"
+#undef CreateFileW
+
+#include "rbx_virtual_disk.h"
+
+int rbx_partition_from_path(const wchar_t *path)
+{
+    size_t root = wcslen(s_save_dir);
+    if (!root || _wcsnicmp(path, s_save_dir, root) != 0)
+        return -1;
+    const WCHAR *device = path + root;
+    if (wcslen(device) == 15 && _wcsnicmp(device, L"\\Partition", 10) == 0 &&
+        device[10] >= L'0' && device[10] <= L'9' && _wcsicmp(device + 11, L".img") == 0)
+        return device[10] - L'0';
+    return -1;
+}
+
+BOOL rbx_open_save_directory(HANDLE *handle, DWORD access, DWORD share)
+{
+    *handle = CreateFileW(s_save_dir, access, share, NULL, OPEN_EXISTING,
+                          FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    return *handle != INVALID_HANDLE_VALUE;
+}
+
+uint64_t rbx_partition_size(unsigned partition)
+{
+    return partition == 0 ? XBOX_PART_TABLE_OFFSET + 512 : s_part_sectors[partition] * 512;
+}
+
+void rbx_partition_seed(unsigned char page[4096])
+{
+    xbox_build_partition_table(page + XBOX_PART_TABLE_OFFSET);
+}

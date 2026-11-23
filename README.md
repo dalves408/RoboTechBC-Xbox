@@ -44,7 +44,7 @@ That launcher:
 | --- | --- |
 | Arrows | D-pad |
 | Enter / Z | A (confirm / skip intro) |
-| Esc / X | B |
+| X | B |
 | Space | START (skip intro / Attract) |
 | WASD / keypad 8462 | Left stick |
 | IJKL | Right stick |
@@ -54,8 +54,15 @@ That launcher:
 | Shift / Ctrl | Left / right stick click |
 | Backspace | BACK |
 | Delete | Screenshot → `screenshots\shot_*.bmp` |
+| F1 | Video settings |
+| Esc | Quit confirmation or close settings |
+| F11 / Alt+Enter | Toggle borderless fullscreen |
 
 Keys work even when the console keeps focus (raw INPUTSINK + async). Enter/Space/Z skip guest Bink/Attract once the pad map is open (~20–40s in). Wait through logos to the title menu.
+
+Versus supports two players. Connect two SDL3 gamepads for separate controls. If Player 2 disconnects, their controls go neutral and resume when SDL3 reconnects the pad. Keyboard and mouse control Player 1. Controller 1 can hold Back and press Start to open Video settings. Use the D-pad or left stick and A to adjust settings, and B or Start to close the overlay.
+
+Video settings include 1×–5× internal resolution, borderless fullscreen, 4:3 or stretched output, VSync, 30–360 FPS presentation limits or uncapped presentation, 2×/4×/8× MSAA where supported, 2×–16× anisotropic filtering, and hi-res texture replacements. The presentation limit leaves the Xbox game clock unchanged. Settings are saved to `settings.ini`.
 
 ### Short Ch1 cinematic overlay (obsolete)
 
@@ -64,6 +71,8 @@ Keys work even when the console keeps focus (raw INPUTSINK + async). Enter/Space
 ## Build from scratch
 
 Needs Visual Studio 2022 Build Tools (MSVC), CMake, Python 3.12, Git, `extract-xiso`, and a local xboxrecomp checkout linked or copied as `tools\xboxrecomp`.
+
+Place the SDL3 Windows x64 development package (3.4.20) beside the xboxrecomp checkout as `SDL3-3.4.20`, or set CMake's `RBX_SDL3_ROOT` to its location. The build copies `SDL3.dll` beside the executable.
 
 ```powershell
 cd "<repo>"
@@ -74,13 +83,15 @@ cd "<repo>"
 .\test_game.bat
 ```
 
+The packaged game is portable. Keep the executable, DLLs, and `game_files` together. Xbox disk partitions are emulated in memory. Saves and other Xbox filesystem data go in `SaveData`, video settings in `settings.ini`, and optional replacement textures in `texture_pack`. The launcher keeps screenshots and logs in the same installation folder. Move the whole folder to carry your settings and saves with it.
+
 ## Private test release
 
 ```powershell
 python scripts\package_release.py --version 1.0
 ```
 
-Writes `dist\RobotechBC_Recomp_v<ver>_test.zip` (+ `.sha256`): exe, pdb, `vcruntime140.dll`, `D3DCompiler_47.dll`, the disc `game_files\` (bring-up leftovers excluded), `Play.bat` (sets the play env; saves to `saves\`, logs to `logs\`) and `README.txt`. It contains game data: private testing on owned machines only, never commit or share `dist\`. Test an unzipped copy with `rbx_diag.py --exe <dir>\robotech_bc_recomp.exe --cwd <dir>`.
+Writes `dist\RobotechBC_Recomp_v<ver>_test.zip` (+ `.sha256`): exe, pdb, `vcruntime140.dll`, `SDL3.dll`, the disc `game_files\` (bring-up leftovers excluded), `Play.bat` (sets the play env; saves to `SaveData\`, logs to `logs\`) and `README.txt`. The game uses the Windows copy of `D3DCompiler_47.dll`. It contains game data: private testing on owned machines only, never commit or share `dist\`. Test an unzipped copy with `rbx_diag.py --exe <dir>\robotech_bc_recomp.exe --cwd <dir>`.
 
 ## Diagnostics
 
@@ -92,6 +103,10 @@ python scripts\diag\rbx_diag.py --secs 100 --shot-every 4 --audio --name run1 --
 
 Output goes to `analysis\diag\<name>\` (`report.json`, `shots\`, `stderr.log`, `hang_t*_stacks.txt`).
 
+For repeatable input timing, use `--frame-pad "f360:a,f540:a,f720:a:18"` instead of `--keys`. Each press starts at the specified guest render flip and lasts eight flips by default. The report lists the first flip where the game polled each press. Use a fresh `--name` for an independent save directory.
+
+Add `--frame-dump-every 240` to capture numbered BMPs. On a second run add `--compare-frames analysis/diag/<first-run>/frames` to report matching frame numbers, missing captures, and mean RGB errors. Guest clocks and audio still run in real time, so matching input numbers alone do not guarantee pixel-identical frames.
+
 | Tool | Use |
 | --- | --- |
 | `scripts\diag\rbx_diag.py` | Harness: timed keys, fps/CPU/threads, frozen-frame + hang detection, audio WAV analysis. |
@@ -100,6 +115,7 @@ Output goes to `analysis\diag\<name>\` (`report.json`, `shots\`, `stderr.log`, `
 | `-DRBX_ABI_CHECK=ON` (CMake) | Diagnostic build that reports lifted functions which fail to restore ebx/esi/edi/esp. |
 | `RECOMP_STUB_LOG=1` | Logs when an unresolved lifter stub is reached. |
 | `RECOMP_PROF=lo-hi` | Samples the busiest thread between those seconds and prints hot source lines. |
+| `RECOMP_XF_THREADS=n` | Overrides the vertex-transform worker count (0 disables workers, max 7). Default: one worker on hosts with at least four logical CPUs. |
 
 ## Hard constraints (do not regress)
 

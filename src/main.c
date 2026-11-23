@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <wchar.h>
 #include <math.h>
 
 /* xboxrecomp runtime headers */
@@ -79,12 +80,54 @@ extern ptrdiff_t g_xbox_mem_offset;
 /* ── XBE Constants ─────────────────────────────────────────── */
 
 /*
- * Paths are relative to the process working directory (project root / build out).
- * Prefer launching via scripts/run_game.py once the lift+build exists.
+ * Paths are relative to the installation root selected at startup.
  */
 #define YOUR_GAME_ENTRY_POINT   0x0001319F  /* XBE entry point VA (retail XOR decoded) */
 #define YOUR_GAME_XBE_PATH      "game_files\\default.xbe"
 #define YOUR_GAME_DIR            "game_files"
+
+static int portable_paths(void)
+{
+    WCHAR location[MAX_PATH], path[MAX_PATH];
+    char save_utf8[MAX_PATH * 3];
+    DWORD n = GetModuleFileNameW(NULL, location, MAX_PATH);
+    if (n && n < MAX_PATH) {
+        WCHAR *slash = wcsrchr(location, L'\\');
+        if (slash) {
+            *slash = L'\0';
+            if (swprintf_s(path, MAX_PATH, L"%ls\\game_files\\default.xbe", location) > 0 &&
+                GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES &&
+                !SetCurrentDirectoryW(location))
+                return 0;
+        }
+    }
+
+    const char *override = getenv("RECOMP_SAVE_DIR");
+    if (override && *override) {
+        if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, override, -1, location, MAX_PATH))
+            return 0;
+    } else {
+        wcscpy_s(location, MAX_PATH, L"SaveData");
+    }
+    n = GetFullPathNameW(location, MAX_PATH, path, NULL);
+    /* xbox_path_init reserves room for UDATA, the title ID and filenames. */
+    if (!n || n >= MAX_PATH - 96 ||
+        !WideCharToMultiByte(CP_UTF8, 0, path, -1, save_utf8, sizeof save_utf8, NULL, NULL))
+        return 0;
+    DWORD attributes = GetFileAttributesW(path);
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (!CreateDirectoryW(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+            /* The runtime creates nested directories for explicit test overrides. */
+            if (!override || !*override) return 0;
+        }
+    } else if (!(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        return 0;
+    }
+    const char *screenshots = getenv("RECOMP_FB_SHOT_DIR");
+    int custom_screenshots = screenshots && *screenshots;
+    return _putenv_s("RECOMP_SAVE_DIR", save_utf8) == 0 &&
+        (custom_screenshots || _putenv_s("RECOMP_FB_SHOT_DIR", "screenshots") == 0);
+}
 
 /* ── Forward declarations ──────────────────────────────────── */
 
@@ -303,6 +346,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
+    if (!portable_paths()) {
+        fprintf(stderr, "Could not initialize portable game paths. Check the installation and save folder paths.\n");
+        return 1;
+    }
+
     printf("=== Robotech Battlecry (Xbox) - Static Recompilation ===\n");
     printf("Loading XBE...\n");
 
@@ -326,8 +374,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             { "RECOMP_FB_WINDOW", "1" },
             { "RECOMP_KEYBOARD", "1" },
             { "RECOMP_USB", "1" },
-            /* Stable USB pad 0 for interactive keyboard-as-pad (avoid hot-plug AV). */
-            { "RECOMP_USB_PADS", "1" },
+            /* Keep both Versus ports enumerated while SDL reconnects host pads. */
+            { "RECOMP_USB_PADS", "2" },
             /* Off for Ch1 bring-up: FENCE_EXEC held the guest on unpublished
              * fences while the cinematic walker crawled (~draws freeze at
              * 331). Opt in once HUD flight is solid. */
@@ -356,7 +404,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             { "RECOMP_FLIP_PACING", "0" },
             /* Present vsync wait stacked with keyed-mutex contention on the
              * FB thread; guest pacing is enough for bring-up. */
-            { "RECOMP_PRESENT_VSYNC", "0" },
             { "RECOMP_HEAP_RECLAIM", "1" },
             { "RECOMP_AC97_READY", "1" },
             /* Keep MmAllocateContiguousMemory out of the loaded image range so
@@ -459,13 +506,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     }
 
     /* Step 3: Initialize Xbox kernel */
+    {
+        extern void rbx_settings_install(void);
+        rbx_settings_install();
+    }
     printf("Initializing Xbox kernel replacement...\n");
     xbox_kernel_init();
 
     /* Step 4: Set game directory for file I/O path translation */
     {
         extern void xbox_path_init(const char *game_dir, const char *save_dir);
-        xbox_path_init(YOUR_GAME_DIR, NULL);
+        xbox_path_init(YOUR_GAME_DIR, getenv("RECOMP_SAVE_DIR"));
     }
 
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
@@ -523,15 +574,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     {
         extern void rbx_d3d11_register(void);
         rbx_d3d11_register();
-    }
-
-    /* Bat double-click leaves the launch console focused; WM_KEYDOWN then
-     * never reaches the FB window. Raw INPUTSINK + async cover that, and
-     * periodically reclaiming foreground after logos matches CS menu bats. */
-    {
-        extern void (*xbox_fb_tick_hook)(void);
-        extern void rbx_fb_focus_tick(void);
-        xbox_fb_tick_hook = rbx_fb_focus_tick;
     }
 
     /* Step 7: Call the recompiled entry point */

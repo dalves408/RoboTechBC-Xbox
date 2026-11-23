@@ -69,6 +69,7 @@ VK = {
     "enter": 0x0D, "space": 0x20, "esc": 0x1B, "z": 0x5A, "x": 0x58, "c": 0x43, "v": 0x56,
     "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27, "delete": 0x2E,
     "w": 0x57, "a": 0x41, "s": 0x53, "d": 0x44, "tab": 0x09, "q": 0x51, "e": 0x45,
+    "f1": 0x70, "f11": 0x7A,
 }
 EXTENDED = {0x26, 0x28, 0x25, 0x27, 0x2E}
 
@@ -168,11 +169,51 @@ ANOMALY_PATTERNS = {
     "gpu_unhandled": re.compile(r"([1-9]\d*) unhandled methods \((\d+) distinct\)"),
     "stub_called": re.compile(r"\[(?:KERNEL|FILE|STUB)\][^\n]*\bstub\b", re.I),
     "unresolved": re.compile(r"(unresolved|UNRESOLVED|no such function|missing import)", re.I),
-    "audio_underrun": re.compile(r"(underflow|\b(?:starves|underruns)=[1-9]|(?<![a-z_])(?:underrun|starv)(?!\w*=0\b))", re.I),
+    "audio_underrun": re.compile(r"\b(?:underrun|underflow)\b", re.I),
     "dx_error": re.compile(r"(HRESULT|E_FAIL|DXGI_ERROR|device removed|shader compile)", re.I),
     "watchdog": re.compile(r"(WATCHDOG|watchdog|HANG|deadlock)", re.I),
 }
 RBX_STAT = re.compile(r"^\[RBX DX11\] frame=(\d+) flips=(\d+) draws=(\d+).*?us_draw=(\d+) us_clear=(\d+) us_flip=(\d+) scan_ms=(\d+)")
+XA2_UNDERRUN = re.compile(r"^\[XA2\] underrun x(\d+)\b")
+AUDIO_HOST_UNDERRUN = re.compile(r"^\[AUDIO-HOST\].*\bunderruns=(\d+)\b")
+FRAME_PRESS = re.compile(r"^\[RBX PAD\] (\w+) observed at f(\d+) \(scheduled f(\d+)\)$", re.M)
+FRAME_NAME = re.compile(r"(?:^|_)f(\d+)\.bmp$", re.I)
+
+
+def compare_frames(reference: Path, capture: Path):
+    from PIL import Image, ImageChops, ImageStat
+
+    def by_number(directory):
+        frames = {}
+        for path in directory.iterdir():
+            match = FRAME_NAME.search(path.name)
+            if not match or not path.is_file():
+                continue
+            number = int(match[1])
+            if number in frames:
+                raise ValueError(f"duplicate frame {number} in {directory}")
+            frames[number] = path
+        return frames
+
+    expected, actual = by_number(reference), by_number(capture)
+    scores, different_size, identical = {}, [], 0
+    for number in sorted(expected.keys() & actual.keys()):
+        with Image.open(expected[number]) as before, Image.open(actual[number]) as after:
+            if before.size != after.size:
+                different_size.append(number)
+                continue
+            diff = ImageChops.difference(before.convert("RGB"), after.convert("RGB"))
+            identical += diff.getbbox() is None
+            scores[number] = round(statistics.mean(ImageStat.Stat(diff).mean), 4)
+    return {
+        "reference": str(reference), "compared": len(scores),
+        "identical": identical,
+        "max_mean_rgb_error": max(scores.values(), default=None),
+        "missing": sorted(expected.keys() - actual.keys()),
+        "extra": sorted(actual.keys() - expected.keys()),
+        "different_size": different_size,
+        "mean_rgb_error_by_frame": scores,
+    }
 
 
 def scan_log(path: Path):
@@ -182,6 +223,15 @@ def scan_log(path: Path):
         return res, rbx
     with path.open("r", errors="replace") as fh:
         for line in fh:
+            counter = XA2_UNDERRUN.match(line) or AUDIO_HOST_UNDERRUN.match(line)
+            if counter:
+                count = int(counter[1])
+                item = res["audio_underrun"]
+                if count > item.get("cumulative", 0):
+                    item["count"] += count - item.get("cumulative", 0)
+                    item["cumulative"] = count
+                    item["examples"] = {f"XAudio2 cumulative total: {count}": count}
+                continue
             m = RBX_STAT.match(line)
             if m:
                 rbx.append({k: int(v) for k, v in zip(
@@ -223,7 +273,11 @@ def main() -> int:
     ap.add_argument("--name", default=time.strftime("run_%Y%m%d_%H%M%S"))
     ap.add_argument("--interval", type=float, default=1.0, help="sample period (s)")
     ap.add_argument("--shot-every", type=float, default=5.0, help="screenshot period (s), 0=off")
-    ap.add_argument("--keys", default="", help="t:key[:holdms],... timed key presses")
+    input_mode = ap.add_mutually_exclusive_group()
+    input_mode.add_argument("--keys", default="", help="t:key[:holdms],... timed key presses")
+    input_mode.add_argument("--frame-pad", default="", help="fN:button[:frames],... guest-frame pad presses")
+    ap.add_argument("--frame-dump-every", type=int, default=0, help="capture at multiples of this guest frame number")
+    ap.add_argument("--compare-frames", type=Path, help="compare captured BMPs with a numbered reference directory")
     ap.add_argument("--audio", action="store_true", help="dump audio device stream to WAV and analyse")
     ap.add_argument("--gpu-stats", action="store_true", help="RECOMP_GPU_STATS=1 (periodic [RBX DX11] timings)")
     ap.add_argument("--env", action="append", default=[], help="extra KEY=VALUE env")
@@ -231,6 +285,13 @@ def main() -> int:
     ap.add_argument("--exe", default=str(EXE))
     ap.add_argument("--cwd", default=str(ROOT), help="working dir (must hold game_files\\); e.g. an unzipped release")
     a = ap.parse_args()
+    if a.frame_dump_every < 0:
+        ap.error("--frame-dump-every must be nonnegative")
+    if a.compare_frames and (not a.frame_dump_every or not a.compare_frames.is_dir()):
+        ap.error("--compare-frames requires a reference directory and --frame-dump-every")
+    if a.frame_pad and not all(re.fullmatch(r"f\d+:(up|down|left|right|start|back|ls|rs|a|b|x|y|black|white|lt|rt)(?::[1-9]\d*)?", item)
+                               for item in a.frame_pad.split(",")):
+        ap.error("--frame-pad must be a comma-separated list of fN:button[:frames]")
 
     out = OUT_ROOT / a.name
     (out / "shots").mkdir(parents=True, exist_ok=True)
@@ -239,6 +300,18 @@ def main() -> int:
     for k in CLEAR_ENV:
         env.pop(k, None)
     env.update(PLAY_ENV)
+    env.pop("RECOMP_RBX_FRAME_PAD", None)
+    if a.frame_pad:
+        env["RECOMP_RBX_FRAME_PAD"] = a.frame_pad
+        env["RECOMP_SAVE_DIR"] = str(out / "scenario_saves")
+        env["RECOMP_RBX_SETTINGS"] = str(out / "scenario.ini")
+    if a.frame_dump_every:
+        frame_dir = out / "frames"
+        frame_dir.mkdir(exist_ok=True)
+        if any(frame_dir.iterdir()):
+            ap.error(f"{frame_dir} already has captures, choose a new --name")
+        env["RECOMP_GPU_PRESDUMP"] = f"{out / 'frames' / 'frame'}:{a.frame_dump_every}"
+        env["RECOMP_GPU_PRESDUMP_FRAME"] = "1"
     env["RECOMP_FB_SHOT_DIR"] = str(out / "shots")
     if a.gpu_stats:
         env["RECOMP_GPU_STATS"] = "1"
@@ -382,6 +455,16 @@ def write_report(a, out, samples, shots, key_log, hangs, exited, thr_total, wav)
         "frame_hangs": [{k: v for k, v in h.items() if k != "at_abs"} for h in hangs],
         "log": log, "keys_sent": key_log,
     }
+    if a.frame_pad:
+        rep["frame_pad"] = {
+            "scheduled": a.frame_pad.split(","),
+            "observed": [
+                {"button": button, "frame": int(frame), "scheduled_frame": int(scheduled)}
+                for button, frame, scheduled in FRAME_PRESS.findall((out / "stderr.log").read_text(errors="replace"))
+            ],
+        }
+    if a.compare_frames:
+        rep["frame_comparison"] = compare_frames(a.compare_frames, out / "frames")
     if rbx:
         def avg(k):
             return round(statistics.mean(r[k] for r in rbx), 1)
@@ -410,7 +493,9 @@ def write_report(a, out, samples, shots, key_log, hangs, exited, thr_total, wav)
     md = render_md(rep)
     (out / "report.md").write_text(md, encoding="utf-8")
     print("\n" + md)
-    return 1 if rep["crashed"] or rep["frame_hangs"] else 0
+    missed_input = a.frame_pad and len(rep["frame_pad"]["observed"]) != len(rep["frame_pad"]["scheduled"])
+    no_comparable_frames = a.compare_frames and not rep["frame_comparison"]["compared"]
+    return 1 if rep["crashed"] or rep["frame_hangs"] or missed_input or no_comparable_frames else 0
 
 
 def analyze_wav(path: Path):
@@ -503,6 +588,17 @@ def render_md(r):
             L.append(f"- {k}: {v['count']}  e.g. {v['examples']}")
     if r["keys_sent"]:
         L += ["", f"## Keys sent: {r['keys_sent']}"]
+    if "frame_pad" in r:
+        observed = r["frame_pad"]["observed"]
+        total = len(r["frame_pad"]["scheduled"])
+        L += ["", "## Frame-numbered input", "", f"- Observed {len(observed)} of {total} scheduled presses",
+              *[f"- {p['button']} at f{p['frame']} (scheduled f{p['scheduled_frame']})" for p in observed]]
+    if "frame_comparison" in r:
+        comparison = r["frame_comparison"]
+        L += ["", "## Frame comparison", "",
+              f"- Compared {comparison['compared']} frames, {comparison['identical']} identical",
+              f"- Largest mean RGB error (0–255): {comparison['max_mean_rgb_error']}",
+              f"- Missing: {len(comparison['missing'])}, extra: {len(comparison['extra'])}, different dimensions: {len(comparison['different_size'])}"]
     return "\n".join(L) + "\n"
 
 

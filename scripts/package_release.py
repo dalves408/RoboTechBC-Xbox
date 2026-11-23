@@ -1,4 +1,4 @@
-"""Package a self-contained, private test build: exe + runtime DLLs + game_files + launcher.
+"""Package a private test build: exe + Visual C++ runtime + game_files + launcher.
 
     python scripts\\package_release.py --version 1.0
 
@@ -23,6 +23,7 @@ SYS32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
 EXCLUDE_SUFFIXES = (".cine_full", ".cine_short")
 EXCLUDE_NAMES = {"default_analysis.json"}
 EXCLUDE_DIRS = {".skipped_for_bringup"}
+RUNTIME_DATA_DIRS = {"udata", "tdata", "cache"}
 MOVIE_STASH = GAME / "Media" / "vcResources" / "xbox" / "vcMovie" / ".skipped_for_bringup"
 
 PLAY_BAT = r"""@echo off
@@ -31,7 +32,6 @@ rem Robotech: Battlecry (Xbox recomp) - test release {version}
 cd /d "%~dp0"
 
 set "RECOMP_USB=1"
-set "RECOMP_USB_PADS=1"
 set "RECOMP_CONTIG_AVOID_IMAGE=1"
 set "RECOMP_KEYBOARD=1"
 set "RECOMP_KEYBOARD_FOCUS=0"
@@ -44,9 +44,9 @@ set "RECOMP_KEY_TRACE=1"
 set "RECOMP_USB_STATS=1"
 
 rem Never inherit these (they break input or menus for this title).
-for %%V in (RECOMP_USB_SYNTH_TD RECOMP_USB_XAPI_TD RECOMP_PAD_SCRIPT RECOMP_PAD_LIVE RECOMP_PAD_PRESS RECOMP_KEY_SCRIPT RECOMP_WATCHDOG_SECS RECOMP_FMV_DUMP RECOMP_SWM5_PACE_ENABLE RECOMP_SWM5_PACE_THREAD RECOMP_VBLANK_THREAD RECOMP_PAD_HOLD_MASK RECOMP_PAD_HOLD_ENABLE RECOMP_GPU_SKIPBLACK RECOMP_WATCH RECOMP_KERNEL_WATCH RECOMP_PEEK RECOMP_TIMER_DPC_MS) do set "%%V="
+for %%V in (RECOMP_USB_SYNTH_TD RECOMP_USB_XAPI_TD RECOMP_PAD_SCRIPT RECOMP_RBX_FRAME_PAD RECOMP_PAD_LIVE RECOMP_PAD_PRESS RECOMP_KEY_SCRIPT RECOMP_WATCHDOG_SECS RECOMP_FMV_DUMP RECOMP_SWM5_PACE_ENABLE RECOMP_SWM5_PACE_THREAD RECOMP_VBLANK_THREAD RECOMP_PAD_HOLD_MASK RECOMP_PAD_HOLD_ENABLE RECOMP_GPU_SKIPBLACK RECOMP_WATCH RECOMP_KERNEL_WATCH RECOMP_PEEK RECOMP_TIMER_DPC_MS) do set "%%V="
 
-set "RECOMP_SAVE_DIR=%CD%\saves"
+set "RECOMP_SAVE_DIR="
 set "RECOMP_FB_SHOT_DIR=%CD%\screenshots"
 if not exist "%CD%\logs" mkdir "%CD%\logs"
 if not exist "%RECOMP_FB_SHOT_DIR%" mkdir "%RECOMP_FB_SHOT_DIR%"
@@ -68,26 +68,32 @@ Test release {version}  (commit {commit}, built {date})
 PRIVATE TEST BUILD - contains game data from an owned disc. Do not distribute.
 
 RUN
-  1. Unzip to a short path with no special characters, e.g. C:\\Games\\RobotechBC
-     (very deep paths make saves fall back to %LOCALAPPDATA%\\xboxrecomp).
+  1. Unzip to a writable folder, e.g. C:\\Games\\RobotechBC.
   2. Double-click Play.bat.
   Intros can be skipped with Enter / Space once the pad is live (~20-40 s in).
 
 REQUIREMENTS
   - Windows 10/11 x64, a DirectX 11 GPU.
   - Media Foundation (standard Windows; on "N" editions install the Media Feature Pack).
-  - vcruntime140.dll and D3DCompiler_47.dll are bundled.
+  - vcruntime140.dll and SDL3.dll are bundled. D3DCompiler_47.dll comes from Windows.
 
-CONTROLS (keyboard; an XInput pad also works)
+CONTROLS
+  Versus supports two SDL3 controllers. If Player 2 disconnects, reconnect
+  the controller to resume input. Keyboard and mouse control Player 1.
   Arrows        D-pad              WASD / keypad 8462  Left stick
   Enter / Z     A                  IJKL                Right stick
-  Esc / X       B                  1 / 3               Left / right trigger
+  X             B                  1 / 3               Left / right trigger
   C / V         X / Y              Shift / Ctrl        Stick clicks
   Q / E         White / Black      Backspace           BACK
   Space         START (pause)      Delete              Screenshot -> screenshots\\
+  F1            Video settings    Esc                 Quit confirmation
+  F11           Fullscreen
+  Controller 1: hold Back and press Start to open settings.
 
 FILES
-  saves\\        Save data (created on first save)
+  SaveData\\     Save data and Xbox filesystem data
+  settings.ini   Video settings (created when settings change)
+  texture_pack\\ Optional high-resolution texture replacements
   logs\\         One log per run - include it with any bug report
   screenshots\\  Delete-key screenshots
   robotech_bc_recomp.pdb  Debug symbols (keep for crash reports)
@@ -111,6 +117,8 @@ def git_commit():
 def game_files():
     for dirpath, dirnames, filenames in os.walk(GAME):
         dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
+        if Path(dirpath) == GAME:
+            dirnames[:] = [d for d in dirnames if d.lower() not in RUNTIME_DATA_DIRS]
         for f in filenames:
             if f in EXCLUDE_NAMES or f.endswith(EXCLUDE_SUFFIXES):
                 continue
@@ -143,10 +151,14 @@ def main():
     pdb = BUILD / "robotech_bc_recomp.pdb"
     if pdb.exists():
         items.append((pdb, pdb.name))
-    for dll in ("vcruntime140.dll", "D3DCompiler_47.dll"):
-        if not (SYS32 / dll).exists():
-            sys.exit(f"missing {SYS32 / dll}")
-        items.append((SYS32 / dll, dll))
+    runtime = SYS32 / "vcruntime140.dll"
+    if not runtime.exists():
+        sys.exit(f"missing {runtime}")
+    items.append((runtime, runtime.name))
+    sdl = BUILD / "SDL3.dll"
+    if not sdl.exists():
+        sys.exit(f"missing {sdl}; rebuild the game")
+    items.append((sdl, sdl.name))
     items += [(p, "game_files/" + p.relative_to(GAME).as_posix()) for p in game_files()]
 
     comp = zipfile.ZIP_DEFLATED if a.level else zipfile.ZIP_STORED
@@ -161,6 +173,7 @@ def main():
             if done * 20 // total != (done - p.stat().st_size) * 20 // total:
                 print(f"  {done * 100 // total:3d}%  {time.time() - t0:5.0f}s", flush=True)
         z.writestr(f"{name}/Play.bat", PLAY_BAT.format(**fmt).replace("\n", "\r\n"))
+        z.writestr(f"{name}/SaveData/", b"")
         z.writestr(f"{name}/README.txt", README.format(**fmt).replace("\n", "\r\n"))
         z.writestr(f"{name}/VERSION.txt", f"{a.version} {commit} {fmt['date']}\r\n")
     with zipfile.ZipFile(tmp) as z:

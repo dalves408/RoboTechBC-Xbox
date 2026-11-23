@@ -27,6 +27,7 @@ set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/xboxrecomp" CACHE PATH
     "Path to the xboxrecomp toolkit root directory")
 
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
+include(patches/rbx_virtual_disk.cmake)
 
 # Interactive pad input for this title requires bak OHCI. Shared toolkit
 # ohci.c is frequently overwritten by XAPI_TD WIP (empty interrupt EDs /
@@ -92,12 +93,30 @@ set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
     src/rbx_d3d11.c
+    src/rbx_settings.c
+    src/rbx_sdl_window.c
 )
 
 add_executable(${PROJECT_NAME} WIN32
     ${GAME_SOURCES}
     ${RECOMP_GEN_SOURCES}
 )
+
+get_filename_component(_RBX_TOOLS_DIR "${XBOXRECOMP_DIR}" DIRECTORY)
+set(RBX_SDL3_ROOT "${_RBX_TOOLS_DIR}/SDL3-3.4.20" CACHE PATH "SDL3 Windows development package")
+if(NOT EXISTS "${RBX_SDL3_ROOT}/lib/x64/SDL3.lib" OR
+   NOT EXISTS "${RBX_SDL3_ROOT}/lib/x64/SDL3.dll")
+    message(FATAL_ERROR "Set RBX_SDL3_ROOT to the SDL3 Windows x64 development package")
+endif()
+get_target_property(_RBX_INPUT_SOURCES xbox_input SOURCES)
+list(FILTER _RBX_INPUT_SOURCES EXCLUDE REGEX "(^|[/\\\\])xinput_device\\.c$")
+set_property(TARGET xbox_input PROPERTY SOURCES ${_RBX_INPUT_SOURCES})
+target_sources(xbox_input PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/patches/rbx_sdl_input.c")
+target_include_directories(xbox_input PUBLIC "${RBX_SDL3_ROOT}/include")
+target_link_libraries(xbox_input PUBLIC "${RBX_SDL3_ROOT}/lib/x64/SDL3.lib")
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${RBX_SDL3_ROOT}/lib/x64/SDL3.dll"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>")
 
 # -DRBX_ABI_CHECK=ON (use a separate build dir): every lifted direct call checks
 # that ebx/esi/edi survive it; src/recomp_manual.c logs offenders as [ABI].
@@ -124,7 +143,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     ole32
     dxgi
     dxguid
-    $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>
     winmm
     dbghelp
 )
