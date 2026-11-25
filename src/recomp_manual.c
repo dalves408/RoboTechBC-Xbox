@@ -602,7 +602,8 @@ void sub_0012B670(void)
  * edge flags it set last time, so the draw callback, which runs before it on
  * the next pass, also sees each press once. Nothing changes while the game is
  * running. RECOMP_RBX_PAUSE_TICK=0 turns it off; RECOMP_RBX_PAUSE_LOG=1 logs
- * pause changes and each menu up/down press with the pass count. */
+ * pause changes, player 1's stick and d-pad changes as the menu sampled them,
+ * and once a game second how many passes ran and were skipped. */
 #define RBX_PAUSED_VA       0x001E628Cu
 #define RBX_GAME_CLOCK_VA   0x0023A48Cu
 #define RBX_INPUT_VA        0x002BE140u   /* per player, 0x210 apart */
@@ -665,13 +666,24 @@ static void rbx_pause_frame(void)
     }
     sub_00011370();
     if (log) {
-        /* Player 1's d-pad up/down edges (index 6 and 7), as the menu saw them. */
-        uint32_t up = MEM32(RBX_INPUT_VA + RBX_INPUT_EDGES + 4 * 6);
-        uint32_t down = MEM32(RBX_INPUT_VA + RBX_INPUT_EDGES + 4 * 7);
-        if (up || down) {
-            fprintf(stderr, "[RBX PAUSE] menu %s (clock %u, pass %lu)\n",
-                    up ? "up" : "down", MEM32(RBX_GAME_CLOCK_VA), passes);
+        /* Player 1's raw pad record as the menu's last sample read it (current
+         * state at +0x1F8: bytes 0-3 sticks, 6 d-pad up, 7 d-pad down). The
+         * edge flags are no use here: the menu may clear them when it acts. */
+        static uint32_t last_raw = 0xFFFFFFFFu, last_report;
+        uint32_t cur = RBX_INPUT_VA + 0x1F8u;
+        uint32_t raw = MEM8(cur) | MEM8(cur + 1) << 8 | MEM8(cur + 6) << 16 | MEM8(cur + 7) << 24;
+        uint32_t clock = MEM32(RBX_GAME_CLOCK_VA);
+        if (raw != last_raw) {
+            fprintf(stderr, "[RBX PAUSE] pad sticks %02X %02X up %02X down %02X (clock %u, pass %lu)\n",
+                    MEM8(cur), MEM8(cur + 1), MEM8(cur + 6), MEM8(cur + 7), clock, passes);
             fflush(stderr);
+            last_raw = raw;
+        }
+        if (clock - last_report >= 1000u) {
+            fprintf(stderr, "[RBX PAUSE] paused: %lu passes, %lu skipped so far (clock %u)\n",
+                    passes, skipped, clock);
+            fflush(stderr);
+            last_report = clock;
         }
     }
 }
