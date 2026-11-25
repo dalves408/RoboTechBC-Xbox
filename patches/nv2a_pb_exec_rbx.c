@@ -570,7 +570,15 @@ static uint32_t attr_elem_bytes(const VertexAttr *a)
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
  * normalised-byte types appear in practice; anything else returns 0 so a
  * caller sees a degenerate vertex rather than reading past the array. */
-static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
+/* RBX: forced inline. transform_vertex calls this for each of 16 inputs of
+ * every vertex, and the bench profile put 9% of the pushbuffer thread on
+ * its opening line alone: call and prologue overhead, not the reads. */
+#if defined(_MSC_VER)
+#define RBX_FORCEINLINE static __forceinline
+#else
+#define RBX_FORCEINLINE static inline __attribute__((always_inline))
+#endif
+RBX_FORCEINLINE int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 {
     /* RBX: guest RAM is mapped once for the life of the process. This runs
      * for every attribute of every vertex (7% of the pushbuffer thread in the
@@ -5005,14 +5013,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      * texture), this CPU copy of guest memory only feeds
                      * the GDI fallback, the overlay and dumps, yet it cost
                      * ~5% of this thread (bench profile). Copy every Nth
-                     * flip then (RECOMP_FB_COPY_EVERY, default 4; 1 = every
-                     * flip). With no shared frame, every flip as before. */
+                     * flip then (RECOMP_FB_COPY_EVERY, default 8; 1 = every
+                     * flip; 8 measured safe on the bench). With no shared frame, every flip
+                     * as before. */
                     extern int rbx_gpu_frame_shared(void);
                     static int every = -1;
                     static unsigned n;
                     if (every < 0) {
                         const char *e = getenv("RECOMP_FB_COPY_EVERY");
-                        every = e ? atoi(e) : 4;
+                        every = e ? atoi(e) : 8;
                         if (every < 1) every = 1;
                     }
                     if (every == 1 || !rbx_gpu_frame_shared() || ++n % (unsigned)every == 0)

@@ -159,7 +159,7 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 | `RECOMP_GPU_INDEXED=0` | A/B only: hand program batches to D3D11 as three full vertices per triangle instead of unique vertices plus an index buffer. |
 | `RECOMP_FPS_CAP_DROP=1` | A/B only: the F1 FPS limit drops frames on their way to the window instead of holding the game to the cap. |
 | `RECOMP_MINIDUMP=0` / `full` | A crash writes `crashes\RoboTechBC_<date>_<time>.dmp` beside the exe (open with the matching .pdb). `0` turns it off; `full` includes all memory. |
-| `RECOMP_FB_COPY_EVERY=N` | While the window shows the GPU frame, copy guest memory into the GDI fallback buffer every Nth flip (default 4; 1 = every flip). |
+| `RECOMP_FB_COPY_EVERY=N` | While the window shows the GPU frame, copy guest memory into the GDI fallback buffer every Nth flip (default 8; 1 = every flip). |
 
 ## Hard constraints (do not regress)
 
