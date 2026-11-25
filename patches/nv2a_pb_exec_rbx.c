@@ -3349,21 +3349,31 @@ static void xp_run(LONG gen)
 
 /* Workers spin briefly between batches (a batch is tens of microseconds;
  * an event wake-up costs about as much), then sleep on their event. The
- * 1 ms timeout covers a SetEvent racing the sleeping flag. */
+ * 1 ms timeout covers a SetEvent racing the sleeping flag.
+ * The spin is bounded in time, not in pause instructions: 40000 pauses was
+ * 0.5-5 ms depending on the CPU, so workers rarely slept and each cost
+ * ~60% of a core (bench). RECOMP_XF_SPIN_US sets it (default 200 us,
+ * which covers the gap between batches inside a frame). */
+static LONGLONG s_xp_spin_ticks;
 static DWORD WINAPI xp_worker(LPVOID arg)
 {
     LONG idx = (LONG)(size_t)arg, my = 0;
     HANDLE go = s_xp_go[idx];
     for (;;) {
         unsigned spins = 0;
+        LARGE_INTEGER t0, t1;
+        QueryPerformanceCounter(&t0);
         while (s_xp_gen == my) {
-            if (++spins < 40000) { YieldProcessor(); continue; }
+            if ((++spins & 255) != 0) { YieldProcessor(); continue; }
+            QueryPerformanceCounter(&t1);
+            if (t1.QuadPart - t0.QuadPart < s_xp_spin_ticks) continue;
             s_xp_sleeping[idx] = 1;
             MemoryBarrier();
             if (s_xp_gen == my)
                 WaitForSingleObject(go, 1);
             s_xp_sleeping[idx] = 0;
             spins = 0;
+            QueryPerformanceCounter(&t0);
         }
         my = s_xp_gen;
         xp_run(my);
@@ -3377,14 +3387,15 @@ static int xp_workers(void)
         SYSTEM_INFO si;
         int n, i;
         GetSystemInfo(&si);
-        /* Default by logical CPUs. It used to be `>= 4`, i.e. at most one
-         * worker however many cores the host had, while vertex programs are
-         * interpreted on the CPU and the pushbuffer thread is what the title
-         * waits on. Leave room for the render, audio and present threads. */
-        if (e) n = atoi(e);
-        else {
-            DWORD c = si.dwNumberOfProcessors;
-            n = c >= 12 ? 4 : c >= 8 ? 3 : c >= 6 ? 2 : c >= 4 ? 1 : 0;
+        /* One worker on 4+ logical CPUs. Four workers measured no faster on
+         * the bench (6800H): transform time fell but clip time on the
+         * pushbuffer thread rose by as much, and they cost ~1.9 more cores. */
+        n = e ? atoi(e) : si.dwNumberOfProcessors >= 4;
+        {
+            const char *sp = getenv("RECOMP_XF_SPIN_US");
+            LARGE_INTEGER f;
+            QueryPerformanceFrequency(&f);
+            s_xp_spin_ticks = f.QuadPart * (sp ? atoi(sp) : 200) / 1000000;
         }
         if (getenv("RECOMP_VSH_DUMP") || getenv("RECOMP_VSH_VERIFY") || getenv("RECOMP_VSH_NODECODE"))
             n = 0;
