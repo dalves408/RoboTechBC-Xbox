@@ -2257,6 +2257,37 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
     o->fog = fog_factor(v->fog[0]);
 }
 
+/* RBX: an indexed batch or a strip hands each transformed vertex to two or
+ * three triangles, and each one converted it again (1/w, colour packing,
+ * fog). Keep the converted vertex per transform slot for the batch, in a
+ * small direct-mapped cache (strips and indexed meshes reuse nearby slots).
+ * Clipped vertices live on the stack, not in s_xf, and are converted as
+ * before. s_bvc_gen moves on with every batch (raster_batch_program).
+ * RECOMP_XF_CONVCACHE=0 turns it off. */
+static Nv2aVshOutput *s_xf;     /* transformed vertices of the current batch */
+#define BVC_N 1024
+static Nv2aVertex s_bvc[BVC_N];
+static uint32_t s_bvc_slot[BVC_N], s_bvc_tag[BVC_N], s_bvc_gen = 1;
+static void backend_conv(const Nv2aVshOutput *v, Nv2aVertex *o)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_XF_CONVCACHE");
+        on = !(e && e[0] == '0');
+    }
+    if (on && s_xf && v >= s_xf && v < s_xf + NV_MAX_INDICES) {
+        uint32_t slot = (uint32_t)(v - s_xf), k = slot & (BVC_N - 1);
+        if (s_bvc_tag[k] != s_bvc_gen || s_bvc_slot[k] != slot) {
+            backend_from_xf(v, &s_bvc[k]);
+            s_bvc_tag[k] = s_bvc_gen;
+            s_bvc_slot[k] = slot;
+        }
+        *o = s_bvc[k];
+        return;
+    }
+    backend_from_xf(v, o);
+}
+
 /* `textured`: the batch carried texture coordinates, so the bound texture is
  * part of it. */
 uint32_t g_dbg_batches, g_dbg_flush0, g_dbg_xffail, g_dbg_short, g_dbg_begin, g_dbg_ilf, g_dbg_dpn, g_dbg_dp;
@@ -3009,9 +3040,9 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                 return;
         }
         if ((o = backend_slot()) != NULL) {
-            backend_from_xf(va, &o[0]);
-            backend_from_xf(vb, &o[1]);
-            backend_from_xf(vc, &o[2]);
+            backend_conv(va, &o[0]);
+            backend_conv(vb, &o[1]);
+            backend_conv(vc, &o[2]);
             s_bcount += 3;
         }
         return;
@@ -3238,9 +3269,9 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
         raster_xf_triangle(&p0[0], &p0[i], &p0[i + 1]);
 }
 
-/* About 7 MB, so allocated by the first batch that transforms rather than
- * carried in every build that never turns the executor on. */
-static Nv2aVshOutput *s_xf;
+/* s_xf (declared above backend_conv): about 7 MB, so allocated by the first
+ * batch that transforms rather than carried in every build that never turns
+ * the executor on. */
 
 /* Does this batch run the title's vertex program? RECOMP_NO_VSH turns the
  * interpreter off (the batch then falls to the screen-space heuristics). */
@@ -3655,6 +3686,8 @@ xf_done:
     if (s_gpu.texs[0].valid)
         note_texture_use();
 
+    if (++s_bvc_gen == 0)          /* new batch: converted vertices are stale */
+        s_bvc_gen = 1;
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < n; i += 3)
