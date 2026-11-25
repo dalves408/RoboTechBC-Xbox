@@ -1049,6 +1049,10 @@ static void surface_swizzle_update(void)
                            &s_swz_mx, &s_swz_my);
 }
 
+/* CLEAR_RECT of the clear in progress, for the D3D11 back end (rbx_d3d11.c). */
+uint32_t g_rbx_clear_rect_h, g_rbx_clear_rect_v;
+int g_rbx_clear_rect_set;
+
 static void clear_surface(uint32_t param)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
@@ -1065,6 +1069,12 @@ static void clear_surface(uint32_t param)
             return;
         current_surface(&surf);
         current_render_state(&rs);
+        /* The back end's clear has no rectangle argument; hand it CLEAR_RECT
+         * here (read by rbx_d3d11.c's clear, which used to wipe the whole
+         * target whatever rectangle the title asked for). */
+        g_rbx_clear_rect_h = s_gpu.clear_rect_h;
+        g_rbx_clear_rect_v = s_gpu.clear_rect_v;
+        g_rbx_clear_rect_set = s_gpu.clear_rect_set;
         s_backend->clear(&surf, &rs, param, s_gpu.clear_color,
                          s_gpu.zstencil_clear);
         s_gpu.clears++;

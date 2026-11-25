@@ -120,6 +120,7 @@ Add `--gpu-stats` to any `rbx_diag.py` run. Every 2 s the game prints an `[RBXPE
 | `fence_rewait_ms_per_s` | Time BlockOnFence spends waiting again after an early wake |
 | `pb_dropped_walks`, `pb_midwalk_get_moves` | Pushbuffer walks abandoned at PUT (commands skipped), and GET moved under the walk |
 | `rt_created`, `rt_evicted`, `rt_alias_created` | Render targets created, evicted from the 8 slots, and created at an address that already had one |
+| `partial_clears` | Colour clears limited to a rectangle or to some channels (drawn, not wiped) |
 | `flips_without_gpu_target`, `flips_with_several_targets` | Flips the window had to show from guest memory, and flips with more than one candidate image |
 | `forced_get_catchups` | KickOff gave up waiting and marked unread pushbuffer commands as consumed |
 | `fence_early_wakes`, `fence_timeouts` | BlockOnFence woke before its fence; the 2 s recheck gave up |
@@ -144,6 +145,7 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 | `RECOMP_STUB_LOG=1` | Logs when an unresolved lifter stub is reached. |
 | `RECOMP_PROF=lo-hi` | Samples the busiest thread between those seconds and prints hot source lines. |
 | `RECOMP_SHADER_CACHE=<dir>` | Where compiled shaders are kept between runs (default `shader_cache\` beside the game; `0` turns the cache off). A first run fills it; later runs load instead of compiling, which removes ~30 ms hitches per new combiner variant. `shader_cache_hits` in `--gpu-stats` runs counts loads. |
+| `RECOMP_GPU_CLEARFULL=1` | A/B only: colour clears wipe the whole target again, ignoring the clear rectangle and channel mask. |
 | `RECOMP_GPU_RTSEED=0` | A/B only: new render targets start black again instead of copying the image already at that address. |
 | `RECOMP_GPU_PUBFIRST=1` | A/B only: the window shows the first render target at the flip address instead of the largest, most recent one. |
 | `RECOMP_KICK_STALL_MS=n` | How long KickOff waits with no pushbuffer-walk progress before forcing GET to PUT (default 500). Forced catch-ups drop commands; they show as `forced_get_catchups` in `--gpu-stats` runs. |

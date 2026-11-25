@@ -25,6 +25,7 @@ METRICS = [
     ("pb_midwalk_get_moves", -1),
     ("rt_created", -1), ("rt_evicted", -1), ("rt_alias_created", -1),
     ("flips_without_gpu_target", -1), ("flips_with_several_targets", -1),
+    ("partial_clears", 0),
 ]
 
 
@@ -54,7 +55,7 @@ def main(argv: list[str]) -> int:
         else:
             delta = vb - va
             pct = f" ({delta / va * 100:+.0f}%)" if va else ""
-            tag = "better" if (delta > 0) == (better > 0) else "worse"
+            tag = "" if not better else ("better" if (delta > 0) == (better > 0) else "worse")
             change = f"{delta:+g}{pct} {tag}"
         rows.append((key, str(va), str(vb), change))
     widths = [max(len(r[i]) for r in rows) for i in range(4)]

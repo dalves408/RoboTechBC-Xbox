@@ -600,6 +600,81 @@ static void rt_seed_from_guest(Rt *rt, const Nv2aSurface *s)
 }
 
 static void readback_finish(Rt *rt);
+
+/* ---- partial clears ------------------------------------------------------
+ * NV2A CLEAR_SURFACE has a per-channel colour mask (R 0x10, G 0x20, B 0x40,
+ * A 0x80) and is limited to CLEAR_RECT. ClearRenderTargetView does neither, so
+ * an alpha-only clear wiped the picture to the clear colour and a clear of
+ * one region (a loading bar, a menu panel) wiped the whole target -- a frame
+ * of solid colour, i.e. a flash. A partial clear is drawn instead: a full-
+ * target triangle through a scissor, with the write mask set from the
+ * clear's channels. RECOMP_GPU_CLEARFULL=1 = old behaviour. */
+extern uint32_t g_rbx_clear_rect_h, g_rbx_clear_rect_v;
+extern int g_rbx_clear_rect_set;
+static unsigned st_clear_partial;
+static ID3D11PixelShader *s_cl_ps;
+static ID3D11Buffer *s_cl_cb;
+static ID3D11RasterizerState *s_cl_rs;
+static ID3D11BlendState *s_cl_bs[16];
+static const char s_cl_hlsl[] =
+"cbuffer C : register(b0) { float4 col; };\n"
+"float4 ps(float4 p : SV_Position) : SV_Target { return col; }\n";
+
+static int clear_partial_draw(Rt *rt, unsigned wmask, const float c[4], const D3D11_RECT *r)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_VIEWPORT vp;
+    ID3D11ShaderResourceView *nosrv = NULL;
+    wmask &= 15;
+    if (!s_cl_ps) {
+        ID3DBlob *b = NULL, *err = NULL;
+        D3D11_BUFFER_DESC bd;
+        D3D11_RASTERIZER_DESC rd;
+        if (FAILED(rbx_compile(s_cl_hlsl, sizeof s_cl_hlsl - 1, "cl", NULL, NULL, "ps", "ps_4_0", 0, 0, &b, &err))) {
+            SAFE_REL(err); return 0;
+        }
+        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b), ID3D10Blob_GetBufferSize(b), NULL, &s_cl_ps);
+        SAFE_REL(b);
+        memset(&bd, 0, sizeof bd);
+        bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_DYNAMIC; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cl_cb);
+        memset(&rd, 0, sizeof rd);
+        rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE;
+        rd.ScissorEnable = TRUE; rd.MultisampleEnable = TRUE;
+        ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_cl_rs);
+    }
+    if (!s_cl_bs[wmask]) {
+        D3D11_BLEND_DESC d;
+        memset(&d, 0, sizeof d);
+        d.RenderTarget[0].SrcBlend = d.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        d.RenderTarget[0].DestBlend = d.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+        d.RenderTarget[0].BlendOp = d.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        d.RenderTarget[0].RenderTargetWriteMask = (UINT8)wmask;
+        ID3D11Device_CreateBlendState(s_dev, &d, &s_cl_bs[wmask]);
+    }
+    if (!s_cl_ps || !s_cl_cb || !s_cl_rs || !s_cl_bs[wmask] || !s_bl_vs) return 0;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cl_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return 0;
+    memcpy(m.pData, c, 16);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cl_cb, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &nosrv);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, NULL);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_cl_bs[wmask], NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_cl_rs);
+    vp.TopLeftX = vp.TopLeftY = 0; vp.MinDepth = 0; vp.MaxDepth = 1;
+    vp.Width = (float)(rt->w * (uint32_t)s_scale); vp.Height = (float)(rt->h * (uint32_t)s_scale);
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, r);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_bl_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_cl_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cl_cb);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    return 1;
+}
 static uint32_t s_evicted[8]; static int s_evicted_n;   /* VAs of recently evicted targets */
 
 static Rt *get_rt(const Nv2aSurface *s)
@@ -1506,7 +1581,33 @@ static void gb_clear_impl(const Nv2aSurface *s, const Nv2aRenderState *rs, uint3
         float c[4];
         c[0] = ((argb >> 16) & 255) / 255.0f; c[1] = ((argb >> 8) & 255) / 255.0f;
         c[2] = (argb & 255) / 255.0f; c[3] = ((argb >> 24) & 255) / 255.0f;
-        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rt->rtv, c);
+        {
+            static int full = -1;
+            unsigned wmask = (flags >> 4) & 15u;   /* R 1, G 2, B 4, A 8: the D3D11 write-mask bits */
+            uint32_t sw = rt->w * (uint32_t)s_scale, sh = rt->h * (uint32_t)s_scale;
+            D3D11_RECT r;
+            r.left = 0; r.top = 0; r.right = (LONG)sw; r.bottom = (LONG)sh;
+            if (full < 0) full = getenv("RECOMP_GPU_CLEARFULL") != NULL;
+            if ((g_rbx_clear_rect_set & 3) == 3) {
+                /* Inclusive x0..x1 / y0..y1 in un-antialiased pixels; the target is in AA pixels (xemu scales the
+                 * rectangle by the AA factor the same way). */
+                uint32_t ax = rt->aa_sx ? rt->aa_sx : 1, ay = rt->aa_sy ? rt->aa_sy : 1;
+                uint32_t x0 = (g_rbx_clear_rect_h & 0xFFFF) * ax, x1 = ((g_rbx_clear_rect_h >> 16) + 1) * ax;
+                uint32_t y0 = (g_rbx_clear_rect_v & 0xFFFF) * ay, y1 = ((g_rbx_clear_rect_v >> 16) + 1) * ay;
+                if (x1 > rt->w) x1 = rt->w;
+                if (y1 > rt->h) y1 = rt->h;
+                if (x0 < x1 && y0 < y1) {
+                    r.left = (LONG)(x0 * (uint32_t)s_scale); r.right = (LONG)(x1 * (uint32_t)s_scale);
+                    r.top = (LONG)(y0 * (uint32_t)s_scale); r.bottom = (LONG)(y1 * (uint32_t)s_scale);
+                }
+            }
+            if (!full && (wmask != 15u || r.left > 0 || r.top > 0 || (uint32_t)r.right < sw || (uint32_t)r.bottom < sh)) {
+                st_clear_partial++;
+                if (!clear_partial_draw(rt, wmask, c, &r))
+                    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rt->rtv, c);
+            } else
+                ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rt->rtv, c);
+        }
         rt->resolve_pending = rt->msaa != NULL;
         rt->dirty = 1; rt->shown_dirty = 1;
     }
@@ -2414,16 +2515,16 @@ static void gb_flip_impl(void)
             fprintf(stderr, "[RBXPERF] ms=%u flips=%u pub=%u ft_avg_us=%u ft_max_us=%u hitch33=%u hitch50=%u hitch100=%u "
                             "rb_n=%u rb_us=%u sh_n=%u sh_us=%u sh_total=%u sh_hits=%u catchup=%ld fence_early=%ld fence_timeout=%ld "
                             "mmio_traps=%ld apu_lock_waits=%u apu_lock_timeouts=%u fence_wait_us=%ld pb_drops=%u pb_midwalk_get=%u "
-                            "rt_new=%u rt_evict=%u rt_alias=%u pub_nort=%u pub_multi=%u\n",
+                            "rt_new=%u rt_evict=%u rt_alias=%u pub_nort=%u pub_multi=%u clear_partial=%u\n",
                     win_ms, st_flips, st_pub,
                     st_ft_n ? (unsigned)(st_ft_sum * 1000000ULL / qf / st_ft_n) : 0u, (unsigned)(st_ft_max * 1000000ULL / qf),
                     st_hitch33, st_hitch50, st_hitch100, st_rb_n, st_rb_us, st_sh_n, st_sh_us, s_sh_total, st_sh_hits,
                     (long)(fc - l_fc), (long)(fs - l_fs), (long)(ft - l_ft), (long)(mm - l_mm), lw - l_lw, lt - l_lt,
                     (long)(fw - l_fw), pd - l_pd, pm - l_pm,
-                    st_rt_new, st_rt_evict, st_rt_alias, st_pub_nort, st_pub_multi);
+                    st_rt_new, st_rt_evict, st_rt_alias, st_pub_nort, st_pub_multi, st_clear_partial);
             l_fc = fc; l_fs = fs; l_ft = ft; l_mm = mm; l_lw = lw; l_lt = lt; l_fw = fw; l_pd = pd; l_pm = pm;
             st_rb_us = st_rb_n = st_sh_us = st_sh_n = st_sh_hits = st_pub = 0;
-            st_rt_new = st_rt_evict = st_rt_alias = st_pub_nort = st_pub_multi = 0;
+            st_rt_new = st_rt_evict = st_rt_alias = st_pub_nort = st_pub_multi = st_clear_partial = 0;
             st_ft_sum = st_ft_max = 0; st_ft_n = st_hitch33 = st_hitch50 = st_hitch100 = 0;
         }
         g_pb_scan_ticks = 0; g_pb_scan_segs = 0;
