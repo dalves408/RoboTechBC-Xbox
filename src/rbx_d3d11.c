@@ -19,6 +19,7 @@ static unsigned long long gb_qf(void) { static LARGE_INTEGER f; if (!f.QuadPart)
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <stddef.h>
 #include "nv2a_backend.h"
 #include "rbx_rc_hlsl.h"
 #include "rbx_settings.h"
@@ -53,6 +54,61 @@ static unsigned st_rt_new, st_rt_evict, st_rt_alias; /* render targets created, 
 static unsigned st_pub_nort, st_pub_multi, st_rb_defer, st_rb_evict, st_pace_us, st_pace_n, st_pace_calls, st_pace_late;   /* flips whose surface had no GPU target (window fell back to guest memory) / several */
 static unsigned long long st_ft_sum, st_ft_max, s_ft_last; /* guest flip-to-flip time, QPC ticks */
 static unsigned st_ft_n, st_hitch33, st_hitch50, st_hitch100;  /* flip gaps over 33 / 50 / 100 ms */
+/* RECOMP_RBX_SIMRATE=1: how often the game's state actually changes, as opposed to how often it flips. Each flip hashes
+ * the world (the constants of every GPU vertex-program draw: camera and object matrices) and everything else (the
+ * transformed vertices of CPU-path draws: HUD, sprites, fixed-function world). A flip whose hashes equal the last
+ * flip's showed the same picture again. One [SIMRATE] line every 2 s: changes per window, how many identical flips
+ * each change was followed by, and the time between changes. If the world changes on every flip the game already
+ * steps per frame and interpolation has nothing to add; if it changes every Nth flip at a steady interval, that
+ * interval is the simulation tick. */
+static int s_sr = -1;
+static uint64_t s_sr_world, s_sr_scr, s_sr_world_prev, s_sr_scr_prev;
+static unsigned st_sr_flips, st_sr_world_new, st_sr_scr_new, st_sr_any_new, st_sr_run[8], s_sr_run;
+static unsigned long long s_sr_last, st_sr_gap_sum, st_sr_gap_max, st_sr_gap_min; static unsigned st_sr_gap_n;
+#define SR_SEED 1469598103934665603ULL
+static uint64_t sr_fold(uint64_t h, const void *p, size_t n)
+{
+    const uint8_t *b = (const uint8_t *)p; size_t i;
+    for (i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ULL;
+    return h;
+}
+static int sr_on(void) { if (s_sr < 0) { const char *e = getenv("RECOMP_RBX_SIMRATE"); s_sr = e && e[0] && e[0] != '0'; } return s_sr; }
+static void sr_flip(unsigned long long now)
+{
+    static DWORD last_print;
+    int wn = s_sr_world != s_sr_world_prev, sn = s_sr_scr != s_sr_scr_prev;
+    DWORD t = GetTickCount();
+    st_sr_flips++;
+    st_sr_world_new += wn; st_sr_scr_new += sn;
+    if (wn || sn) {
+        st_sr_any_new++;
+        st_sr_run[s_sr_run < 7 ? s_sr_run : 7]++;   /* identical flips that followed the previous change */
+        s_sr_run = 0;
+        if (s_sr_last) {
+            unsigned long long d = now - s_sr_last;
+            st_sr_gap_sum += d; st_sr_gap_n++;
+            if (d > st_sr_gap_max) st_sr_gap_max = d;
+            if (!st_sr_gap_min || d < st_sr_gap_min) st_sr_gap_min = d;
+        }
+        s_sr_last = now;
+    } else s_sr_run++;
+    s_sr_world_prev = s_sr_world; s_sr_scr_prev = s_sr_scr;
+    s_sr_world = s_sr_scr = SR_SEED;
+    if (!last_print) last_print = t;
+    if (t - last_print >= 2000) {
+        unsigned long long qf = gb_qf();
+        fprintf(stderr, "[SIMRATE] ms=%lu flips=%u changes=%u world=%u other=%u repeats_after_change 0:%u 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u 7+:%u "
+                        "gap_us avg=%u min=%u max=%u\n",
+                (unsigned long)(t - last_print), st_sr_flips, st_sr_any_new, st_sr_world_new, st_sr_scr_new,
+                st_sr_run[0], st_sr_run[1], st_sr_run[2], st_sr_run[3], st_sr_run[4], st_sr_run[5], st_sr_run[6], st_sr_run[7],
+                st_sr_gap_n ? (unsigned)(st_sr_gap_sum * 1000000ULL / qf / st_sr_gap_n) : 0u,
+                (unsigned)(st_sr_gap_min * 1000000ULL / qf), (unsigned)(st_sr_gap_max * 1000000ULL / qf));
+        st_sr_flips = st_sr_world_new = st_sr_scr_new = st_sr_any_new = 0;
+        memset(st_sr_run, 0, sizeof st_sr_run);
+        st_sr_gap_sum = st_sr_gap_max = st_sr_gap_min = 0; st_sr_gap_n = 0;
+        last_print = t;
+    }
+}
 
 #define MAX_RT   8
 #define MAX_TEX  768
@@ -2241,6 +2297,521 @@ static int gvs_flat_full(const Nv2aSurface *s, const Nv2aBatch *b, const RbxGvs 
     return n && lo <= 1.0f && hi >= (float)s->width - 1.0f;
 }
 
+/* ---- frame interpolation (prototype; RECOMP_RBX_INTERP, off by default) -------------------------------------------
+ * The game's world steps at a fixed ~30 Hz while it flips 200-800 times a second: the extra flips resubmit the same
+ * draws (RECOMP_RBX_SIMRATE measured ~12 identical flips per step). This draws those repeats at in-between positions.
+ *
+ * Each flip's draws are recorded in order. The first draw that differs from the last flip's (key or content) marks a
+ * new tick: the last flip's list becomes the previous tick (A) and the tick's arrival time is noted. Every draw is
+ * then matched to A by a key that does not change while an object moves (program, vertex/index count, texture, the
+ * model-space vertex data; the n-th draw with a key matches A's n-th) and drawn at lerp(A, current, t), where t runs
+ * from 0 at the tick's arrival to 1 one tick interval (smoothed) later, then held there if the next tick is late.
+ *
+ * Latency: blending from A to the current step shows each step one tick (~33 ms) late. So by default the blend runs
+ * ahead by a whole tick instead, lerp(A, current, t + 1): it predicts the next step from the last two, adding no
+ * latency over the game's own; the cost is that when something turns, stops or starts, it overshoots by that step's
+ * change in motion and snaps back by the same amount on the next tick (invisible at a constant speed). RECOMP_RBX_INTERP_LEAD=0..1 picks the trade-off: 1 (default)
+ * predicts, 0 interpolates (smoothest, one tick of added latency), 0.5 halves both. RECOMP_RBX_INTERP_EXTRAP=0/1 is
+ * the same as LEAD=0/1.
+ *
+ *   RECOMP_RBX_INTERP=1  the 3D world: fixed-function batches (terrain, sky, most mission geometry; their composite
+ *                        matrix, blended in the executor before the CPU transform) and GPU vertex-program models
+ *                        (0B25, 9CEE, 892C: matrix, light and fog constants c96-c110; viewport constants are not).
+ *   RECOMP_RBX_INTERP=2  also screen-space draws: pretransformed GPU batches (BA9E) and CPU-path draws (sprites,
+ *                        particles, HUD, fixed-function geometry) get their vertex positions blended when the matched
+ *                        draw has the same vertex count. Text that changes can slide; that is why it is a second level.
+ *
+ * RECOMP_RBX_INTERP_DEBUG=1 swings every blended draw +-3 steps back and forth once a second, to show what is covered.
+ *
+ * A draw with no match, or whose values jump too far (a camera cut, a respawn), is drawn as the game gave it. A tick
+ * where most draws have no match (scene change) is not blended at all. RECOMP_GPU_VSH_VERIFY reports mismatches while
+ * this is on, since the GPU then draws blended constants on purpose. */
+#define IP_MAXD 4096
+#define IP_MAXV (256u * 1024u)       /* float4 positions per list */
+#define IP_HT   8192                 /* power of two */
+#define IP_LIVE_TICKS 8              /* a draw that changed within a tick is left alone for this many ticks */
+#define IP_LIVE_TICKS_3D 240         /* ...a 3D one (it changed on a flip too few 3D draws changed to be a tick) */
+typedef struct { uint64_t key, ch; int next, prev_i, a_i; uint8_t tick_src, live, pending, changed; uint32_t voff, vn, used; RbxGvsConst k; } IpDraw;
+typedef struct {
+    IpDraw d[IP_MAXD]; unsigned n, matched;
+    unsigned nt, nt_changed;              /* 3D draws this flip, and how many changed from the last flip */
+    float v[IP_MAXV * 4]; uint32_t vused;
+    uint64_t hkey[IP_HT]; int head[IP_HT], tail[IP_HT]; unsigned cnt[IP_HT], hgen[IP_HT], gen;
+} IpList;
+static IpList *s_ipA, *s_ipB, *s_ipC;
+static int s_ip = -1, s_ip_new, s_ip_valid, s_ip_began;
+static float s_ip_lead = 1.0f;   /* 0 = interpolate (one tick behind), 1 = extrapolate (no added latency) */
+static unsigned long long s_ip_tick_t, s_ip_T, s_ip_flip_t;   /* tick_t: the current tick's start on a smoothed clock */
+static unsigned long long s_ip_arrive_t;                        /* when the current tick's draws actually arrived */
+static float s_ip_t;
+static uint32_t s_ip_flipno = 1;   /* marks A's draws already matched this flip */
+/* Camera motion over the last tick, per kind of 3D draw (1 vertex program, 2 fixed-function): D = C0 * inverse(C1)
+ * for a static object, since its matrix is C = X * W (camera/projection X, its own world W) and W cancels. Estimated
+ * at each tick from the matched draws (element-wise median, so moving objects do not skew it). Predicts where an
+ * unmatched or mismatched draw was last tick (D * C1), and picks among identical copies. */
+static float s_ip_D[3][16];
+static int s_ip_D_ok[3];
+static IpDraw s_ip_synth;
+static int s_ip_prechecked;   /* ip_record already checked the pair against the camera prediction */
+static int ip_jump(const float *a, const float *b, unsigned n, float rel, float abs_floor);
+static void m4_mul(const float *a, const float *b, float *o)
+{
+    int i, j;
+    for (i = 0; i < 4; i++) for (j = 0; j < 4; j++)
+        o[4 * i + j] = a[4 * i] * b[j] + a[4 * i + 1] * b[4 + j] + a[4 * i + 2] * b[8 + j] + a[4 * i + 3] * b[12 + j];
+}
+static int m4_inv(const float *m, float *o)
+{
+    double inv[16], det;
+    int i;
+    inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+    inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+    inv[8] = m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+    inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+    inv[5] = m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+    inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+    inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+    inv[2] = m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+    inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+    inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+    inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+    inv[7] = m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+    inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+    det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (!(fabs(det) > 1e-30)) return 0;
+    for (i = 0; i < 16; i++) o[i] = (float)(inv[i] / det);
+    return 1;
+}
+static int ip_fcmp(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
+/* After a tick: the camera's motion from the 3D draws that were matched to the previous tick. */
+static void ip_estimate_camera(void)
+{
+    enum { NS = 64 };
+    static float samp[NS][16];
+    float col[NS];
+    int kind;
+    for (kind = 1; kind <= 2; kind++) {
+        unsigned i, n = 0, cnt = s_ipC->n < IP_MAXD ? s_ipC->n : IP_MAXD, step;
+        unsigned matched = 0;
+        for (i = 0; i < cnt; i++) if (s_ipC->d[i].tick_src == kind && s_ipC->d[i].a_i >= 0 && !s_ipC->d[i].live) matched++;
+        s_ip_D_ok[kind] = 0;
+        if (matched < 4) continue;
+        step = matched / NS + 1;   /* spread the samples over the frame */
+        for (i = 0, matched = 0; i < cnt && n < NS; i++) {
+            const IpDraw *d = &s_ipC->d[i];
+            float inv[16];
+            if (d->tick_src != kind || d->a_i < 0 || d->live) continue;
+            if (matched++ % step) continue;
+            if (!m4_inv(&d->k.cu[0][0], inv)) continue;
+            m4_mul(&s_ipA->d[d->a_i].k.cu[0][0], inv, samp[n]);
+            n++;
+        }
+        if (n < 4) continue;
+        for (i = 0; i < 16; i++) {
+            unsigned q;
+            for (q = 0; q < n; q++) col[q] = samp[q][i];
+            qsort(col, n, sizeof col[0], ip_fcmp);
+            s_ip_D[kind][i] = col[n / 2];
+        }
+        s_ip_D_ok[kind] = 1;
+    }
+}
+static unsigned st_ip_cam, st_ip_false, st_ip_ticks, st_ip_blend, st_ip_nomatch, st_ip_jump, st_ip_cut, st_ip_gvs, st_ip_scr, st_ip_live;
+/* RECOMP_RBX_INTERP_TRACE=lo-hi (seconds since the first flip): one [IPTR] line per flip with what it drew and where,
+ * whether it was published, and the interpolation state. Works with interpolation off too. */
+static unsigned s_tr_gvs, s_tr_cpu, s_tr_blend, s_tr_tick, s_tr_ffp; static uint32_t s_tr_gvs_va, s_tr_cpu_va;
+static int s_ip_debug;   /* RECOMP_RBX_INTERP_DEBUG=1: swing blended draws back and forth, to see what is covered */
+
+static int ip_on(void)
+{
+    if (s_ip < 0) {
+        const char *e = getenv("RECOMP_RBX_INTERP"), *x = getenv("RECOMP_RBX_INTERP_EXTRAP"), *l = getenv("RECOMP_RBX_INTERP_LEAD");
+        s_ip = e ? atoi(e) : 0;
+        if (s_ip < 0) s_ip = 0;
+        if (s_ip > 2) s_ip = 2;
+        if (x && x[0]) s_ip_lead = x[0] != '0' ? 1.0f : 0.0f;
+        if (l && l[0]) s_ip_lead = (float)atof(l);
+        if (s_ip_lead < 0) s_ip_lead = 0;
+        if (s_ip_lead > 1) s_ip_lead = 1;
+        { const char *d = getenv("RECOMP_RBX_INTERP_DEBUG"); s_ip_debug = d && d[0] && d[0] != '0'; }
+        if (s_ip) {
+            s_ipA = (IpList *)calloc(1, sizeof *s_ipA); s_ipB = (IpList *)calloc(1, sizeof *s_ipB); s_ipC = (IpList *)calloc(1, sizeof *s_ipC);
+            if (!s_ipA || !s_ipB || !s_ipC) { fprintf(stderr, "[RBX INTERP] out of memory: off\n"); s_ip = 0; }
+            else fprintf(stderr, "[RBX INTERP] on: level %d (%s), lead %.2f (added latency ~%.0f%% of a tick)\n", s_ip,
+                         s_ip == 1 ? "3D world" : "3D world + screen-space draws", s_ip_lead, (1.0f - s_ip_lead) * 100.0f);
+        }
+    }
+    return s_ip;
+}
+static void ip_list_reset(IpList *l) { l->nt = l->nt_changed = 0; l->n = 0; l->matched = 0; l->vused = 0; l->gen++; if (!l->gen) { memset(l->hgen, 0, sizeof l->hgen); l->gen = 1; } }
+static unsigned ip_slot(IpList *l, uint64_t key, int add)
+{
+    unsigned i = (unsigned)(key ^ (key >> 29)) & (IP_HT - 1), probes;
+    for (probes = 0; probes < IP_HT; probes++, i = (i + 1) & (IP_HT - 1)) {
+        if (l->hgen[i] != l->gen) {
+            if (!add) return ~0u;
+            l->hgen[i] = l->gen; l->hkey[i] = key; l->head[i] = l->tail[i] = -1; l->cnt[i] = 0;
+            return i;
+        }
+        if (l->hkey[i] == key) return i;
+    }
+    return ~0u;
+}
+/* Start of a flip's draws: the blend factor for the whole flip. */
+/* The blend factor for this flip from the smoothed tick clock. t runs from 0 at the tick's (smoothed) start to 1 one
+ * interval later. It may start a little below 0 when a tick arrives early, so the motion carries on from where the
+ * last frame was instead of jumping ahead, and runs a little past 1 when one is late before it holds. */
+static void ip_calc_t(void)
+{
+    double t = 1.0;
+    unsigned long long T = s_ip_T > gb_qf() / 120 ? s_ip_T : gb_qf() / 120;   /* never under 1/120 s */
+    if (s_ip_T && s_ip_tick_t) t = (double)(long long)(s_ip_flip_t - s_ip_tick_t) / (double)T;
+    if (t < -0.5) t = -0.5;
+    if (t > 1.3) t = 1.3;
+    s_ip_t = (float)(t + s_ip_lead);
+}
+static void ip_begin(void)
+{
+    LARGE_INTEGER q;
+    double t;
+    if (s_ip_began) return;
+    s_ip_began = 1;
+    QueryPerformanceCounter(&q); s_ip_flip_t = (unsigned long long)q.QuadPart;
+    (void)t;
+    ip_calc_t();
+    if (s_ip_debug) s_ip_t = (float)(1.0 + 3.0 * sin((double)s_ip_flip_t * 6.283 / (double)gb_qf()));   /* +-3 steps, 1 Hz */
+}
+static int ip_find(IpList *l, uint64_t key, unsigned o)
+{
+    unsigned sl = ip_slot(l, key, 0);
+    int i;
+    if (sl == ~0u) return -1;
+    for (i = l->head[sl]; i >= 0 && o; o--) i = l->d[i].next;
+    return i;
+}
+static unsigned long long s_ip_undo_tick_t, s_ip_undo_T, s_ip_undo_arrive_t;
+static int s_ip_undo_valid;
+static void ip_new_tick(void)
+{
+    IpList *t = s_ipA;
+    unsigned long long gap = s_ip_arrive_t ? s_ip_flip_t - s_ip_arrive_t : 0, qf = gb_qf();
+    s_tr_tick = 1;
+    s_ip_undo_tick_t = s_ip_tick_t; s_ip_undo_T = s_ip_T; s_ip_undo_valid = s_ip_valid;   /* for a false tick */
+    s_ip_undo_arrive_t = s_ip_arrive_t;
+    s_ip_new = 1; st_ip_ticks++;
+    if (gap && gap < qf / 5) s_ip_T = s_ip_T ? (s_ip_T * 7 + gap) / 8 : gap;   /* smoothed tick interval */
+    /* The game steps a fixed amount of game time per tick, but its ticks reach us with ~+-10 ms of jitter (the
+     * flip pacing). Timing the blend from each arrival made the motion uneven, so the tick start runs on a clock
+     * that advances one interval per tick and is pulled a quarter of the way toward each arrival; it resyncs when
+     * an arrival is more than half an interval off (a stall, a pause). */
+    if (s_ip_tick_t && s_ip_T) {
+        unsigned long long est = s_ip_tick_t + s_ip_T;
+        long long diff = (long long)(s_ip_flip_t - est);
+        if (diff > (long long)(s_ip_T / 2) || -diff > (long long)(s_ip_T / 2)) est = s_ip_flip_t;
+        else est = (unsigned long long)((long long)est + diff / 4);
+        s_ip_tick_t = est;
+    } else s_ip_tick_t = s_ip_flip_t;
+    s_ip_arrive_t = s_ip_flip_t;
+    s_ipA = s_ipB; s_ipB = t;      /* the last flip's draws are the previous step; the old A stays in B until the flip ends */
+    s_ip_valid = s_ipA->n > 0;
+    if (!s_ip_debug) ip_calc_t();
+}
+/* Record a draw in this flip's list, detect a new tick, and return A's matching draw (or NULL: draw it as given).
+ *
+ * Only the 3D (GPU vertex-program) draws mark a tick: some screen-space draws (an animated HUD element, particles)
+ * change on every flip, so scenes with no 3D draws (menus) are not blended. A "live" draw, one that changed between two flips of the same tick, already moves per flip and is never
+ * blended. A screen-space draw that changes before the flip's tick is noticed is drawn as given and sorted out at the
+ * end of the flip. */
+static const IpDraw *ip_record(uint64_t key, uint64_t ch, const RbxGvsConst *k, const float *pos, uint32_t pstride,
+                               uint32_t vn, int tick_src)
+{
+    IpList *C = s_ipC, *P;
+    unsigned j = C->n, o = 0, sl;
+    const IpDraw *m = NULL;
+    int pi, live = 0, pending = 0;
+    s_ip_prechecked = 0;
+    int changed = 0;
+    ip_begin();
+    sl = ip_slot(C, key, 1);
+    if (sl != ~0u) o = C->cnt[sl]++;
+    P = s_ip_new ? s_ipA : s_ipB;              /* the last flip's list */
+    pi = ip_find(P, key, o);
+    if (tick_src) {
+        /* A 3D draw that is in the last flip too, not known to change on its own, and different from it: a tick. A draw
+         * with no counterpart (new, or keyed by data that changes) does not count. If too few 3D draws turn out to
+         * have changed, ip_flip takes the tick back and marks those draws live. */
+        if (pi >= 0 && P->d[pi].ch != ch) {
+            if (!s_ip_new && !P->d[pi].live) { ip_new_tick(); P = s_ipA; }
+            changed = 1;
+        }
+        C->nt++;
+        if (changed && s_ip_new) C->nt_changed++;
+        if (pi < 0) live = 0;
+        else if (P->d[pi].live) live = changed && !s_ip_new ? IP_LIVE_TICKS_3D : s_ip_new ? P->d[pi].live - 1 : P->d[pi].live;
+    } else {
+        /* live counts down in ticks (IP_LIVE_TICKS after its last change between flips of one tick) */
+        int carried = pi < 0 ? 0 : s_ip_new ? (P->d[pi].live ? P->d[pi].live - 1 : 0) : P->d[pi].live;
+        if (pi < 0) live = 0;
+        else if (P->d[pi].ch == ch || s_ip_new) live = carried;
+        else if (!s_ipB->nt) live = IP_LIVE_TICKS;   /* a scene with no 3D draws (menus): no tick to go by, not blended */
+        else { live = IP_LIVE_TICKS; pending = 1; }  /* changed, and no tick seen yet: live, unless this flip turns out a tick */
+    }
+    if (j < IP_MAXD) {
+        IpDraw *d = &C->d[j];
+        d->key = key; d->ch = ch; d->next = -1; d->vn = 0; d->voff = 0; d->used = 0; d->a_i = -1;
+        d->prev_i = pi; d->tick_src = (uint8_t)tick_src; d->live = (uint8_t)live; d->pending = (uint8_t)pending; d->changed = (uint8_t)changed;
+        if (k) d->k = *k;
+        if (pos && vn && C->vused + vn <= IP_MAXV) {
+            uint32_t i; float *w = &C->v[C->vused * 4];
+            for (i = 0; i < vn; i++, pos = (const float *)((const uint8_t *)pos + pstride), w += 4) { w[0] = pos[0]; w[1] = pos[1]; w[2] = pos[2]; w[3] = pos[3]; }
+            d->voff = C->vused; d->vn = vn; C->vused += vn;
+        }
+        if (sl != ~0u) { if (C->tail[sl] < 0) C->head[sl] = (int)j; else C->d[C->tail[sl]].next = (int)j; C->tail[sl] = (int)j; }
+        C->n = j + 1;
+    }
+    if (tick_src) st_ip_gvs++; else st_ip_scr++;
+    if (live) { st_ip_live++; return NULL; }
+    if (s_ip_valid) {
+        int ai = ip_find(s_ipA, key, o);
+        float pred[16];
+        const float *target = k ? &k->cu[0][0] : NULL;
+        int kind = tick_src;
+        if (k && kind >= 1 && kind <= 2 && s_ip_D_ok[kind]) { m4_mul(s_ip_D[kind], &k->cu[0][0], pred); target = pred; }
+        if (ai >= 0 && k) {
+            /* The same mesh drawn many times (a city of identical buildings) shares one key, and which copies the game
+             * draws changes as they enter and leave view, so the n-th copy now need not be the n-th last tick: pairing
+             * by order blended buildings toward their neighbours. Take the unused copy whose matrix is closest. */
+            unsigned as = ip_slot(s_ipA, key, 0);
+            int i, best = -1;
+            float bd = 0;
+            for (i = s_ipA->head[as]; i >= 0; i = s_ipA->d[i].next) {
+                const float *a = &s_ipA->d[i].k.cu[0][0], *c = target, *cur = &k->cu[0][0];
+                float dsum = 0, dcur = 0;
+                unsigned q;
+                if (s_ipA->d[i].used == s_ip_flipno) continue;
+                /* Closest to where the camera's motion puts it (static scenery) or to where it is now (things that
+                 * move with the camera, like the player's own mech, whose left and right limbs share one mesh). */
+                for (q = 0; q < 16; q++) { dsum += fabsf(a[q] - c[q]); dcur += fabsf(a[q] - cur[q]); }
+                if (dcur < dsum) dsum = dcur;
+                if (best < 0 || dsum < bd) { best = i; bd = dsum; }
+            }
+            ai = best;
+        }
+        if (ai >= 0) { m = &s_ipA->d[ai]; s_ipA->d[ai].used = s_ip_flipno; }
+        s_ip_prechecked = target == pred;
+        if (target == pred && (!m || (ip_jump(&m->k.cu[0][0], pred, 16, 0.5f, 1e-3f) && ip_jump(&m->k.cu[0][0], &k->cu[0][0], 16, 0.5f, 1e-3f)))) {
+            /* No counterpart, or one far from where the camera's motion puts this object: assume it is static and
+             * moved only with the camera, so it stays in step with the buildings around it. Checked against the
+             * prediction as well as the current matrix, so a fast turn (a big change for everything) is not a jump, and
+             * neither is something that moves with the camera. */
+            s_ip_synth.k = *k;
+            memcpy(&s_ip_synth.k.cu[0][0], pred, sizeof pred);
+            m = &s_ip_synth; st_ip_cam++;
+        }
+        if (j < IP_MAXD) C->d[j].a_i = m && m != &s_ip_synth ? (int)(m - s_ipA->d) : -1;
+        if (m) C->matched++; else st_ip_nomatch++;
+    }
+    return m;
+}
+/* End of a flip: this flip's list becomes the comparison for the next one. A tick whose draws mostly had no match in
+ * the previous one (scene change, loading) stops blending until the next tick. */
+static void ip_flip(void)
+{
+    IpList *t;
+    if (!s_ip_began) return;
+    if (s_ip_new && s_ipC->nt_changed * 10 < s_ipC->nt) {
+        /* False tick: under a tenth of the 3D draws changed, so those few animate on their own (inline geometry, water,
+         * effects). Mark them live, so they neither mark ticks nor get blended, and put the tick state back. */
+        unsigned i, n = s_ipC->n < IP_MAXD ? s_ipC->n : IP_MAXD;
+        for (i = 0; i < n; i++) if (s_ipC->d[i].tick_src && s_ipC->d[i].changed) s_ipC->d[i].live = IP_LIVE_TICKS_3D;
+        t = s_ipA; s_ipA = s_ipB; s_ipB = t;            /* old A back; the last flip goes where B is dropped below */
+        s_ip_tick_t = s_ip_undo_tick_t; s_ip_T = s_ip_undo_T; s_ip_valid = s_ip_undo_valid; s_ip_arrive_t = s_ip_undo_arrive_t;
+        s_ip_new = 0; st_ip_ticks--; st_ip_false++;
+    }
+    if (s_ip_new) {   /* screen-space draws that changed before the tick was noticed: live only if they were before */
+        unsigned i, n = s_ipC->n < IP_MAXD ? s_ipC->n : IP_MAXD;
+        for (i = 0; i < n; i++) {
+            IpDraw *d = &s_ipC->d[i];
+            if (d->pending) { d->live = d->prev_i >= 0 && s_ipA->d[d->prev_i].live ? s_ipA->d[d->prev_i].live - 1 : 0; d->pending = 0; }
+        }
+        if (s_ipC->n >= 8 && s_ipC->matched * 2 < s_ipC->n) { s_ip_valid = 0; st_ip_cut++; s_ip_D_ok[1] = s_ip_D_ok[2] = 0; }
+        else ip_estimate_camera();
+    }
+    t = s_ipB; s_ipB = s_ipC; s_ipC = t;
+    ip_list_reset(s_ipC);
+    s_ip_new = 0; s_ip_began = 0;
+    if (!++s_ip_flipno) s_ip_flipno = 1;
+    {   /* with RECOMP_GPU_STATS or RECOMP_RBX_SIMRATE: one line every 2 s */
+        static DWORD last;
+        DWORD now = GetTickCount();
+        if (!last) last = now;
+        if (now - last >= 2000) {
+            static unsigned quiet;
+            if (s_verbose || sr_on() || !(quiet++ % 5))   /* otherwise every 10 s, so players' logs carry it */
+                fprintf(stderr, "[RBX INTERP] ticks=%u false_ticks=%u tick_ms=%.1f draws_3d=%u draws_2d=%u blended=%u live=%u no_match=%u jumps=%u cuts=%u camera_fill=%u\n", st_ip_ticks,
+                        st_ip_false, s_ip_T ? (double)s_ip_T * 1000.0 / (double)gb_qf() : 0.0, st_ip_gvs, st_ip_scr, st_ip_blend, st_ip_live,
+                        st_ip_nomatch, st_ip_jump, st_ip_cut, st_ip_cam);
+            st_ip_cam = st_ip_false = st_ip_ticks = st_ip_blend = st_ip_nomatch = st_ip_jump = st_ip_cut = st_ip_gvs = st_ip_scr = st_ip_live = 0;
+            last = now;
+        }
+    }
+}
+static float ip_mix(float a, float b, float t) { return a + (b - a) * t; }
+/* Too far to blend: a cut or a teleport. Measured against the size of the whole set of values (for a matrix, its
+ * largest entry): per-row scales misfired on a building near the screen centre, whose x translation is small, so a
+ * normal step looked like a jump. */
+static int ip_jump(const float *a, const float *b, unsigned n, float rel, float abs_floor)
+{
+    unsigned i;
+    float d = 0, m = 0;
+    for (i = 0; i < n; i++) {
+        float e = fabsf(a[i] - b[i]);
+        if (e > d) d = e;
+        if (fabsf(a[i]) > m) m = fabsf(a[i]);
+        if (fabsf(b[i]) > m) m = fabsf(b[i]);
+    }
+    return d > abs_floor && d > rel * m;
+}
+static uint64_t ip_hash(uint64_t h, const void *p, size_t n)
+{
+    const uint8_t *b = (const uint8_t *)p; size_t i;
+    for (i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ULL;
+    return h;
+}
+/* A matrix whose w row ignores x, y and z is orthographic: a screen-space draw (HUD, aiming marker, menus, title
+ * screen). Level 1 is the 3D world only, and the camera estimate means nothing for these, so they are left alone. */
+static int ip_persp(const float *m)
+{
+    float w = fabsf(m[12]) + fabsf(m[13]) + fabsf(m[14]), big = 0.0f;
+    unsigned i;
+    for (i = 0; i < 16; i++) if (fabsf(m[i]) > big) big = fabsf(m[i]);
+    return w > big * 1e-6f;
+}
+/* GPU vertex-program batch: blended constants into *k, and for level 2 a pretransformed batch's positions into a
+ * scratch copy of the inputs (*in). */
+static void ip_gvs(int prog, const Nv2aBatch *b, const RbxGvs *g, uint32_t nidx, RbxGvsConst *k, const float **in)
+{
+    static float *scratch; static uint32_t scratch_n;
+    uint64_t key = 1469598103934665603ULL, ch;
+    uint32_t tex = b->texture ? b->texture->offset : 0, nv = b->count, stride = g->nin * 16u;
+    const IpDraw *m;
+    int screen = prog == RBX_GVS_BA9E;
+    if (screen && s_ip < 2) return;
+    if (!screen && !ip_persp(&g->k.cu[0][0])) return;
+    key = ip_hash(key, &prog, sizeof prog); key = ip_hash(key, &nv, sizeof nv); key = ip_hash(key, &nidx, sizeof nidx);
+    key = ip_hash(key, &tex, sizeof tex);
+    if (nv) {   /* model-space data identifies the object; screen-space positions move, so skip input 0 there */
+        uint32_t skip = screen ? 16u : 0u;
+        key = ip_hash(key, (const uint8_t *)g->in + skip, stride - skip);
+        key = ip_hash(key, (const uint8_t *)g->in + (size_t)(nv - 1) * stride + skip, stride - skip);
+    }
+    ch = ip_hash(key, &g->k, offsetof(RbxGvsConst, aa));
+    if (screen) { uint32_t i, n = nv < 64 ? nv : 64; for (i = 0; i < n; i++) ch = ip_hash(ch, (const uint8_t *)g->in + (size_t)i * stride, 16); }
+    m = ip_record(key, ch, &g->k, screen ? g->in : NULL, stride, screen ? nv : 0, !screen);
+    if (!m || !s_ip_valid) return;
+    if (!screen) {
+        const float *a = &m->k.cu[0][0], *c = &g->k.cu[0][0];
+        float *o = &k->cu[0][0];
+        unsigned i;
+        if (!s_ip_prechecked && ip_jump(&m->k.cu[0][0], &g->k.cu[0][0], 16, 1.0f, 1e-3f)) { st_ip_jump++; return; }   /* c96-c99: the matrix */
+        for (i = 0; i < 15 * 4; i++) o[i] = ip_mix(a[i], c[i], s_ip_t);
+        st_ip_blend++; s_tr_blend++;
+    } else {
+        IpList *A = s_ipA;
+        uint32_t i;
+        float *w;
+        if (m->vn != nv || !nv) return;
+        if (scratch_n < nv * stride) { free(scratch); scratch = (float *)malloc(nv * stride); scratch_n = scratch ? nv * stride : 0; if (!scratch) return; }
+        memcpy(scratch, g->in, (size_t)nv * stride);
+        for (i = 0; i < nv; i++)
+            if (ip_jump(&A->v[(m->voff + i) * 4], (const float *)((const uint8_t *)g->in + (size_t)i * stride), 2, 0.0f, 160.0f)) { st_ip_jump++; return; }
+        for (i = 0, w = scratch; i < nv; i++, w = (float *)((uint8_t *)w + stride)) {
+            const float *a = &A->v[(m->voff + i) * 4];
+            w[0] = ip_mix(a[0], w[0], s_ip_t); w[1] = ip_mix(a[1], w[1], s_ip_t); w[2] = ip_mix(a[2], w[2], s_ip_t); w[3] = ip_mix(a[3], w[3], s_ip_t);
+        }
+        *in = scratch;
+        st_ip_blend++; s_tr_blend++;
+    }
+}
+/* Fixed-function batch (patches/nv2a_pb_exec_rbx.c, before it transforms the batch on the CPU): the mission world,
+ * terrain and sky are fixed-function, and their composite matrix (world * view * projection * viewport) is what the
+ * camera moves. Blended like a vertex program's matrix, so clipping and culling see the blended geometry. Returns 1
+ * if composite was changed; the executor restores it after the batch. Its CPU-path draws are then not blended again. */
+static int s_ip_in_ffp;
+int rbx_ip_ffp_begin(const void *key_data, size_t key_bytes, float composite[16])
+{
+    RbxGvsConst k;
+    const IpDraw *m;
+    uint64_t key = 1469598103934665603ULL, ch;
+    unsigned i;
+    s_ip_in_ffp = 1;
+    if (!ip_on()) return 0;
+    if (!ip_persp(composite)) return 0;
+    key = ip_hash(key, "ffp", 3);
+    key = ip_hash(key, key_data, key_bytes);
+    ch = ip_hash(key, composite, 16 * sizeof(float));
+    memset(&k, 0, sizeof k);
+    memcpy(&k.cu[0][0], composite, 16 * sizeof(float));
+    s_tr_ffp++;
+    m = ip_record(key, ch, &k, NULL, 0, 0, 2);   /* kind 2: fixed-function */
+    if (!m || !s_ip_valid) return 0;
+    if (s_ip_D_ok[2] && m != &s_ip_synth) {
+        /* The fixed-function world (terrain, buildings) is static, so draw it at the camera's blended
+         * position, D * current, instead of trusting a per-draw pairing; the whole city then moves as one. Only a
+         * draw whose pair says it moved with the camera (close to its current matrix, far from the camera
+         * prediction: the player's own mech) keeps its pair. */
+        float pred[16];
+        m4_mul(s_ip_D[2], composite, pred);
+        if (!ip_jump(&m->k.cu[0][0], pred, 16, 0.05f, 1e-3f) || ip_jump(&m->k.cu[0][0], composite, 16, 0.05f, 1e-3f)) {
+            memcpy(&s_ip_synth.k.cu[0][0], pred, sizeof pred);
+            m = &s_ip_synth;
+        }
+    }
+    if (!s_ip_prechecked && ip_jump(&m->k.cu[0][0], composite, 16, 1.0f, 1e-3f)) { st_ip_jump++; return 0; }
+    for (i = 0; i < 16; i++) composite[i] = ip_mix((&m->k.cu[0][0])[i], composite[i], s_ip_t);
+    st_ip_blend++; s_tr_blend++;
+    return 1;
+}
+void rbx_ip_ffp_end(void) { s_ip_in_ffp = 0; }
+
+/* CPU-path batch (level 2): a copy of the batch with blended positions, or b itself. */
+static const Nv2aBatch *ip_cpu(const Nv2aSurface *s, const Nv2aBatch *b, Nv2aBatch *out)
+{
+    static Nv2aVertex *scratch; static uint32_t scratch_n;
+    const Nv2aRenderState *r = b->state;
+    uint64_t key = 1469598103934665603ULL, ch;
+    uint32_t i, nv = b->count, n = nv < 256 ? nv : 256, tex = b->texture ? b->texture->offset : 0, idx = g_rbx_bidx ? g_rbx_bidx_n : 0;
+    uint32_t st[4] = { r->blend_enable | r->blend_src << 1, r->blend_dst, r->depth_test_enable | r->alpha_test_enable << 1, r->color_mask };
+    const IpDraw *m;
+    IpList *A;
+    if (s_ip < 2 || !nv || s_ip_in_ffp) return b;
+    key = ip_hash(key, &nv, sizeof nv); key = ip_hash(key, &idx, sizeof idx); key = ip_hash(key, &tex, sizeof tex);
+    key = ip_hash(key, st, sizeof st); key = ip_hash(key, &s->color_va, sizeof s->color_va);
+    ch = key;
+    for (i = 0; i < n; i++) { int32_t q[3] = { (int32_t)(b->vertices[i].x * 16), (int32_t)(b->vertices[i].y * 16), (int32_t)b->vertices[i].diffuse }; ch = ip_hash(ch, q, sizeof q); }
+    m = ip_record(key, ch, NULL, &b->vertices[0].x, (uint32_t)sizeof(Nv2aVertex), nv, 0);
+    if (!m || !s_ip_valid || m->vn != nv) return b;
+    A = s_ipA;
+    for (i = 0; i < nv; i++) {
+        const float *a = &A->v[(m->voff + i) * 4];
+        const Nv2aVertex *v = &b->vertices[i];
+        if (fabsf(a[0] - v->x) > (float)s->width / 8 || fabsf(a[1] - v->y) > (float)s->height / 8 || (a[3] > 0) != (v->rhw > 0)) { st_ip_jump++; return b; }
+    }
+    if (scratch_n < nv) { free(scratch); scratch = (Nv2aVertex *)malloc(nv * sizeof *scratch); scratch_n = scratch ? nv : 0; if (!scratch) return b; }
+    memcpy(scratch, b->vertices, nv * sizeof *scratch);
+    for (i = 0; i < nv; i++) {
+        const float *a = &A->v[(m->voff + i) * 4];
+        scratch[i].x = ip_mix(a[0], scratch[i].x, s_ip_t); scratch[i].y = ip_mix(a[1], scratch[i].y, s_ip_t);
+        scratch[i].z = ip_mix(a[2], scratch[i].z, s_ip_t); scratch[i].rhw = ip_mix(a[3], scratch[i].rhw, s_ip_t);
+    }
+    *out = *b; out->vertices = scratch;
+    st_ip_blend++; s_tr_blend++;
+    return out;
+}
+
 /* A batch the executor handed over raw (g_rbx_gvs.prog set): the program's vertex shader transforms, clips and
  * culls; the combiners draw it. b->count is the number of unique vertices, g_rbx_gvs.in their inputs. */
 static void gb_draw_gvs(const Nv2aSurface *s, const Nv2aBatch *b)
@@ -2262,6 +2833,8 @@ static void gb_draw_gvs(const Nv2aSurface *s, const Nv2aBatch *b)
     unsigned stage;
     Rt *rt;
     Ds *ds;
+    RbxGvsConst ip_k;          /* the constants drawn with: the game's, or blended (RECOMP_RBX_INTERP) */
+    const float *ip_in;
 
     if (prog <= RBX_GVS_OFF || prog >= RBX_GVS_NPROG || !s_gvs_vs[prog] || !b->combiner || !g_rbx_bidx || !nidx
         || ineed > IB_BYTES || need > VB_BYTES)
@@ -2282,6 +2855,9 @@ static void gb_draw_gvs(const Nv2aSurface *s, const Nv2aBatch *b)
         return;
     }
     /* vertices: raw inputs into the vertex ring at a byte offset; the ring stays Nv2aVertex-aligned for the others */
+    s_tr_gvs++; s_tr_gvs_va = s->color_va;
+    ip_k = g->k; ip_in = g->in;
+    if (ip_on()) ip_gvs(prog, b, g, nidx, &ip_k, &ip_in);
     if (s_vb_off + need > VB_BYTES) {
         s_vb_off = 0; s_vb_i = (s_vb_i + 1) % VB_RING; s_vb = s_vbr[s_vb_i];
         s_xvb = s_xvbr[s_vb_i]; s_xvb_off = 0;
@@ -2289,7 +2865,7 @@ static void gb_draw_gvs(const Nv2aSurface *s, const Nv2aBatch *b)
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vb, 0,
                s_vb_off == 0 ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &m)))
         return;
-    memcpy((uint8_t *)m.pData + s_vb_off, g->in, need);
+    memcpy((uint8_t *)m.pData + s_vb_off, ip_in, need);
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
     voff = s_vb_off;
     s_vb_off += need;
@@ -2298,7 +2874,8 @@ static void gb_draw_gvs(const Nv2aSurface *s, const Nv2aBatch *b)
     gcb = s_gvs_cbr[s_gvs_cb_i++ % GVS_CB_RING];
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)gcb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
         return;
-    memcpy(m.pData, &g->k, sizeof g->k);
+    memcpy(m.pData, &ip_k, sizeof ip_k);
+    if (sr_on()) { s_sr_world = sr_fold(s_sr_world, &prog, sizeof prog); s_sr_world = sr_fold(s_sr_world, &g->k, offsetof(RbxGvsConst, aa)); }
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)gcb, 0);
 
     sf_flush();
@@ -2382,9 +2959,20 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     UINT stride = sizeof(Nv2aVertex), off = 0;
     UINT xstride = (UINT)sizeof(RcVertExt), xoff = 0;
     int layer_draw = 0, packed_ext = 0;
+    Nv2aBatch ip_b;            /* RECOMP_RBX_INTERP=2: the batch with blended positions */
 
     if (!gb_ready() || !b->count) return;
     if (g_rbx_gvs.prog) { gb_draw_gvs(s, b); return; }
+    s_tr_cpu++; s_tr_cpu_va = s->color_va;
+    if (ip_on() >= 2) b = ip_cpu(s, b, &ip_b);
+    if (sr_on()) {   /* RECOMP_RBX_SIMRATE: quantised positions, colour and UVs of (up to) the first 256 vertices */
+        uint32_t k, n = b->count < 256u ? b->count : 256u;
+        for (k = 0; k < n; k++) {
+            const Nv2aVertex *v = &b->vertices[k];
+            int32_t q[5] = { (int32_t)(v->x * 16), (int32_t)(v->y * 16), (int32_t)v->diffuse, (int32_t)(v->u * 16), (int32_t)(v->v * 16) };
+            s_sr_scr = sr_fold(s_sr_scr, q, sizeof q);
+        }
+    }
     if (gclip && s_cull_on && r->cull_enable && r->cull_face == 0x408) { st_culled += g_rbx_bidx_n / 3; return; }
     if (s_fh < 0) s_fh = getenv("RECOMP_GPU_FRAMEHASH") != NULL;
     if (s_fh > 0) { uint32_t k; uint64_t h = fh_dh * 1099511628211ULL + b->count; for (k = 0; k < b->count; k++) { const Nv2aVertex *v = &b->vertices[k]; h = (h ^ (uint64_t)(int)(v->x * 16)) * 1099511628211ULL; h = (h ^ (uint64_t)(int)(v->y * 16)) * 1099511628211ULL; h = (h ^ v->diffuse) * 1099511628211ULL; h = (h ^ (uint64_t)(int)(v->u * 16)) * 1099511628211ULL; h = (h ^ (uint64_t)(int)(v->v * 16)) * 1099511628211ULL; } if (b->texture) { uint32_t n = tex_bytes(b->texture); h = (h ^ hash_bytes((const uint8_t *)xbox_GetMemoryOffset() + b->texture->offset, n)) * 1099511628211ULL; } h = (h ^ (r->blend_enable * 7u + r->blend_src * 131u + r->blend_dst * 977u + r->alpha_test_enable * 13u + r->depth_test_enable * 17u + r->color_mask)) * 1099511628211ULL; { uint64_t vh = 1469598103934665603ULL, th = 0; for (k = 0; k < b->count; k++) { const Nv2aVertex *v = &b->vertices[k]; vh = (vh ^ (uint64_t)(int)(v->x * 16)) * 1099511628211ULL; vh = (vh ^ (uint64_t)(int)(v->y * 16)) * 1099511628211ULL; vh = (vh ^ v->diffuse) * 1099511628211ULL; vh = (vh ^ (uint64_t)(int)(v->u * 16)) * 1099511628211ULL; vh = (vh ^ (uint64_t)(int)(v->v * 16)) * 1099511628211ULL; } if (b->texture) th = hash_bytes((const uint8_t *)xbox_GetMemoryOffset() + b->texture->offset, tex_bytes(b->texture)); if (fh_nd < 256) { FdRec *q = &fd_cur[fh_nd]; q->vh = vh; q->th = th; q->x0 = b->vertices[0].x; q->y0 = b->vertices[0].y; q->n = b->count; q->w = b->texture ? b->texture->width : 0; q->h = b->texture ? b->texture->height : 0; q->fmt = b->texture ? b->texture->color : 0; q->c0 = b->vertices[0].diffuse; q->st = r->blend_enable * 1000 + r->blend_src; } } fh_dh = h; fh_nd++; }
@@ -3170,6 +3758,22 @@ static void video_apply(void)
     }
 }
 
+static void ip_trace(int published)
+{
+    static int on = -1; static unsigned lo, hi, lines; static DWORD t0;
+    DWORD ms;
+    if (on < 0) { const char *e = getenv("RECOMP_RBX_INTERP_TRACE"); on = e && sscanf(e, "%u-%u", &lo, &hi) == 2; t0 = GetTickCount(); }
+    if (on) {
+        ms = GetTickCount() - t0;
+        if (ms >= lo * 1000u && ms < hi * 1000u && lines < 20000u) {
+            lines++;
+            fprintf(stderr, "[IPTR] ms=%lu f=%u flip_va=%08X draws_3d=%u (rt %08X) draws_other=%u (rt %08X) ffp=%u tick=%u u=%.2f blended=%u published=%d\n",
+                    (unsigned long)ms, s_frame, (unsigned)g_nv2a_flip_va, s_tr_gvs, (unsigned)s_tr_gvs_va, s_tr_cpu, (unsigned)s_tr_cpu_va,
+                    s_tr_ffp, s_tr_tick, s_ip_t, s_tr_blend, published);
+        }
+    }
+    s_tr_gvs = s_tr_cpu = s_tr_blend = s_tr_tick = s_tr_ffp = 0; s_tr_gvs_va = s_tr_cpu_va = 0;
+}
 static void gb_flip_impl(void)
 {
     int i;
@@ -3194,6 +3798,8 @@ static void gb_flip_impl(void)
             if (d * 1000ULL > qf * 100ULL) st_hitch100++;
         }
         s_ft_last = (unsigned long long)q.QuadPart;
+        if (sr_on()) sr_flip((unsigned long long)q.QuadPart);
+        if (s_ip > 0) ip_flip();
     }
     rbx_input_guest_frame = (LONG)s_frame;
     s_frame_for_grave = s_frame;
@@ -3261,7 +3867,11 @@ static void gb_flip_impl(void)
         st_dec_us = st_crt_us = 0; st_draws = st_tris = st_culled = st_clears = st_decodes = st_hash_ns_us = st_flips = st_rtsamples = 0; st_th_fast = st_th_full = st_th_stale = 0;
         last = now;
     }
-    publish_frame();
+    {
+        unsigned pub0 = st_pub;
+        publish_frame();
+        ip_trace(pub0 != st_pub);
+    }
     rbx_settings_wait();
     video_apply();
 }

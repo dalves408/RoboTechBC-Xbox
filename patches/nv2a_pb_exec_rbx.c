@@ -2379,6 +2379,8 @@ uint32_t g_rbx_bidx_n;
 static uint32_t *s_bidx, s_bidx_n, *s_bslot_tag, *s_bslot_out, s_bslot_gen;
 static int s_bidx_mode;
 extern int rbx_gpu_indexed_ok(void);
+extern int rbx_ip_ffp_begin(const void *key, size_t key_bytes, float composite[16]);   /* src/rbx_d3d11.c */
+extern void rbx_ip_ffp_end(void);
 
 /* At the start of a program batch's triangles: use the indexed hand-off? */
 static void bidx_begin(void)
@@ -4532,8 +4534,28 @@ static void raster_batch(void)
 
     if (s_gpu.idx_count < 3) { g_dbg_short++; return; }
     g_dbg_batches++;
-    if (batch_uses_program() || batch_is_ffp()) {
+    if (batch_uses_program()) {
         raster_batch_program();
+        return;
+    }
+    if (batch_is_ffp()) {
+        /* RECOMP_RBX_INTERP (src/rbx_d3d11.c): the mission world is fixed-function, so its composite matrix is what
+         * moves with the camera. The back end may hand back a blended matrix for this batch; the batch is
+         * transformed with it and the title's own is put back after. Keyed by what identifies the mesh, not where
+         * it is: vertex array address and stride, index count and first/last index, first vertex, texture. */
+        float saved[16], first[4] = { 0, 0, 0, 0 };
+        uint32_t key[12];
+        int blended;
+        if (s_gpu.idx_count) fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], first);
+        key[0] = s_gpu.attr[0].offset; key[1] = s_gpu.attr[0].stride; key[2] = s_gpu.idx_count;
+        key[3] = s_gpu.idx[0]; key[4] = s_gpu.idx[s_gpu.idx_count - 1]; key[5] = s_gpu.texs[0].offset;
+        key[6] = (uint32_t)s_gpu.inline_active; key[7] = s_gpu.prim;
+        memcpy(&key[8], first, sizeof first);
+        memcpy(saved, s_gpu.composite, sizeof saved);
+        blended = rbx_ip_ffp_begin(key, sizeof key, s_gpu.composite);
+        raster_batch_program();
+        rbx_ip_ffp_end();
+        if (blended) memcpy(s_gpu.composite, saved, sizeof saved);
         return;
     }
     if (!batch_is_screen_space()) {
