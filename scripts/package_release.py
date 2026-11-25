@@ -70,6 +70,7 @@ PRIVATE TEST BUILD - contains game data from an owned disc. Do not distribute.
 RUN
   1. Unzip to a writable folder, e.g. C:\\Games\\RobotechBC.
   2. Double-click Play.bat.
+  Config.exe changes the video settings outside the game (same settings.ini as F1).
   Intros can be skipped with Enter / Space once the pad is live (~20-40 s in).
 
 REQUIREMENTS
@@ -89,10 +90,12 @@ CONTROLS
   F1            Video settings    Esc                 Quit confirmation
   F11           Fullscreen
   Controller 1: hold Back and press Start to open settings.
+  Keys can be rebound, and A/B or X/Y swapped for Nintendo-style pads, on the
+  CONTROLS page of F1 or Config.exe.
 
 FILES
   SaveData\\     Save data and Xbox filesystem data
-  settings.ini   Video settings (created when settings change)
+  settings.ini   Video settings (created when settings change; Config.exe or F1 edits it)
   texture_pack\\ Optional high-resolution texture replacements
   logs\\         One log per run - include it with any bug report
   screenshots\\  Delete-key screenshots
@@ -159,6 +162,10 @@ def main():
     if not sdl.exists():
         sys.exit(f"missing {sdl}; rebuild the game")
     items.append((sdl, sdl.name))
+    config = BUILD / "Config.exe"
+    if not config.exists():
+        sys.exit(f"missing {config}; rebuild the game (Config.exe is built with it)")
+    items.append((config, config.name))
     items += [(p, "game_files/" + p.relative_to(GAME).as_posix()) for p in game_files()]
 
     comp = zipfile.ZIP_DEFLATED if a.level else zipfile.ZIP_STORED

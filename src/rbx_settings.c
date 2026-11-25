@@ -1,9 +1,12 @@
-/* Robotech's host settings. The Esc/F1 workflow follows the NHLHitzPro player. */
+/* Robotech's host settings. The Esc/F1 workflow follows the NHLHitzPro player;
+ * the look (rbx_menu.c, rbx_ui.c) is shared with Config.exe. */
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "rbx_settings.h"
+#include "rbx_menu.h"
+#include "rbx_ui.h"
 #include "video/gpu_present.h"
 #include "input/keyboard.h"
 #include "input/xinput_xbox.h"
@@ -19,31 +22,23 @@ extern void xa2_set_muted(int);
 extern int rbx_pad_peek(DWORD port, XBOX_INPUT_STATE *state);
 extern int (*rbx_input_block_hook)(void);
 extern int rbx_sdl_window_tick(HWND, int (*)(unsigned, long, int), int (*)(void));
+extern int (*rbx_keyboard_poll_hook)(XBOX_INPUT_STATE *out);
+extern int (*rbx_pad_swaps_hook)(void);
 
-enum { SCALE, FULLSCREEN, STRETCH, WIDE, VSYNC, RATE, AA, ANISO, HIRES, CLOSE, QUIT, ROWS };
+/* The options themselves are in rbx_options.h (shared with Config.exe). */
+enum { SCALE = RBX_OPT_SCALE, FULLSCREEN = RBX_OPT_FULLSCREEN, STRETCH = RBX_OPT_STRETCH,
+       WIDE = RBX_OPT_WIDE, VSYNC = RBX_OPT_VSYNC, RATE = RBX_OPT_RATE, AA = RBX_OPT_AA,
+       ANISO = RBX_OPT_ANISO, HIRES = RBX_OPT_HIRES, CLOSE = RBX_ROW_RESUME, QUIT = RBX_ROW_QUIT,
+       ROWS = RBX_ROW_COUNT };
 enum { CLOSED, SETTINGS, CONFIRM };
-static const struct {
-    const char *label, *key;
-    unsigned count, initial;
-    const char *values[7];
-} options[ROWS] = {
-    {"Render scale", "scale", 5, 0, {"1x / 640 x 480", "2x / 1280 x 960", "3x / 1920 x 1440", "4x / 2560 x 1920", "5x / 3200 x 2400"}},
-    {"Fullscreen", "fullscreen", 2, 0, {"Off", "On"}},
-    {"Stretch image", "stretch", 2, 0, {"Off / Keep shape", "On / Fill window"}},
-    /* Widescreen renders more of the scene left and right (Hor+) and keeps the HUD and menus at 4:3 in the middle. */
-    {"Widescreen", "widescreen", 5, 1, {"Off / 4:3", "Auto / Match window", "16:9", "16:10", "21:9"}},
-    {"VSync", "vsync", 2, 0, {"Off", "On"}},
-    {"FPS limit", "rate", 7, 6, {"30 FPS", "60 FPS", "120 FPS", "144 FPS", "240 FPS", "360 FPS", "Uncapped"}},
-    {"Anti-aliasing", "msaa", 4, 0, {"Off", "2x MSAA", "4x MSAA", "8x MSAA"}},
-    {"Anisotropic filtering", "anisotropy", 5, 0, {"Off", "2x", "4x", "8x", "16x"}},
-    {"Hi-res textures", "hires", 2, 1, {"Off", "On"}},
-    {"Close settings"}, {"Quit game"}
-};
+#define options rbx_options
 static unsigned choice[ROWS];
 static WCHAR ini[MAX_PATH];
 static HWND overlay;
-static HFONT body, heading;
-static int mode, selected, yes, initialized, sdl_window_input, scenario_mode;
+static int mode, selected, yes, initialized, sdl_window_input, scenario_mode, pad_input, from_pad;
+static int page, col, listening;
+static const char *status;
+static RbxKeymap keymap;       /* CONTROLS: read by the game thread, changed by the menu */
 static volatile LONG block_input, hold_frame, video, available_msaa;
 static DWORD release_at;
 static WORD last_pad;
@@ -56,6 +51,8 @@ void rbx_settings_wait(void)
     while (InterlockedCompareExchange(&hold_frame, 0, 0))
         Sleep(8);
 }
+
+static void paint_overlay(void);
 
 static void store_choice(int row)
 {
@@ -83,78 +80,82 @@ static void fullscreen_changed(int fullscreen)
 {
     choice[FULLSCREEN] = (unsigned)fullscreen;
     store_choice(FULLSCREEN);
-    if (overlay) InvalidateRect(overlay, NULL, FALSE);
-}
-
-static void fill(HDC dc, RECT rect, COLORREF color)
-{
-    HBRUSH brush = CreateSolidBrush(color);
-    FillRect(dc, &rect, brush);
-    DeleteObject(brush);
-}
-
-static void label(HDC dc, const char *text, RECT rect, COLORREF color, UINT alignment)
-{
-    SetTextColor(dc, color);
-    DrawTextA(dc, text, -1, &rect, alignment | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (mode) paint_overlay();
 }
 
 static LRESULT CALLBACK overlay_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
 {
     if (message == WM_NCHITTEST) return HTTRANSPARENT;
-    if (message == WM_PAINT) {
-        PAINTSTRUCT paint;
-        HDC dc = BeginPaint(window, &paint);
-        RECT r;
-        GetClientRect(window, &r);
-        fill(dc, r, RGB(16, 24, 36));
-        fill(dc, (RECT){0, 0, r.right, 3}, RGB(65, 202, 196));
-        SetBkMode(dc, TRANSPARENT);
-        SelectObject(dc, heading);
-        label(dc, mode == SETTINGS ? "Video settings" : "Quit Robotech: Battlecry?",
-              (RECT){20, 12, r.right - 20, 49}, RGB(242, 249, 255), DT_LEFT);
-        SelectObject(dc, body);
-        if (mode == SETTINGS) {
-            for (int row = 0; row < ROWS; row++) {
-                int y = 55 + row * 24;
-                if (row == selected)
-                    fill(dc, (RECT){11, y, r.right - 11, y + 24}, RGB(31, 69, 82));
-                label(dc, options[row].label, (RECT){20, y, r.right - 20, y + 24},
-                      RGB(242, 249, 255), DT_LEFT);
-                if (options[row].count)
-                    label(dc, options[row].values[choice[row]],
-                          (RECT){20, y, r.right - 20, y + 24},
-                          RGB(126, 226, 218), DT_RIGHT);
-            }
-            label(dc, "Arrows change settings   Enter selects   Esc or F1 closes",
-                  (RECT){20, r.bottom - 32, r.right - 20, r.bottom - 8},
-                  RGB(171, 192, 209), DT_LEFT);
-        } else {
-            fill(dc, yes ? (RECT){r.right / 2, 59, r.right - 15, 89}
-                         : (RECT){15, 59, r.right / 2, 89}, RGB(31, 69, 82));
-            label(dc, "Keep playing", (RECT){15, 59, r.right / 2, 89}, RGB(242, 249, 255), DT_CENTER);
-            label(dc, "Quit game", (RECT){r.right / 2, 59, r.right - 15, 89}, RGB(242, 249, 255), DT_CENTER);
-        }
-        EndPaint(window, &paint);
-        return 0;
-    }
     return DefWindowProcA(window, message, wparam, lparam);
 }
 
+/* Draw the menu (rbx_menu.c) into a 32-bit bitmap the size of the game
+ * window: the panel solid, the game around it dimmed, then hand it to the
+ * layered window. Painted only when something changes. */
+static void paint_overlay(void)
+{
+    RECT client, panel, window;
+    int cut = 0;
+    if (!overlay || !mode || !GetClientRect(overlay, &client)) return;
+    int w = client.right, h = client.bottom;
+    if (w <= 0 || h <= 0) return;
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    HDC screen = GetDC(overlay), dc = CreateCompatibleDC(screen);
+    unsigned *pixels = NULL;
+    HBITMAP bitmap = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&pixels, NULL, 0);
+    if (bitmap && pixels) {
+        HGDIOBJ old = SelectObject(dc, bitmap);
+        memset(pixels, 0, (size_t)w * h * 4);
+        if (mode == SETTINGS) {
+            RbxMenuState state = {page, selected, col, listening, pad_input, choice, &keymap, status};
+            rbx_menu_draw_settings(dc, w, h, &state, &panel, &cut);
+        }
+        else
+            rbx_menu_draw_quit(dc, w, h, yes, pad_input, &panel, &cut);
+        GdiFlush();
+        /* GDI leaves alpha at 0: make the panel opaque and the rest black at 66%. */
+        for (int y = 0; y < h; y++) {
+            unsigned *row = pixels + (size_t)y * w;
+            int inside_row = y >= panel.top && y < panel.bottom;
+            for (int x = 0; x < w; x++)
+                row[x] = inside_row && rbx_in_panel(&panel, cut, x, y) ? row[x] | 0xFF000000u
+                                                                       : 0xA8000000u;
+        }
+        POINT source = {0, 0}, target;
+        SIZE size = {w, h};
+        BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        GetWindowRect(overlay, &window);
+        target.x = window.left;
+        target.y = window.top;
+        UpdateLayeredWindow(overlay, screen, &target, &size, dc, &source, 0, &blend, ULW_ALPHA);
+        SelectObject(dc, old);
+    }
+    if (bitmap) DeleteObject(bitmap);
+    DeleteDC(dc);
+    ReleaseDC(overlay, screen);
+}
+
+/* The overlay covers the game window's client area. */
 static void position_overlay(void)
 {
     HWND parent = xbox_fb_window();
     RECT client, current;
     POINT origin = {0, 0};
-    int width = 444, height = mode == SETTINGS ? 358 : 105;
     if (!overlay || !parent || !GetClientRect(parent, &client)) return;
     ClientToScreen(parent, &origin);
-    int x = origin.x + (client.right - width) / 2;
-    int y = origin.y + (client.bottom - height) / 2;
+    int width = client.right > 1 ? client.right : 1, height = client.bottom > 1 ? client.bottom : 1;
     GetWindowRect(overlay, &current);
-    if (current.left != x || current.top != y ||
-        current.right - current.left != width || current.bottom - current.top != height)
-        SetWindowPos(overlay, HWND_TOP, x, y, width, height, SWP_NOACTIVATE);
+    if (current.left != origin.x || current.top != origin.y ||
+        current.right - current.left != width || current.bottom - current.top != height) {
+        SetWindowPos(overlay, HWND_TOP, origin.x, origin.y, width, height, SWP_NOACTIVATE);
+        paint_overlay();
+    }
 }
 
 static void open_overlay(int next)
@@ -172,11 +173,6 @@ static void open_overlay(int next)
                                   WS_EX_TRANSPARENT, wc.lpszClassName, "", WS_POPUP,
                                   0, 0, 1, 1, parent, NULL, instance, NULL);
         if (!overlay) return;
-        SetLayeredWindowAttributes(overlay, 0, 248, LWA_ALPHA);
-        body = CreateFontA(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, "Segoe UI");
-        heading = CreateFontA(-23, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
-                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, "Segoe UI");
     }
     if (!mode) {
         InterlockedExchange(&block_input, 1);
@@ -185,10 +181,11 @@ static void open_overlay(int next)
         xa2_set_muted(1);
     }
     mode = next;
-    selected = yes = 0;
+    selected = yes = col = listening = 0;
+    status = NULL;
     position_overlay();
+    paint_overlay();
     ShowWindow(overlay, SW_SHOWNOACTIVATE);
-    InvalidateRect(overlay, NULL, FALSE);
 }
 
 static void close_overlay(void)
@@ -203,6 +200,11 @@ static void close_overlay(void)
 
 static void change_value(int direction)
 {
+    if (selected >= RBX_OPT_COUNT) {
+        /* The button row: left and right move between RESUME and QUIT GAME. */
+        selected = selected == CLOSE ? QUIT : CLOSE;
+        return;
+    }
     int count = (int)options[selected].count;
     if (!count) return;
     int value = (int)choice[selected];
@@ -216,10 +218,101 @@ static void change_value(int direction)
     store_choice(selected);
 }
 
+/* ---- the CONTROLS page ---- */
+
+static void save_keys(void)
+{
+    if (ini[0] && !rbx_keymap_save(&keymap, ini))
+        status = "Could not save to settings.ini. The change lasts until the game closes.";
+}
+
+static void switch_page(int direction)
+{
+    page = (page + RBX_PAGE_COUNT + direction) % RBX_PAGE_COUNT;
+    col = listening = 0;
+    status = NULL;
+    if (selected >= 0) selected = 0;
+}
+
+/* Up and down on either page; -1 is the tab row above the first row. */
+static void move_row(int direction)
+{
+    int last = page == RBX_PAGE_VIDEO ? QUIT : RBX_CROW_BUTTONS;
+    status = NULL;
+    if (page == RBX_PAGE_VIDEO) {
+        if (direction < 0) selected = selected == -1 ? QUIT : selected >= CLOSE ? CLOSE - 1 : selected - 1;
+        else selected = selected >= CLOSE ? -1 : selected + 1;
+        return;
+    }
+    int next = selected + direction;
+    if (next < -1) next = last;
+    if (next > last) next = -1;
+    /* Between the key grid and the button row, keep to the same side. */
+    if (selected == RBX_CROW_BUTTONS && next == RBX_CROW_BUTTONS - 1) col = col == RBX_CBTN_DEFAULTS ? 0 : 2;
+    else if (next == RBX_CROW_BUTTONS && selected == RBX_CROW_BUTTONS - 1) col = col < 2 ? RBX_CBTN_DEFAULTS : RBX_CBTN_RESUME;
+    else if (next == RBX_CROW_BUTTONS) col = RBX_CBTN_RESUME;
+    else if (next >= RBX_CROW_GRID && (selected < RBX_CROW_GRID || selected == RBX_CROW_BUTTONS) &&
+             next != RBX_CROW_BUTTONS - 1)
+        col = 0;
+    selected = next;
+}
+
+static void controls_side(int direction)
+{
+    if (selected == RBX_CROW_SWAP_AB) keymap.swap_ab = !keymap.swap_ab, save_keys();
+    else if (selected == RBX_CROW_SWAP_XY) keymap.swap_xy = !keymap.swap_xy, save_keys();
+    else if (selected == RBX_CROW_BUTTONS) col = (col + RBX_CBTN_COUNT + direction) % RBX_CBTN_COUNT;
+    else col = (col + 4 + direction) % 4;
+}
+
+static void controls_enter(void)
+{
+    if (selected <= RBX_CROW_SWAP_XY) { controls_side(1); return; }
+    if (selected < RBX_CROW_BUTTONS) { listening = 1; status = NULL; return; }
+    if (col == RBX_CBTN_DEFAULTS) {
+        unsigned char ab = keymap.swap_ab, xy = keymap.swap_xy;
+        rbx_keymap_defaults(&keymap);
+        keymap.swap_ab = ab;
+        keymap.swap_xy = xy;
+        save_keys();
+        if (!status) status = "Keys reset to the default layout.";
+    } else if (col == RBX_CBTN_RESUME) close_overlay();
+    else open_overlay(CONFIRM);
+}
+
+/* The selected key slot gets the next key. */
+static void listen_key(unsigned key)
+{
+    int action = rbx_grid_action(selected - RBX_CROW_GRID, col), slot = col % 2;
+    if (key == VK_ESCAPE || key == VK_F1) { listening = 0; return; }
+    if (key == VK_LSHIFT || key == VK_RSHIFT) key = VK_SHIFT;
+    if (key == VK_LCONTROL || key == VK_RCONTROL) key = VK_CONTROL;
+    if (key == VK_LMENU || key == VK_RMENU) key = VK_MENU;
+    if (key == VK_DELETE) key = 0;
+    else if (rbx_key_reserved((int)key) || key > 255) {
+        status = "That key is kept for the menus and the window (Esc, F1, F9, F11, Delete).";
+        return;
+    }
+    rbx_keymap_bind(&keymap, action, slot, (int)key);
+    listening = 0;
+    status = NULL;
+    save_keys();
+}
+
 int rbx_settings_key(unsigned key, long flags, int down)
 {
     if (scenario_mode) return 1;
     int repeat = (flags & (1L << 30)) != 0;
+    if (down && pad_input != from_pad) {
+        /* The key hints follow the last thing used: keyboard or controller. */
+        pad_input = from_pad;
+        if (mode) paint_overlay();
+    }
+    if (mode == SETTINGS && listening) {
+        if (down && !repeat) listen_key(key);
+        if (mode) paint_overlay();
+        return 1;
+    }
     if (key == VK_ESCAPE || key == VK_F1) {
         if (down && !repeat) {
             int next = key == VK_F1 ? SETTINGS : CONFIRM;
@@ -231,14 +324,30 @@ int rbx_settings_key(unsigned key, long flags, int down)
     if (!mode) return 0;
     if (!down) return 1;
     if (mode == SETTINGS) {
+        int controls = page == RBX_PAGE_CONTROLS;
         switch (key) {
-        case VK_UP: selected = (selected + ROWS - 1) % ROWS; break;
-        case VK_DOWN: selected = (selected + 1) % ROWS; break;
-        case VK_LEFT: change_value(-1); break;
-        case VK_RIGHT: change_value(1); break;
+        case VK_TAB: case VK_NEXT: if (!repeat) switch_page(1); break;
+        case VK_PRIOR: if (!repeat) switch_page(-1); break;
+        case VK_UP: move_row(-1); break;
+        case VK_DOWN: move_row(1); break;
+        case VK_LEFT: case VK_RIGHT: {
+            int d = key == VK_LEFT ? -1 : 1;
+            if (selected < 0) { if (!repeat) switch_page(d); }
+            else if (controls) controls_side(d);
+            else change_value(d);
+            break;
+        }
+        case VK_DELETE:
+            if (controls && selected >= RBX_CROW_GRID && selected < RBX_CROW_BUTTONS) {
+                rbx_keymap_bind(&keymap, rbx_grid_action(selected - RBX_CROW_GRID, col), col % 2, 0);
+                save_keys();
+            }
+            break;
         case VK_RETURN:
             if (repeat) break;
-            if (selected == CLOSE) close_overlay();
+            if (selected < 0) switch_page(1);
+            else if (controls) controls_enter();
+            else if (selected == CLOSE) close_overlay();
             else if (selected == QUIT) open_overlay(CONFIRM);
             else change_value(1);
             break;
@@ -250,9 +359,54 @@ int rbx_settings_key(unsigned key, long flags, int down)
             close_overlay();
         }
     }
-    if (mode) InvalidateRect(overlay, NULL, FALSE);
+    if (mode) paint_overlay();
     return 1;
 }
+
+/* ---- the keyboard as pad 1, through the key map ---- */
+
+static int keyboard_focus(void)
+{
+    HWND fg = GetForegroundWindow(), fb = xbox_fb_window();
+    if (!fg) return 0;
+    /* The console counts too: the game was always playable with it in front. */
+    return fg == fb || fg == GetConsoleWindow() || (fb && GetAncestor(fg, GA_ROOTOWNER) == fb);
+}
+
+static int keyboard_poll(XBOX_INPUT_STATE *out)
+{
+    static DWORD packet;
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_KEYBOARD");
+        enabled = !(e && *e == '0');
+    }
+    if (!enabled) return 0;
+    memset(out, 0, sizeof *out);
+    out->dwPacketNumber = ++packet;
+    if (!keyboard_focus()) return 1;
+    int pos[4] = {0}, neg[4] = {0};
+    for (int a = 0; a < RBX_ACTION_COUNT; a++) {
+        const RbxAction *act = &rbx_actions[a];
+        int held = 0;
+        for (int k = 0; k < RBX_KEY_SLOTS; k++) {
+            int vk = keymap.vk[a][k];
+            if (vk && (GetAsyncKeyState(vk) & 0x8000)) held = 1;
+        }
+        if (!held) continue;
+        if (act->kind == RBX_ACT_BUTTON) out->Gamepad.wButtons |= act->target;
+        else if (act->kind == RBX_ACT_ANALOG) out->Gamepad.bAnalogButtons[act->target] = 255;
+        else if (act->sign > 0) pos[act->target] = 1;
+        else neg[act->target] = 1;
+    }
+    SHORT *axis[4] = {&out->Gamepad.sThumbLX, &out->Gamepad.sThumbLY,
+                      &out->Gamepad.sThumbRX, &out->Gamepad.sThumbRY};
+    for (int i = 0; i < 4; i++)
+        *axis[i] = (SHORT)(pos[i] == neg[i] ? 0 : pos[i] ? 32767 : -32768);
+    return 1;
+}
+
+static int pad_swaps(void) { return (keymap.swap_ab ? 1 : 0) | (keymap.swap_xy ? 2 : 0); }
 
 static int window_key(unsigned key, long flags, int down)
 {
@@ -279,7 +433,7 @@ void rbx_settings_tick(void)
     if (mask && !(mask & (1u << choice[AA]))) {
         do { choice[AA]--; } while (!(mask & (1u << choice[AA])));
         apply_choice(AA);
-        if (mode) InvalidateRect(overlay, NULL, FALSE);
+        if (mode) paint_overlay();
     }
     if (mode) position_overlay();
     else rbx_fb_focus_tick();
@@ -290,6 +444,8 @@ void rbx_settings_tick(void)
         pad = state.Gamepad.wButtons;
         if (state.Gamepad.bAnalogButtons[XBOX_BUTTON_A]) pad |= 0x1000;
         if (state.Gamepad.bAnalogButtons[XBOX_BUTTON_B]) pad |= 0x2000;
+        if (state.Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE]) pad |= 0x4000;
+        if (state.Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]) pad |= 0x8000;
         if (state.Gamepad.sThumbLY > 18000) pad |= 1;
         if (state.Gamepad.sThumbLY < -18000) pad |= 2;
         if (state.Gamepad.sThumbLX < -18000) pad |= 4;
@@ -298,14 +454,25 @@ void rbx_settings_tick(void)
     WORD pressed = pad & ~last_pad;
     last_pad = pad;
     if (GetForegroundWindow() == parent) {
-        if (!mode && (pad & 0x30) == 0x30 && (pressed & 0x10)) open_overlay(SETTINGS);
+        if (!mode && (pad & 0x30) == 0x30 && (pressed & 0x10)) {
+            pad_input = 1;
+            open_overlay(SETTINGS);
+        }
         else if (mode) {
-            if (pressed & (0x2000 | 0x10)) close_overlay();
+            from_pad = 1;
+            if (pressed && !pad_input) { pad_input = 1; paint_overlay(); }
+            if (listening) {
+                /* Waiting for a keyboard key: the pad can only cancel. */
+                if (pressed & (0x2000 | 0x10)) { listening = 0; paint_overlay(); }
+            } else if (pressed & (0x2000 | 0x10)) close_overlay();
+            else if (mode == SETTINGS && (pressed & 0x4000)) { switch_page(-1); paint_overlay(); }
+            else if (mode == SETTINGS && (pressed & 0x8000)) { switch_page(1); paint_overlay(); }
             else if (pressed & 1) rbx_settings_key(VK_UP, 0, 1);
             else if (pressed & 2) rbx_settings_key(VK_DOWN, 0, 1);
             else if (pressed & 4) rbx_settings_key(VK_LEFT, 0, 1);
             else if (pressed & 8) rbx_settings_key(VK_RIGHT, 0, 1);
             else if (pressed & 0x1000) rbx_settings_key(VK_RETURN, 0, 1);
+            from_pad = 0;
         }
     }
     if (!mode && rbx_settings_input_blocked() && !pad &&
@@ -353,6 +520,11 @@ void rbx_settings_install(void)
         if (!strcmp(wide, "1")) choice[WIDE] = 1;
     }
     apply_choice(-1);
+    rbx_keymap_load(&keymap, ini[0] ? ini : NULL);
+    /* RECOMP_RBX_TOOLKIT_KEYS=1 goes back to the toolkit's fixed key map. */
+    const char *toolkit_keys = getenv("RECOMP_RBX_TOOLKIT_KEYS");
+    if (!(toolkit_keys && *toolkit_keys == '1')) rbx_keyboard_poll_hook = keyboard_poll;
+    rbx_pad_swaps_hook = pad_swaps;
     xbox_fb_key_hook = window_key;
     xbox_fb_tick_hook = rbx_settings_tick;
     xbox_fb_fullscreen_changed = fullscreen_changed;

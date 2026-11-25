@@ -10,6 +10,25 @@
 #include <SDL3/SDL.h>
 
 static volatile LONG g_controller_connected[XBOX_MAX_CONTROLLERS];
+
+/* Set by src/rbx_settings.c: the keyboard through the player's key map
+ * (Controls tab), and which face buttons to swap on controllers (bit 0 A/B,
+ * bit 1 X/Y). Unset, the toolkit's keyboard map is used and nothing swaps. */
+int (*rbx_keyboard_poll_hook)(XBOX_INPUT_STATE *out);
+int (*rbx_pad_swaps_hook)(void);
+
+static int rbx_keyboard_poll(XBOX_INPUT_STATE *out)
+{
+    return rbx_keyboard_poll_hook ? rbx_keyboard_poll_hook(out) : xbox_InputKeyboardPoll(out);
+}
+
+static void swap_face_buttons(XBOX_INPUT_STATE *state)
+{
+    int swaps = rbx_pad_swaps_hook ? rbx_pad_swaps_hook() : 0;
+    BYTE *b = state->Gamepad.bAnalogButtons, t;
+    if (swaps & 1) { t = b[XBOX_BUTTON_A]; b[XBOX_BUTTON_A] = b[XBOX_BUTTON_B]; b[XBOX_BUTTON_B] = t; }
+    if (swaps & 2) { t = b[XBOX_BUTTON_X]; b[XBOX_BUTTON_X] = b[XBOX_BUTTON_Y]; b[XBOX_BUTTON_Y] = t; }
+}
 int (*rbx_input_block_hook)(void);
 volatile LONG rbx_input_guest_frame;
 
@@ -92,7 +111,7 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
     XBOX_INPUT_STATE kb;
     int i;
 
-    if (!xbox_InputKeyboardPoll(&kb))
+    if (!rbx_keyboard_poll(&kb))
         return;
     pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
     for (i = 0; i < 8; i++)
@@ -170,7 +189,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
              * playable with no controller plugged in. */
             int kb;
             memset(pState, 0, sizeof *pState);
-            kb = xbox_InputKeyboardPoll(pState);
+            kb = rbx_keyboard_poll(pState);
             if (mkb_merge(dwPort, pState))
                 g_controller_connected[dwPort] = TRUE;
             if (kb || mkb_enabled()) {
@@ -183,6 +202,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     }
 
     g_controller_connected[dwPort] = TRUE;
+    swap_face_buttons(pState);
 
     if (dwPort == 0)
         keyboard_merge(pState);
@@ -230,6 +250,7 @@ int rbx_pad_peek(DWORD port, XBOX_INPUT_STATE *state)
     sdlpad_rescan(0);
     ok = sdlpad_get(port, state);
     LeaveCriticalSection(&g_lock);
+    if (ok) swap_face_buttons(state);
     return ok;
 }
 
