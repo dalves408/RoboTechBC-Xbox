@@ -3989,6 +3989,51 @@ static void gvs_ref(uint32_t index, RbxGvsRef *r)
     r->fog = v.fog;
 }
 
+/* RBX: per-program counts of batches that took the GPU path, and of black passes
+ * skipped whole (below); logged every 16384 such batches. */
+static unsigned long s_gvs_taken[RBX_GVS_NPROG], s_black_skipped[RBX_GVS_NPROG];
+static void gvs_count(unsigned long *tab, int prog)
+{
+    static unsigned long n;
+    tab[prog]++;
+    if (++n % 16384 == 0)
+        fprintf(stderr, "[GVS] batches GPU/black-skipped: 0B25 %lu/%lu 9CEE %lu/%lu BA9E %lu/%lu 892C %lu/%lu\n",
+                s_gvs_taken[1], s_black_skipped[1], s_gvs_taken[2], s_black_skipped[2],
+                s_gvs_taken[3], s_black_skipped[3], s_gvs_taken[4], s_black_skipped[4]);
+}
+
+/* RBX: the outline programs (0B25 / 9CEE) take oD0 from c[100], and the cel
+ * outline and darkening passes load it black. The back end drops every
+ * combiner batch whose diffuse is all black (RECOMP_GPU_SKIPBLACK, on by
+ * default), so such a batch was transformed, clipped and converted only to be
+ * dropped -- on the bench about half of all vertex work. Decide it here from
+ * c[100] and skip the batch whole, on the CPU and GPU paths alike.
+ * RECOMP_GPU_SKIPBLACK=0 keeps drawing them, as before. */
+static int black_pass_skip(uint32_t n)
+{
+    static int skipblk = -1;
+    int prog;
+    float d0[4];
+    if (skipblk < 0) {
+        const char *e = getenv("RECOMP_GPU_SKIPBLACK");
+        skipblk = !(e && e[0] == '0');
+    }
+    if (!skipblk || n < 3 || !s_gpu.rc_seen || !backend_draws()
+        || s_gpu.prim < NV_PRIM_TRIANGLES || s_gpu.prim > NV_PRIM_POLYGON)
+        return 0;
+    prog = gvs_prog();
+    if (prog != RBX_GVS_0B25 && prog != RBX_GVS_9CEE)
+        return 0;
+    vsh_color(d0, nv2a_vsh_constant(100));
+    if (pack_color(d0) & 0x00FFFFFFu)
+        return 0;
+    gvs_count(s_black_skipped, prog);
+    s_gpu.batches_program++;
+    s_gpu.verts_program += n;
+    note_drawn();
+    return 1;
+}
+
 /* Draw the current batch through a GPU vertex program; 0 = not this batch. */
 static int gvs_batch(uint32_t n)
 {
@@ -4118,6 +4163,7 @@ static int gvs_batch(uint32_t n)
     }
     g_pb_t_xf += pb_ticks() - t0;
     g_pb_n_xfverts += n;
+    gvs_count(s_gvs_taken, prog);
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
     if (s_gpu.texs[0].valid)
@@ -4147,7 +4193,7 @@ static void raster_batch_program(void)
         return;
     if (batch_uses_program()) {
         (void)vp_hash();          /* settle the program identity before workers read it */
-        if (gvs_batch(n))
+        if (black_pass_skip(n) || gvs_batch(n))
             return;
     }
     t0 = pb_ticks();
