@@ -584,6 +584,123 @@ void sub_0012B670(void)
     MEMF(sp + 20) = x1;
 }
 
+/* RBX pause menu at high frame rates (one press skipped several entries).
+ *
+ * The mission loop (0x10FC80) runs the game in 33 ms ticks (0x11080) and,
+ * every pass, draws (0x11300) and runs a per-frame callback (0x11370). START
+ * pauses through 0x245D0, which sets 0x1E628C. While it is set the tick skips
+ * the game, and the per-frame callback reads the pads (its call to 0x111410
+ * returns to 0x1144F) and drives the pause menu. On the Xbox that ran once per
+ * displayed frame, 30 a second at most. Uncapped it ran about 200 a second
+ * (measured), so one press walked down several entries.
+ *
+ * While paused, hold that pad read to 1/30 s from the previous one. This
+ * paces the whole paused loop to 30 passes a second, the Xbox's rate, and the
+ * paused picture is still. Gameplay is unchanged. RECOMP_RBX_MENU_PACE=0
+ * turns it off. RECOMP_RBX_PAUSE_LOG=1 logs each new caller of 0x111410, and
+ * every second how often each one was called and how long the pause was held.
+ * scripts/patch_kickoff_yield.ps1 renames the generated 0x111410 to _orig. */
+#define RBX_PAUSED_VA        0x001E628Cu
+#define RBX_PAUSE_PAD_RET    0x0001144Fu   /* 0x11370's pad read, paused path */
+extern void sub_00111410_orig(void);
+
+static int rbx_menu_flag(const char *name, int dflt)
+{
+    const char *e = getenv(name);
+    return e && *e ? e[0] != '0' : dflt;
+}
+
+/* Wait until one 30th of a second after the previous paced pass. A pass that
+ * comes late (a slow frame, or the first after a gap) starts the count again
+ * rather than hurrying to catch up. Returns microseconds waited. */
+static unsigned long rbx_pace_30hz(void)
+{
+    static HANDLE timer;
+    static LARGE_INTEGER freq;
+    static LONGLONG next;
+    LARGE_INTEGER now;
+    LONGLONG interval, start;
+    if (!freq.QuadPart) {
+        QueryPerformanceFrequency(&freq);
+        timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+        if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+    }
+    interval = freq.QuadPart / 30;
+    QueryPerformanceCounter(&now);
+    if (!next || now.QuadPart > next + interval) {
+        next = now.QuadPart + interval;
+        return 0;
+    }
+    start = now.QuadPart;
+    while (now.QuadPart < next) {
+        LONGLONG left_us = (next - now.QuadPart) * 1000000 / freq.QuadPart;
+        if (left_us > 1500 && timer) {
+            LARGE_INTEGER due;
+            due.QuadPart = -(left_us - 1000) * 10;   /* 100 ns units, relative */
+            if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 50);
+            else Sleep(1);
+        } else if (left_us > 1500) {
+            Sleep(1);
+        } else {
+            SwitchToThread();
+        }
+        QueryPerformanceCounter(&now);
+    }
+    next += interval;
+    return (unsigned long)((now.QuadPart - start) * 1000000 / freq.QuadPart);
+}
+
+#define RBX_CALLERS 32
+static struct { uint32_t ret; unsigned long n; } s_callers[RBX_CALLERS];
+static int s_ncallers;
+
+static void rbx_log_pad_caller(uint32_t ret, unsigned long held_us)
+{
+    static DWORD last;
+    static unsigned long held;
+    int i;
+    held += held_us;
+    for (i = 0; i < s_ncallers; i++)
+        if (s_callers[i].ret == ret) break;
+    if (i == s_ncallers) {
+        if (i == RBX_CALLERS) return;
+        s_callers[i].ret = ret; s_callers[i].n = 0; s_ncallers++;
+        fprintf(stderr, "[RBX PAUSE] new caller of 111410: return %08X (paused %u)\n",
+                ret, MEM32(RBX_PAUSED_VA));
+        fflush(stderr);
+    }
+    s_callers[i].n++;
+    if (GetTickCount() - last >= 1000) {
+        last = GetTickCount();
+        fprintf(stderr, "[RBX PAUSE] last second (paused %u, held %lu ms):",
+                MEM32(RBX_PAUSED_VA), held / 1000);
+        for (i = 0; i < s_ncallers; i++) {
+            if (s_callers[i].n)
+                fprintf(stderr, " 111410<-%08X x%lu", s_callers[i].ret, s_callers[i].n);
+            s_callers[i].n = 0;
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+        held = 0;
+    }
+}
+
+void sub_00111410(void)
+{
+    static int on = -1, log;
+    uint32_t ret = MEM32(g_esp);
+    unsigned long held_us = 0;
+    if (on < 0) {
+        on = rbx_menu_flag("RECOMP_RBX_MENU_PACE", 1);
+        log = rbx_menu_flag("RECOMP_RBX_PAUSE_LOG", 0);
+    }
+    if (on && ret == RBX_PAUSE_PAD_RET && MEM32(RBX_PAUSED_VA))
+        held_us = rbx_pace_30hz();
+    if (log)
+        rbx_log_pad_caller(ret, held_us);
+    sub_00111410_orig();
+}
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
     if (xbox_va == 0x00155730u) {
