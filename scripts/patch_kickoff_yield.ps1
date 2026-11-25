@@ -126,3 +126,23 @@ foreach ($f in Get-ChildItem -Path $gen -Filter 'recomp_*.c') {
     }
 }
 if (-not $hit) { throw "sub_0012B670 definition not found in $gen" }
+
+# isCheat (0x2F350) is wrapped by sub_0002F350 in recomp_manual.c, which
+# reports the level-select cheat as on in -DRBX_DEBUG_UNLOCK_ALL_LEVELS=ON
+# builds (a plain pass-through otherwise). The lifter's file split can move,
+# so look for the definition in every gen file.
+$gen = Join-Path $root 'src\recomp\gen'
+$cheatRe = [regex]'void sub_0002F350\(void\)(\r?\n)\{'
+$cheatDone = $false
+foreach ($f in Get-ChildItem $gen -Filter 'recomp_*.c') {
+    $ct = [IO.File]::ReadAllText($f.FullName)
+    if ($ct.Contains('void sub_0002F350_orig(void)')) { $cheatDone = $true; Write-Output "already patched: $($f.FullName) (isCheat)"; break }
+    if ($cheatRe.IsMatch($ct)) {
+        $ct = $cheatRe.Replace($ct, '/* RBX: renamed; wrapped by sub_0002F350 in src/recomp_manual.c (debug level unlock). */$1void sub_0002F350_orig(void)$1{', 1)
+        [IO.File]::WriteAllText($f.FullName, $ct)
+        $cheatDone = $true
+        Write-Output "patched $($f.FullName) (isCheat)"
+        break
+    }
+}
+if (-not $cheatDone) { throw 'sub_0002F350 (isCheat) not found in src\recomp\gen' }

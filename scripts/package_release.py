@@ -140,6 +140,9 @@ def main():
         sys.exit(f"missing {exe}; build first")
     if not (GAME / "default.xbe").exists():
         sys.exit(f"missing {GAME}\\default.xbe; extract the disc first")
+    cache = ROOT / "build" / "CMakeCache.txt"
+    if cache.exists() and "RBX_DEBUG_UNLOCK_ALL_LEVELS:BOOL=ON" in cache.read_text(errors="ignore"):
+        sys.exit("this build has the debug level unlock; rebuild without -UnlockAllLevels first")
     if MOVIE_STASH.exists() and any(MOVIE_STASH.iterdir()):
         sys.exit("intro movies are stashed; run scripts\\skip_boot_movies.ps1 -Restore")
 

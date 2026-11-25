@@ -743,3 +743,46 @@ void recomp_unimpl(const char *text, uint32_t va)
     }
     if (stop) abort();
 }
+
+/* ── Debug: unlock every level ───────────────────────────────────────────
+ *
+ * sub_0002F350 is the title's isCheat(mask): it returns
+ * (MEM32(0x1EA5EC) & mask) == mask. Bit 0x2 is the WEWILLWIN "level select"
+ * cheat. The mission-select checks (sub_00025060, sub_00025290, sub_00025620)
+ * and the frontend copy into 0x1E6398 (sub_00035B80) all ask isCheat(2), so
+ * answering yes for bit 0x2 opens every story mission without a code.
+ *
+ * Nothing is written to guest memory: the real cheat dword sits inside the
+ * profile block that gets saved, and profile load / new profile / CLEAR /
+ * frontend states reset it. The player's save is left as it was.
+ *
+ * Only compiled in with -DRBX_DEBUG_UNLOCK_ALL_LEVELS=ON (CMake option, OFF
+ * by default; build.ps1 -UnlockAllLevels). Such a build still honours
+ * RECOMP_UNLOCK_LEVELS=0 to turn it off for one run. Release builds keep the
+ * plain pass-through. scripts/patch_kickoff_yield.ps1 renames the lifted
+ * function to sub_0002F350_orig. */
+#define RBX_CHEAT_FLAGS_VA   0x001EA5ECu
+#define RBX_CHEAT_LEVELSEL   0x00000002u
+
+extern void sub_0002F350_orig(void);
+void sub_0002F350(void)
+{
+#ifdef RBX_DEBUG_UNLOCK_ALL_LEVELS
+    static int on = -1;
+    uint32_t mask = MEM32(g_esp + 4);
+    if (on < 0) {
+        const char *e = getenv("RECOMP_UNLOCK_LEVELS");
+        on = !(e && e[0] == '0');
+        fprintf(stderr, "[RBX] debug build: all levels unlocked %s\n",
+                on ? "(RECOMP_UNLOCK_LEVELS=0 turns it off)" : "is OFF for this run");
+        fflush(stderr);
+    }
+    sub_0002F350_orig();
+    if (on && (mask & RBX_CHEAT_LEVELSEL)) {
+        uint32_t flags = MEM32(RBX_CHEAT_FLAGS_VA) | RBX_CHEAT_LEVELSEL;
+        g_eax = (flags & mask) == mask;
+    }
+#else
+    sub_0002F350_orig();
+#endif
+}

@@ -1,5 +1,8 @@
 param(
-    [ValidateSet('Debug','Release','RelWithDebInfo')][string]$Configuration = 'Debug'
+    [ValidateSet('Debug','Release','RelWithDebInfo')][string]$Configuration = 'Debug',
+    # Debug/test only: every level selectable without the cheat code. Passed on
+    # every configure (ON or OFF) so it never sticks in the CMake cache.
+    [switch]$UnlockAllLevels
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
@@ -53,10 +56,15 @@ $cmakeArgs = @(
     '-S', $projectRoot,
     '-B', $buildDir,
     '-G', 'Visual Studio 17 2022',
-    '-A', 'x64'
+    '-A', 'x64',
+    "-DRBX_DEBUG_UNLOCK_ALL_LEVELS=$(if ($UnlockAllLevels) { 'ON' } else { 'OFF' })"
 )
 & $cmakeExe @cmakeArgs
 if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed.' }
 & $cmakeExe --build $buildDir --config $Configuration
 if ($LASTEXITCODE -ne 0) { throw 'CMake build failed.' }
-Write-Host "Built $Configuration under $buildDir"
+if ($UnlockAllLevels) {
+    Write-Host "Built $Configuration under $buildDir (DEBUG: all levels unlocked; do not package)"
+} else {
+    Write-Host "Built $Configuration under $buildDir"
+}

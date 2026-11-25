@@ -412,6 +412,9 @@ static int window_key(unsigned key, long flags, int down)
 {
     if (scenario_mode) return 1;
     if (!sdl_window_input) return rbx_settings_key(key, flags, down);
+    /* While the menu is open, Delete clears a key slot: the framebuffer window
+     * keeps it (a screenshot) from SDL's wrapper, so hand it over here. */
+    if (key == VK_DELETE && mode != CLOSED) return rbx_settings_key(key, flags, down);
     /* Leave window and diagnostic shortcuts to the framebuffer window. */
     if (key == VK_F11 || key == VK_F9 || key == VK_DELETE ||
         (key == VK_RETURN && (flags & (1L << 29))))
