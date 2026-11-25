@@ -116,6 +116,11 @@ static int rbx_d3d_dma_busy(uint32_t device)
     return put != get;
 }
 
+/* Perf counters, read by the [RBXPERF] stats line in rbx_d3d11.c. */
+volatile LONG g_rbx_forced_catchups;   /* times GET was snapped to PUT before the walker read the commands */
+volatile LONG g_rbx_fence_spurious;    /* BlockOnFence returned before its fence was reached */
+volatile LONG g_rbx_fence_timeouts;    /* ...and the 2 s recheck gave up */
+
 static void rbx_d3d_force_get_catchup(uint32_t device)
 {
     uint32_t pb, put;
@@ -129,6 +134,7 @@ static void rbx_d3d_force_get_catchup(uint32_t device)
     put = MEM32(device + 0x2Cu) & 0x0FFFFFFFu;
     if (pb)
         MEM32(pb + 0x44u) = put;
+    InterlockedIncrement(&g_rbx_forced_catchups);
     hw_put = xbox_Nv2aRegPtr(RBX_NV2A_USER_DMA_PUT);
     hw_get = xbox_Nv2aRegPtr(RBX_NV2A_USER_DMA_GET);
     if (hw_put && hw_get)
@@ -319,7 +325,6 @@ extern void sub_001558D0_orig(void);
 void sub_001558D0(void)
 {
     static int on = -1;
-    static LONG s_spurious, s_timeouts;
     uint32_t target = MEM32(g_esp + 4);
     uint32_t dev, fence_va, counter;
     DWORD t0;
@@ -338,7 +343,7 @@ void sub_001558D0(void)
     if (counter - target >= counter - MEM32(fence_va))
         return;
     {
-        LONG n = InterlockedIncrement(&s_spurious);
+        LONG n = InterlockedIncrement(&g_rbx_fence_spurious);
         if (n <= 4 || (n & (n - 1)) == 0) {
             fprintf(stderr, "[RBX] BlockOnFence woke early: fence=%08X target=%08X counter=%08X (#%ld)\n",
                     MEM32(fence_va), target, counter, (long)n);
@@ -348,7 +353,7 @@ void sub_001558D0(void)
     t0 = GetTickCount();
     while (counter - target < counter - MEM32(fence_va)) {
         if (GetTickCount() - t0 > 2000u) {
-            LONG n = InterlockedIncrement(&s_timeouts);
+            LONG n = InterlockedIncrement(&g_rbx_fence_timeouts);
             if (n <= 8) {
                 fprintf(stderr, "[RBX] BlockOnFence recheck timeout fence=%08X target=%08X\n",
                         MEM32(fence_va), target);

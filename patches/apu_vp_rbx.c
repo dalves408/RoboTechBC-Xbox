@@ -663,6 +663,9 @@ static int apu_fe_lock_on(void)
  * the frame instead dropped 32 samples of play time each time the title
  * polled the voice's position. */
 static unsigned s_lock_waits, s_lock_wait_timeouts;
+/* For the [RBXPERF] stats line in rbx_d3d11.c. */
+unsigned rbx_apu_lock_waits(void) { return s_lock_waits; }
+unsigned rbx_apu_lock_wait_timeouts(void) { return s_lock_wait_timeouts; }
 static void vp_wait_voice_unlock(MCPXAPUState *d, uint16_t v)
 {
     static int limit_us = -1;

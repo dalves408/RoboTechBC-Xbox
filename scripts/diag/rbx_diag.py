@@ -10,6 +10,9 @@ once per interval, then writes a report under analysis\\diag\\<name>\\:
   * screenshots of the client area; luma / bright-wash / frozen-frame metrics
   * stderr anomaly scan (UNIMPL, unhandled GPU methods, faults, stubs)
   * [RBX DX11] per-interval pipeline timings (scan/flip/draw us)
+  * [RBXPERF] frame times, hitches, readback/shader-compile cost, forced GET catch-ups,
+    fence timeouts, trapped register accesses and APU voice-lock waits (--gpu-stats);
+    written to perf.csv and summarised in the report
   * optional timed key script (controls test) and WAV dump of audio output
 
 Usage (from repo root):
@@ -174,6 +177,10 @@ ANOMALY_PATTERNS = {
     "watchdog": re.compile(r"(WATCHDOG|watchdog|HANG|deadlock)", re.I),
 }
 RBX_STAT = re.compile(r"^\[RBX DX11\] frame=(\d+) flips=(\d+) draws=(\d+).*?us_draw=(\d+) us_clear=(\d+) us_flip=(\d+) scan_ms=(\d+)")
+RBX_PERF = re.compile(r"^\[RBXPERF\] (.*)$")
+PERF_FIELDS = ["ms", "flips", "pub", "ft_avg_us", "ft_max_us", "hitch33", "hitch50", "hitch100",
+               "rb_n", "rb_us", "sh_n", "sh_us", "sh_total", "catchup", "fence_early", "fence_timeout",
+               "mmio_traps", "apu_lock_waits", "apu_lock_timeouts"]
 XA2_UNDERRUN = re.compile(r"^\[XA2\] underrun x(\d+)\b")
 AUDIO_HOST_UNDERRUN = re.compile(r"^\[AUDIO-HOST\].*\bunderruns=(\d+)\b")
 FRAME_PRESS = re.compile(r"^\[RBX PAD\] (\w+) observed at f(\d+) \(scheduled f(\d+)\)$", re.M)
@@ -219,8 +226,9 @@ def compare_frames(reference: Path, capture: Path):
 def scan_log(path: Path):
     res = {k: {"count": 0, "examples": {}} for k in ANOMALY_PATTERNS}
     rbx = []
+    perf = []
     if not path.exists():
-        return res, rbx
+        return res, rbx, perf
     with path.open("r", errors="replace") as fh:
         for line in fh:
             counter = XA2_UNDERRUN.match(line) or AUDIO_HOST_UNDERRUN.match(line)
@@ -231,6 +239,16 @@ def scan_log(path: Path):
                     item["count"] += count - item.get("cumulative", 0)
                     item["cumulative"] = count
                     item["examples"] = {f"XAudio2 cumulative total: {count}": count}
+                continue
+            pm = RBX_PERF.match(line)
+            if pm:
+                row = {}
+                for item in pm[1].split():
+                    k, _, v = item.partition("=")
+                    if k in PERF_FIELDS and v.lstrip("-").isdigit():
+                        row[k] = int(v)
+                if "ms" in row:
+                    perf.append(row)
                 continue
             m = RBX_STAT.match(line)
             if m:
@@ -248,7 +266,40 @@ def scan_log(path: Path):
     for k in res:
         ex = res[k]["examples"]
         res[k]["examples"] = dict(sorted(ex.items(), key=lambda kv: -kv[1])[:8])
-    return res, rbx
+    return res, rbx, perf
+
+
+def summarize_perf(perf, out: Path):
+    """Write perf.csv (one row per stats window) and return the run's totals."""
+    if not perf:
+        return None
+    with (out / "perf.csv").open("w", encoding="utf-8") as fh:
+        fh.write(",".join(PERF_FIELDS) + "\n")
+        for row in perf:
+            fh.write(",".join(str(row.get(k, "")) for k in PERF_FIELDS) + "\n")
+    rows = perf[1:] if len(perf) > 1 else perf   # the first window starts at boot, not at the last line
+    secs = max(1e-3, sum(r.get("ms", 0) for r in rows) / 1000.0)
+
+    def total(k):
+        return sum(r.get(k, 0) for r in rows)
+    flips = total("flips")
+    return {
+        "windows": len(rows), "secs": round(secs, 1),
+        "guest_fps": round(flips / secs, 1),
+        "presented_fps": round(total("pub") / secs, 1),
+        "frame_ms_avg": round(statistics.mean(r["ft_avg_us"] for r in rows if r.get("flips")) / 1000, 2)
+                        if any(r.get("flips") for r in rows) else None,
+        "frame_ms_worst": round(max(r.get("ft_max_us", 0) for r in rows) / 1000, 1),
+        "hitches_over_33ms": total("hitch33"), "hitches_over_50ms": total("hitch50"),
+        "hitches_over_100ms": total("hitch100"),
+        "readback_ms_per_s": round(total("rb_us") / 1000 / secs, 2),
+        "shader_compiles": total("sh_n"), "shader_compile_ms": round(total("sh_us") / 1000, 1),
+        "shader_variants_since_boot": max(r.get("sh_total", 0) for r in perf),
+        "forced_get_catchups": total("catchup"), "fence_early_wakes": total("fence_early"),
+        "fence_timeouts": total("fence_timeout"),
+        "mmio_traps_per_s": round(total("mmio_traps") / secs),
+        "apu_lock_waits": total("apu_lock_waits"), "apu_lock_timeouts": total("apu_lock_timeouts"),
+    }
 
 
 def parse_keys(spec: str):
@@ -433,7 +484,7 @@ def exit_meaning(code):
 
 
 def write_report(a, out, samples, shots, key_log, hangs, exited, thr_total, wav):
-    log, rbx = scan_log(out / "stderr.log")
+    log, rbx, perf = scan_log(out / "stderr.log")
     fps_vals = [s["fps"] for s in samples if s["fps"] is not None]
     cpu_vals = [s["cpu_cores"] for s in samples]
     srt = sorted(fps_vals)
@@ -470,6 +521,9 @@ def write_report(a, out, samples, shots, key_log, hangs, exited, thr_total, wav)
             return round(statistics.mean(r[k] for r in rbx), 1)
         rep["rbx_dx11"] = {"intervals": len(rbx), "avg_scan_ms": avg("scan_ms"), "avg_us_flip": avg("us_flip"),
                            "avg_us_draw": avg("us_draw"), "max_scan_ms": max(r["scan_ms"] for r in rbx)}
+    perf_summary = summarize_perf(perf, out)
+    if perf_summary:
+        rep["perf"] = perf_summary
     dur = max(1.0, samples[-1]["t"] if samples else 1.0)
     hot = sorted(thr_total.items(), key=lambda kv: -kv[1])[:6]
     rep["hot_threads_cpu_pct_of_core"] = {str(t): round(100 * v / dur, 1) for t, v in hot}
@@ -569,6 +623,18 @@ def verdicts(r):
                 v.append(f"AUDIO: clipping {au['clipped_pct']}%")
             if au["hard_clicks"] > 50:
                 v.append(f"AUDIO: {au['hard_clicks']} hard discontinuities (crackle)")
+    p = r.get("perf")
+    if p:
+        if p["hitches_over_100ms"]:
+            v.append(f"STUTTER: {p['hitches_over_100ms']} frame(s) over 100 ms (worst {p['frame_ms_worst']} ms)")
+        if p["forced_get_catchups"]:
+            v.append(f"PB: {p['forced_get_catchups']} forced GET catch-up(s) (unread commands marked consumed)")
+        if p["fence_timeouts"]:
+            v.append(f"PB: {p['fence_timeouts']} BlockOnFence recheck timeout(s) (2 s each)")
+        if p["shader_compiles"]:
+            v.append(f"SHADERS: {p['shader_compiles']} compile(s) during the run, {p['shader_compile_ms']} ms total")
+        if p["apu_lock_timeouts"]:
+            v.append(f"AUDIO: {p['apu_lock_timeouts']} voice-lock wait timeout(s)")
     if r["log"]["fault"]["count"]:
         v.append(f"LOG: {r['log']['fault']['count']} fault-like lines")
     return v
@@ -580,6 +646,8 @@ def render_md(r):
           f"- CPU cores mean: {r['cpu_cores_mean']}  WS max: {r['ws_mb_max']} MB  hot threads (tid -> % of a core): {r['hot_threads_cpu_pct_of_core']}"]
     if "rbx_dx11" in r:
         L.append(f"- RBX DX11 timings: {r['rbx_dx11']}")
+    if "perf" in r:
+        L.append(f"- Perf counters (perf.csv): {r['perf']}")
     if "audio" in r:
         L.append(f"- audio: {r['audio']}")
     L += ["", "## Log anomalies"]

@@ -33,6 +33,22 @@ static void sprite_filter_run(ID3D11ShaderResourceView *srv, uint32_t sw, uint32
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
+/* ---- [RBXPERF] counters (printed with RECOMP_GPU_STATS=1, parsed by scripts/diag/rbx_diag.py) ---- */
+static unsigned qpc_us(void);
+extern volatile LONG g_rbx_forced_catchups, g_rbx_fence_spurious, g_rbx_fence_timeouts; /* recomp_manual.c */
+extern volatile LONG g_rbx_mmio_traps;                                                    /* main.c */
+#ifdef RBX_HAVE_APU_VP
+extern unsigned rbx_apu_lock_waits(void), rbx_apu_lock_wait_timeouts(void);              /* patches/apu_vp_rbx.c */
+#else
+static unsigned rbx_apu_lock_waits(void) { return 0; }
+static unsigned rbx_apu_lock_wait_timeouts(void) { return 0; }
+#endif
+static unsigned st_rb_us, st_rb_n;            /* readback: time writing staging copies into guest memory, and count */
+static unsigned st_sh_us, st_sh_n, s_sh_total; /* combiner pixel shaders compiled (time, count, since boot) */
+static unsigned st_pub;                       /* frames handed to the window */
+static unsigned long long st_ft_sum, st_ft_max, s_ft_last; /* guest flip-to-flip time, QPC ticks */
+static unsigned st_ft_n, st_hitch33, st_hitch50, st_hitch100;  /* flip gaps over 33 / 50 / 100 ms */
+
 #define MAX_RT   8
 #define MAX_TEX  768
 #define VB_BYTES (8u * 1024u * 1024u)
@@ -366,8 +382,12 @@ static ID3D11PixelShader *combiner_shader(const Nv2aCombiner *c)
     if (!source) return NULL;
     memcpy(source, prefix, used);
     memcpy(source + used, k_hlsl_rc, sizeof k_hlsl_rc);
-    hr = D3DCompile(source, used + sizeof(k_hlsl_rc) - 1, "rbx_rc", NULL, NULL, "ps_rc", "ps_5_0",
-                    D3DCOMPILE_ENABLE_STRICTNESS, 0, &blob, &err);
+    {
+        unsigned sh0 = qpc_us();
+        hr = D3DCompile(source, used + sizeof(k_hlsl_rc) - 1, "rbx_rc", NULL, NULL, "ps_rc", "ps_5_0",
+                        D3DCOMPILE_ENABLE_STRICTNESS, 0, &blob, &err);
+        st_sh_us += qpc_us() - sh0; st_sh_n++; s_sh_total++;
+    }
     free(source);
     if (FAILED(hr)) {
         fprintf(stderr, "[RBX DX11] rc ps: %s\n", err ? (char *)ID3D10Blob_GetBufferPointer(err) : "?");
@@ -1966,6 +1986,7 @@ static void rb_write(ID3D11Texture2D *st, uint32_t va, uint32_t w, uint32_t h, u
     D3D11_MAPPED_SUBRESOURCE m;
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t y, x;
+    unsigned rb0 = qpc_us();
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &m))) return;
     if (w * h >= s_shot_w * s_shot_h) { s_shot_va = va; s_shot_w = w; s_shot_h = h; s_shot_pitch = pitch; s_shot_bpp = bpp; }
     if (s_fh > 0) { uint32_t yy; uint64_t hh = 1469598103934665603ULL; for (yy = 0; yy < h; yy++) hh = (hh ^ hash_bytes((const uint8_t *)m.pData + (size_t)yy * m.RowPitch, w * 4)) * 1099511628211ULL; fh_rth ^= hh; }
@@ -1983,6 +2004,7 @@ static void rb_write(ID3D11Texture2D *st, uint32_t va, uint32_t w, uint32_t h, u
         }
     }
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+    st_rb_us += qpc_us() - rb0; st_rb_n++;
 }
 
 /* RECOMP_GPU_SYNC_RB=1: copy and map in the same flip (the CPU waits for the GPU to finish the frame). */
@@ -2148,6 +2170,7 @@ static void publish_frame(void)
     present_dump(rt);
     rt->shown_dirty = 0;
     gpu_present_frame_ready();
+    st_pub++;
     if (s_fps_limit) {
         unsigned long long interval = gb_qf() / s_fps_limit;
         unsigned long long current = (unsigned long long)now.QuadPart;
@@ -2192,6 +2215,19 @@ static void gb_flip_impl(void)
     unsigned long now;
     if (!s_inited || s_failed) return;
     s_frame++; s_tick++; st_flips++;
+    {
+        LARGE_INTEGER q; unsigned long long d, qf = gb_qf();
+        QueryPerformanceCounter(&q);
+        if (s_ft_last) {
+            d = (unsigned long long)q.QuadPart - s_ft_last;
+            st_ft_sum += d; st_ft_n++;
+            if (d > st_ft_max) st_ft_max = d;
+            if (d * 1000ULL > qf * 33ULL) st_hitch33++;
+            if (d * 1000ULL > qf * 50ULL) st_hitch50++;
+            if (d * 1000ULL > qf * 100ULL) st_hitch100++;
+        }
+        s_ft_last = (unsigned long long)q.QuadPart;
+    }
     rbx_input_guest_frame = (LONG)s_frame;
     s_frame_for_grave = s_frame;
     texdump_poll();
@@ -2223,6 +2259,23 @@ static void gb_flip_impl(void)
                 (unsigned)(g_pb_t_xf * 1000ULL / gb_qf()), (unsigned)(g_pb_t_vsh * 1000ULL / gb_qf()),
                 (unsigned)((g_pb_t_xf > g_pb_t_vsh ? g_pb_t_xf - g_pb_t_vsh : 0) * 1000ULL / gb_qf()),
                 (unsigned)(g_pb_t_clip * 1000ULL / gb_qf()), (unsigned)(g_pb_t_flush * 1000ULL / gb_qf()), g_pb_n_xfverts);
+        {   /* [RBXPERF]: one line per stats window. Counters from other files are cumulative; print deltas. */
+            static LONG l_fc, l_fs, l_ft, l_mm; static unsigned l_lw, l_lt;
+            LONG fc = g_rbx_forced_catchups, fs = g_rbx_fence_spurious, ft = g_rbx_fence_timeouts, mm = g_rbx_mmio_traps;
+            unsigned lw = rbx_apu_lock_waits(), lt = rbx_apu_lock_wait_timeouts();
+            unsigned long long qf = gb_qf();
+            unsigned win_ms = (unsigned)(now - last);
+            fprintf(stderr, "[RBXPERF] ms=%u flips=%u pub=%u ft_avg_us=%u ft_max_us=%u hitch33=%u hitch50=%u hitch100=%u "
+                            "rb_n=%u rb_us=%u sh_n=%u sh_us=%u sh_total=%u catchup=%ld fence_early=%ld fence_timeout=%ld "
+                            "mmio_traps=%ld apu_lock_waits=%u apu_lock_timeouts=%u\n",
+                    win_ms, st_flips, st_pub,
+                    st_ft_n ? (unsigned)(st_ft_sum * 1000000ULL / qf / st_ft_n) : 0u, (unsigned)(st_ft_max * 1000000ULL / qf),
+                    st_hitch33, st_hitch50, st_hitch100, st_rb_n, st_rb_us, st_sh_n, st_sh_us, s_sh_total,
+                    (long)(fc - l_fc), (long)(fs - l_fs), (long)(ft - l_ft), (long)(mm - l_mm), lw - l_lw, lt - l_lt);
+            l_fc = fc; l_fs = fs; l_ft = ft; l_mm = mm; l_lw = lw; l_lt = lt;
+            st_rb_us = st_rb_n = st_sh_us = st_sh_n = st_pub = 0;
+            st_ft_sum = st_ft_max = 0; st_ft_n = st_hitch33 = st_hitch50 = st_hitch100 = 0;
+        }
         g_pb_scan_ticks = 0; g_pb_scan_segs = 0;
         g_pb_t_batch = g_pb_t_xf = g_pb_t_vsh = g_pb_t_clip = g_pb_t_flush = 0; g_pb_n_xfverts = 0;
         st_us_draw = st_us_clear = st_us_flip = 0;

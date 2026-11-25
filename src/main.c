@@ -263,6 +263,10 @@ typedef struct MCPXAPUState MCPXAPUState;
 extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 extern MCPXAPUState *g_apu_state;
 
+/* Hardware-register accesses handled by trapping (each costs an exception
+ * round trip); read by the [RBXPERF] stats line in rbx_d3d11.c. */
+volatile LONG g_rbx_mmio_traps;
+
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -286,8 +290,10 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
          * drives the APU directly, so the registers have to fault to be seen.
          * "Handled" means the access was decoded and the instruction stepped
          * over, so execution resumes instead of unwinding. */
-        if (xbox_VehMmioFault(ep))
+        if (xbox_VehMmioFault(ep)) {
+            InterlockedIncrement(&g_rbx_mmio_traps);
             return EXCEPTION_CONTINUE_EXECUTION;
+        }
 
         fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
             (unsigned long long)ep->ContextRecord->Rip,

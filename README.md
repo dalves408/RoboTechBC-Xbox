@@ -107,8 +107,32 @@ For repeatable input timing, use `--frame-pad "f360:a,f540:a,f720:a:18"` instead
 
 Add `--frame-dump-every 240` to capture numbered BMPs. On a second run add `--compare-frames analysis/diag/<first-run>/frames` to report matching frame numbers, missing captures, and mean RGB errors. Guest clocks and audio still run in real time, so matching input numbers alone do not guarantee pixel-identical frames.
 
+### Performance baseline and A/B
+
+Add `--gpu-stats` to any `rbx_diag.py` run. Every 2 s the game prints an `[RBXPERF]` line, and the report adds a `perf` summary and writes `perf.csv`:
+
+| Field | Meaning |
+| --- | --- |
+| `guest_fps`, `presented_fps` | Game flips per second, and frames handed to the window |
+| `frame_ms_avg`, `frame_ms_worst`, `hitches_over_33/50/100ms` | Flip-to-flip time on the pushbuffer thread |
+| `readback_ms_per_s` | Time spent copying render targets back into Xbox memory |
+| `shader_compiles`, `shader_compile_ms` | Combiner pixel shaders compiled during the run (each one is a hitch) |
+| `forced_get_catchups` | KickOff gave up waiting and marked unread pushbuffer commands as consumed |
+| `fence_early_wakes`, `fence_timeouts` | BlockOnFence woke before its fence; the 2 s recheck gave up |
+| `mmio_traps_per_s` | APU/USB register accesses handled by an exception trap |
+| `apu_lock_waits`, `apu_lock_timeouts` | Voice processor waits on the title's VOICE_LOCK, and waits that hit the limit |
+
+Compare two runs (for example a baseline and `--env RECOMP_XF_THREADS=4`):
+
+```powershell
+python scripts\diag\rbx_diag.py --secs 100 --gpu-stats --name base --keys $keys
+python scripts\diag\rbx_diag.py --secs 100 --gpu-stats --name xf4 --keys $keys --env RECOMP_XF_THREADS=4
+python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
+```
+
 | Tool | Use |
 | --- | --- |
+| `scripts\diag\perf_compare.py <runA> <runB>` | Side-by-side perf counters of two `--gpu-stats` runs. |
 | `scripts\diag\rbx_diag.py` | Harness: timed keys, fps/CPU/threads, frozen-frame + hang detection, audio WAV analysis. |
 | `scripts\diag\stackdump.py <pid>` | Symbolized stacks of every thread (guest functions show as `sub_XXXXXXXX`). |
 | `scripts\diag\flash_scan.py` | Finds flashing frames in a `RECOMP_GPU_PRESDUMP` capture. |
