@@ -49,7 +49,7 @@ static unsigned st_rb_us, st_rb_n;            /* readback: time writing staging 
 static unsigned st_sh_us, st_sh_n, s_sh_total; /* combiner pixel shaders compiled (time, count, since boot) */
 static unsigned st_pub;                       /* frames handed to the window */
 static unsigned st_rt_new, st_rt_evict, st_rt_alias; /* render targets created, evicted (LRU, MAX_RT), created for a VA that already had one */
-static unsigned st_pub_nort, st_pub_multi;   /* flips whose surface had no GPU target (window fell back to guest memory) / several */
+static unsigned st_pub_nort, st_pub_multi, st_rb_defer, st_rb_evict;   /* flips whose surface had no GPU target (window fell back to guest memory) / several */
 static unsigned long long st_ft_sum, st_ft_max, s_ft_last; /* guest flip-to-flip time, QPC ticks */
 static unsigned st_ft_n, st_hitch33, st_hitch50, st_hitch100;  /* flip gaps over 33 / 50 / 100 ms */
 
@@ -134,7 +134,7 @@ static int s_failed, s_inited, s_noalpha;
 static uint32_t s_frame, s_tick;
 static uint32_t st_th_fast, st_th_full, st_th_stale;
 static uint32_t st_rtsamples, st_draws, st_tris, st_culled, st_decodes, st_clears, st_hash_ns_us, st_flips;
-static int s_cull_on = 1, s_verbose, s_trace, s_rb_all, s_trace_all, s_trace_lines, s_rb_sync;
+static int s_cull_on = 1, s_verbose, s_trace, s_rb_every = 8, s_trace_all, s_trace_lines, s_rb_sync;
 static unsigned s_ta_lo, s_ta_hi;
 static int s_ta_sig;
 static uint64_t s_ta_seen[512];
@@ -382,7 +382,7 @@ static int gb_ready(void)
     if (s_failed) return 0;
     if (!s_inited) {
         s_inited = 1;
-        s_verbose = getenv("RECOMP_GPU_STATS") != NULL; s_trace = getenv("RECOMP_GPU_TRACE") != NULL; { const char *ta = getenv("RECOMP_GPU_TRACEALL"); s_trace_all = ta != NULL; if (ta && sscanf(ta, "%u-%u", &s_ta_lo, &s_ta_hi) != 2) { s_ta_lo = 0; s_ta_hi = 0xFFFFFFFFu; s_ta_sig = (ta[0] == (char)115); } } s_rb_all = getenv("RECOMP_GPU_SKIPRB") == NULL; /* default: read back every dirty RT (skipping sampled RTs stalled the game) */ s_rb_sync = getenv("RECOMP_GPU_SYNC_RB") != NULL;
+        s_verbose = getenv("RECOMP_GPU_STATS") != NULL; s_trace = getenv("RECOMP_GPU_TRACE") != NULL; { const char *ta = getenv("RECOMP_GPU_TRACEALL"); s_trace_all = ta != NULL; if (ta && sscanf(ta, "%u-%u", &s_ta_lo, &s_ta_hi) != 2) { s_ta_lo = 0; s_ta_hi = 0xFFFFFFFFu; s_ta_sig = (ta[0] == (char)115); } } { const char *re = getenv("RECOMP_GPU_RBEVERY"); s_rb_every = re ? atoi(re) : 8; if (s_rb_every < 0) s_rb_every = 1; if (getenv("RECOMP_GPU_SKIPRB")) s_rb_every = 0; } /* targets the GPU samples are read back every Nth flip (1 = every flip, 0 = never) */ s_rb_sync = getenv("RECOMP_GPU_SYNC_RB") != NULL;
         { const char *c = getenv("RECOMP_GPU_CULL"); if (c && c[0] == '0') s_cull_on = 0; }
         if (!gb_init()) { s_failed = 1; fprintf(stderr, "[RBX DX11] init failed\n"); return 0; }
     }
@@ -600,6 +600,7 @@ static void rt_seed_from_guest(Rt *rt, const Nv2aSurface *s)
 }
 
 static void readback_finish(Rt *rt);
+static void readback(Rt *rt);
 
 /* ---- partial clears ------------------------------------------------------
  * NV2A CLEAR_SURFACE has a per-channel colour mask (R 0x10, G 0x20, B 0x40,
@@ -697,6 +698,9 @@ static Rt *get_rt(const Nv2aSurface *s)
         /* Write its last queued copy to guest memory first: dropping it left guest memory a frame stale, and a
          * target re-created from it (or the window's guest-memory fallback) then showed an older frame. */
         if (s_rt[free_i].pend) readback_finish(&s_rt[free_i]);
+        /* A sampled target whose readback was deferred (RECOMP_GPU_RBEVERY) still holds newer pixels than guest
+         * memory: write them now, once, so a re-created target seeds from the right image. */
+        if (s_rt[free_i].dirty && s_rt[free_i].stage && s_rb_every != 0) { readback(&s_rt[free_i]); st_rb_evict++; }
         if (s_evicted_n < 8) s_evicted[s_evicted_n++] = s_rt[free_i].va;
         else { memmove(s_evicted, s_evicted + 1, 7 * sizeof s_evicted[0]); s_evicted[7] = s_rt[free_i].va; }
         rt_release(&s_rt[free_i]);
@@ -2382,7 +2386,16 @@ static void publish_frame(void)
         }
         if (n > 1) st_pub_multi++;
     }
-    if (!rt) { st_pub_nort++; if (s_share_on) { gpu_present_set_source(NULL, 0, 0); s_share_on = 0; } return; }
+    /* No GPU target at the flip VA. One such flip (seen once per boot) used to switch the window to guest memory and
+     * leave it there: s_share_on went to 0 but the texture stayed, so a later frame of the same size never handed
+     * it back. Keep the last GPU frame for a few flips; only a run of them (the game drawing on the CPU) falls back,
+     * and share_close() makes the next GPU frame re-attach. RECOMP_GPU_NORTFLIPS sets the run (default 3). */
+    {
+        static int nort_limit = -1; static unsigned nort_run;
+        if (nort_limit < 0) { const char *e = getenv("RECOMP_GPU_NORTFLIPS"); nort_limit = e ? atoi(e) : 3; if (nort_limit < 1) nort_limit = 1; }
+        if (!rt) { st_pub_nort++; if (++nort_run >= (unsigned)nort_limit) share_close(); return; }
+        nort_run = 0;
+    }
     if (!rt->shown_dirty && s_share_on) return;
     if (s_fps_limit != last_limit) { next_frame = 0; last_limit = s_fps_limit; }
     if (s_fps_limit) {
@@ -2505,7 +2518,14 @@ static void gb_flip_impl(void)
     s_shot_w = s_shot_h = 0;
     for (i = 0; i < MAX_RT; i++)
         if (s_rt[i].tex && s_rt[i].dirty) {
-            if (s_rt[i].sampled + 2 >= s_frame && !s_rb_all) { s_rt[i].dirty = 0; continue; }
+            /* The GPU samples this target from its live texture, so guest memory only serves CPU reads (save
+             * thumbnails, the window fallback, re-seeding after eviction). Reading it back every flip cost ~40 ms/s
+             * on the bench. Every Nth flip, staggered per slot, keeps guest memory at most N flips old.
+             * Never reading it back (RECOMP_GPU_SKIPRB=1) once stalled the game, so 0 stays opt-in. */
+            if (s_rt[i].sampled + 2 >= s_frame && s_rb_every != 1) {
+                if (s_rb_every == 0) { s_rt[i].dirty = 0; continue; }
+                if ((s_frame + (unsigned)i) % (unsigned)s_rb_every) { st_rb_defer++; continue; }   /* stays dirty */
+            }
             if (s_rb_sync) readback(&s_rt[i]); else readback_start(&s_rt[i]);
         }
     gb_mark(4);
@@ -2533,16 +2553,16 @@ static void gb_flip_impl(void)
             fprintf(stderr, "[RBXPERF] ms=%u flips=%u pub=%u ft_avg_us=%u ft_max_us=%u hitch33=%u hitch50=%u hitch100=%u "
                             "rb_n=%u rb_us=%u sh_n=%u sh_us=%u sh_total=%u sh_hits=%u catchup=%ld fence_early=%ld fence_timeout=%ld "
                             "mmio_traps=%ld apu_lock_waits=%u apu_lock_timeouts=%u fence_wait_us=%ld pb_drops=%u pb_midwalk_get=%u "
-                            "rt_new=%u rt_evict=%u rt_alias=%u pub_nort=%u pub_multi=%u clear_partial=%u\n",
+                            "rt_new=%u rt_evict=%u rt_alias=%u pub_nort=%u pub_multi=%u clear_partial=%u rb_defer=%u rb_evict=%u\n",
                     win_ms, st_flips, st_pub,
                     st_ft_n ? (unsigned)(st_ft_sum * 1000000ULL / qf / st_ft_n) : 0u, (unsigned)(st_ft_max * 1000000ULL / qf),
                     st_hitch33, st_hitch50, st_hitch100, st_rb_n, st_rb_us, st_sh_n, st_sh_us, s_sh_total, st_sh_hits,
                     (long)(fc - l_fc), (long)(fs - l_fs), (long)(ft - l_ft), (long)(mm - l_mm), lw - l_lw, lt - l_lt,
                     (long)(fw - l_fw), pd - l_pd, pm - l_pm,
-                    st_rt_new, st_rt_evict, st_rt_alias, st_pub_nort, st_pub_multi, st_clear_partial);
+                    st_rt_new, st_rt_evict, st_rt_alias, st_pub_nort, st_pub_multi, st_clear_partial, st_rb_defer, st_rb_evict);
             l_fc = fc; l_fs = fs; l_ft = ft; l_mm = mm; l_lw = lw; l_lt = lt; l_fw = fw; l_pd = pd; l_pm = pm;
             st_rb_us = st_rb_n = st_sh_us = st_sh_n = st_sh_hits = st_pub = 0;
-            st_rt_new = st_rt_evict = st_rt_alias = st_pub_nort = st_pub_multi = st_clear_partial = 0;
+            st_rt_new = st_rt_evict = st_rt_alias = st_pub_nort = st_pub_multi = st_clear_partial = st_rb_defer = st_rb_evict = 0;
             st_ft_sum = st_ft_max = 0; st_ft_n = st_hitch33 = st_hitch50 = st_hitch100 = 0;
         }
         g_pb_scan_ticks = 0; g_pb_scan_segs = 0;

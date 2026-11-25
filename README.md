@@ -148,6 +148,8 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 | `RECOMP_FENCE_EVENT=0` | A/B only: BlockOnFence's recheck spins again instead of sleeping until the pushbuffer walk writes the fence. |
 | `RECOMP_GPU_CLEARFULL=1` | A/B only: colour clears wipe the whole target again, ignoring the clear rectangle and channel mask. |
 | `RECOMP_GPU_RTSEED=0` | A/B only: new render targets start black again instead of copying the image already at that address. |
+| `RECOMP_GPU_RBEVERY=N` | Render targets the GPU also samples are written back to guest memory every Nth flip (default 8). `1` restores every flip; `RECOMP_GPU_SKIPRB=1` means never. |
+| `RECOMP_GPU_NORTFLIPS=N` | Flips with no GPU image before the window falls back to guest memory (default 3). |
 | `RECOMP_GPU_PUBFIRST=1` | A/B only: the window shows the first render target at the flip address instead of the largest, most recent one. |
 | `RECOMP_KICK_STALL_MS=n` | How long KickOff waits with no pushbuffer-walk progress before forcing GET to PUT (default 500). Forced catch-ups drop commands; they show as `forced_get_catchups` in `--gpu-stats` runs. |
 | `RECOMP_KICK_FORCE_MS=n` | A/B only: restores the old behaviour, forcing GET to PUT after a fixed n ms whether or not the walk is moving. |

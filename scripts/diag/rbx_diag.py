@@ -182,7 +182,7 @@ PERF_FIELDS = ["ms", "flips", "pub", "ft_avg_us", "ft_max_us", "hitch33", "hitch
                "rb_n", "rb_us", "sh_n", "sh_us", "sh_total", "catchup", "fence_early", "fence_timeout",
                "mmio_traps", "apu_lock_waits", "apu_lock_timeouts", "sh_hits", "fence_wait_us",
                "pb_drops", "pb_midwalk_get", "rt_new", "rt_evict", "rt_alias", "pub_nort", "pub_multi",
-               "clear_partial"]
+               "clear_partial", "rb_defer", "rb_evict"]
 XA2_UNDERRUN = re.compile(r"^\[XA2\] underrun x(\d+)\b")
 AUDIO_HOST_UNDERRUN = re.compile(r"^\[AUDIO-HOST\].*\bunderruns=(\d+)\b")
 FRAME_PRESS = re.compile(r"^\[RBX PAD\] (\w+) observed at f(\d+) \(scheduled f(\d+)\)$", re.M)
@@ -307,6 +307,7 @@ def summarize_perf(perf, out: Path):
         "rt_created": total("rt_new"), "rt_evicted": total("rt_evict"), "rt_alias_created": total("rt_alias"),
         "flips_without_gpu_target": total("pub_nort"), "flips_with_several_targets": total("pub_multi"),
         "partial_clears": total("clear_partial"),
+        "readbacks_deferred": total("rb_defer"), "readbacks_at_eviction": total("rb_evict"),
     }
 
 
