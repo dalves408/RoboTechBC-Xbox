@@ -1944,8 +1944,8 @@ static uint32_t vertex_color(uint32_t index)
  * texturing, combiners and depth buffer.
  *
  * ponytail: no texture-coordinate generation or texture matrices (texture
- * coordinates are taken from the attribute streams as they are), no fog
- * coordinate, no specular, no point sprites. */
+ * coordinates are taken from the attribute streams as they are), no
+ * specular, no point sprites. The fog coordinate is ffp_fog_coord(). */
 
 /* Is this batch transformed by the fixed-function unit? Inline-array
  * (DrawPrimitiveUP-style) batches are transformed too: fetch_attr reads their
@@ -2079,6 +2079,66 @@ static int lit_color(uint32_t index, float out[4])
     return 1;
 }
 
+/* RBX: the fixed-function fog coordinate (SET_FOG_GEN_MODE, 0x02A0), as the
+ * hardware makes it from the eye-space position (xemu's fixed-function
+ * shader, NV_fog_distance): RADIAL is the distance to the eye, PLANAR /
+ * ABS_PLANAR the distance to SET_FOG_PLANE (c[57]), FOG_X the vertex's fog
+ * attribute, SPEC_ALPHA the specular colour's alpha. fog_factor() turns it
+ * into the per-vertex factor, as for a program's oFog.x.
+ *
+ * Leaving it 0 (as before) gave every fixed-function mesh -- the mission
+ * world, terrain, buildings, sky -- a fog factor of 1: no distance fog at all,
+ * so the game's draw distance and level-of-detail switches, which its fog
+ * hides on the console, showed as pop-in. RECOMP_FFP_FOG=0 restores that. */
+static int ffp_fog_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_FFP_FOG");
+        on = !(e && e[0] == '0');
+        if (!on)
+            fprintf(stderr, "[RBX XF] fixed-function fog off (RECOMP_FFP_FOG=0)\n");
+    }
+    return on;
+}
+
+static float ffp_fog_coord(uint32_t index, const float pos[4])
+{
+    const float *mv = (const float *)&s_reg[0x0480 / 4];
+    uint32_t gen = s_reg[0x02A0 / 4];
+    float e[3], a[4], d;
+    int i;
+
+    {   /* Say once which fog generation modes the title uses. */
+        static volatile LONG seen;
+        LONG bit = 1L << (gen & 7);
+        if (!(seen & bit) && !(InterlockedOr(&seen, bit) & bit))
+            fprintf(stderr, "[RBX XF] fixed-function fog: gen mode %u, fog mode 0x%X, params %g %g\n",
+                    (unsigned)gen, (unsigned)s_gpu.fog_mode,
+                    s_gpu.fog_param[0], s_gpu.fog_param[1]);
+    }
+    switch (gen) {
+    case 0:                                         /* SPEC_ALPHA */
+        if (!fetch_attr(&s_gpu.attr[4], index, a))
+            return 0.0f;
+        return a[3] < 0.0f ? 0.0f : a[3] > 1.0f ? 1.0f : a[3];
+    case 6:                                         /* FOG_X */
+        return fetch_attr(&s_gpu.attr[5], index, a) ? a[0] : 0.0f;
+    default:
+        break;
+    }
+    for (i = 0; i < 3; i++)
+        e[i] = mv[4 * i] * pos[0] + mv[4 * i + 1] * pos[1]
+             + mv[4 * i + 2] * pos[2] + mv[4 * i + 3] * pos[3];
+    if (gen == 1)                                   /* RADIAL */
+        return sqrtf(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]);
+    {                                               /* PLANAR, ABS_PLANAR */
+        const float *fp = nv2a_vsh_constant(57);
+        d = fp[0] * e[0] + fp[1] * e[1] + fp[2] * e[2] + fp[3];
+        return gen == 3 ? fabsf(d) : d;
+    }
+}
+
 /* One fixed-function vertex, in the shape a vertex program produces. */
 static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
 {
@@ -2112,6 +2172,8 @@ static int ffp_vertex(uint32_t index, Nv2aVshOutput *out)
     out->pos[1] = (clip[1] / w + off[1]) * s_gpu.aa_sy;
     out->pos[2] = clip[2] / w + off[2];
     out->pos[3] = w;
+    if (s_gpu.fog_enable && ffp_fog_on())
+        out->fog[0] = out->fog[1] = out->fog[2] = out->fog[3] = ffp_fog_coord(index, in);
 
     if (!lit_color(index, c) && !fetch_attr(color_attr(), index, c))
         c[0] = c[1] = c[2] = c[3] = 1.0f;

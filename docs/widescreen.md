@@ -32,10 +32,11 @@ With `Off` every new term is an identity (no extra pixels, `wsq = 0`, no `u` off
 
 ## Known limits
 
-- **Edge pop-in.** The game culls objects against its own 4:3 view, so small objects (enemies, props) can appear
-  late at the far left and right; large meshes (terrain, sky, buildings that reach into the 4:3 view) fill the sides.
-  Fixing that needs the game's projection or culling aspect patched (look for `1.3333334f`, `0x3FAAAAAB`, in the
-  XBE's data or the camera setup).
+- **Edge pop-in (fixed).** The game culls objects against its own view frustum, built by `0x12B670` from the 4:3
+  view's extents at the near plane (called by the camera setup at `0x113310` / `0x113C50`). `sub_0012B670` in
+  `src/recomp_manual.c` widens the frustum's x extents by the widescreen factor (+2%) before the game builds its
+  planes, so objects in the side areas are no longer culled. The projection matrix is computed separately and
+  stays 4:3, so the picture does not change. `RECOMP_RBX_WIDE_CULL=0` turns it off (A/B).
 - **HUD is centred, not edge-anchored.** Radar and gauges stay inside the centred 4:3 rather than moving to the
   screen corners.
 - **Heuristic for full-screen passes.** A full-width, screen-flat, textured quad that samples ordinary textures is

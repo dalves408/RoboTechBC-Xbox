@@ -548,6 +548,42 @@ static void xpp_log(uint32_t va, recomp_func_t fn, volatile LONG *cnt)
 XPP_LIST(XPP_WRAP)
 #endif /* RBX_XPP_TRACE */
 
+/* RBX widescreen culling. The camera code (0x113310 / 0x113C50) builds its view
+ * frustum with 0x12B670(planes, near, far, x0, x1, y0, y1), the x and y extents
+ * of the 4:3 view at the near plane. The renderer draws Hor+ (src/rbx_d3d11.c):
+ * geometry past the 4:3 edges lands in the side areas, but the game had culled
+ * whatever lay wholly outside its 4:3 frustum, so objects popped in at the sides.
+ * Widen only the culling planes' x extents by the widescreen factor (+2% margin);
+ * the projection matrix, which the camera computes separately, stays 4:3, so the
+ * picture is unchanged. RECOMP_RBX_WIDE_CULL=0 turns it off.
+ * scripts/patch_kickoff_yield.ps1 renames the generated function to _orig. */
+extern float rbx_wide_factor(void);
+extern void sub_0012B670_orig(void);
+void sub_0012B670(void)
+{
+    static int on = -1;
+    uint32_t sp = g_esp;
+    float k, x0, x1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_RBX_WIDE_CULL");
+        on = !(e && e[0] == '0');
+    }
+    k = on ? rbx_wide_factor() : 1.0f;
+    if (!(k > 1.001f)) {
+        sub_0012B670_orig();
+        return;
+    }
+    k *= 1.02f;
+    x0 = MEMF(sp + 16);
+    x1 = MEMF(sp + 20);
+    MEMF(sp + 16) = x0 * k;
+    MEMF(sp + 20) = x1 * k;
+    sub_0012B670_orig();
+    /* The caller owns its argument slots: give them back as they were. */
+    MEMF(sp + 16) = x0;
+    MEMF(sp + 20) = x1;
+}
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
     if (xbox_va == 0x00155730u) {

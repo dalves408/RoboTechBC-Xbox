@@ -186,6 +186,8 @@ static Ds s_ds[4];
  * a target from guest memory stretches it back. The window gets the wide frame and its aspect.
  * s_wide = target aspect / (4:3); 1 = off. Changed only between frames (video_apply), which rebuilds the targets. */
 static float s_wide = 1.0f;
+/* For the game's frustum culling (sub_0012B670 in recomp_manual.c): how much wider than 4:3 the view is. */
+float rbx_wide_factor(void) { return s_wide; }
 
 /* Guest pixels to add each side of a surface: only the game's full-screen size gets wider. */
 static uint32_t wide_extra(uint32_t w, uint32_t h, uint32_t ax, uint32_t ay)
