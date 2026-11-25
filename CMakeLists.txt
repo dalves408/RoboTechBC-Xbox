@@ -28,6 +28,7 @@ set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/xboxrecomp" CACHE PATH
 
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 include(patches/rbx_virtual_disk.cmake)
+include(patches/rbx_present.cmake)
 
 # Interactive pad input for this title requires bak OHCI. Shared toolkit
 # ohci.c is frequently overwritten by XAPI_TD WIP (empty interrupt EDs /

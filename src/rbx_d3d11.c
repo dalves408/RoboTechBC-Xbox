@@ -114,7 +114,28 @@ static unsigned s_vb_i, s_cb_i;
 static uint32_t s_xvb_off;
 static unsigned s_vendor, s_flush_mode, s_flush_tex; /* RECOMP_GPU_FLUSH_TEX=1: flush before and after every texture (re)creation */        /* RECOMP_GPU_FLUSH: 0 none, 1 P8 512-wide glyph draws, 2 all textured draws, 3 every draw; default 3 on Intel (0x8086), 0 elsewhere */
 static unsigned long s_defer_n; static struct { IUnknown *o; uint32_t f; } s_grave[4096];
-static ID3D11RasterizerState *s_rs;
+static ID3D11RasterizerState *s_rs, *s_rs_split;
+static uint32_t s_split_va;
+static unsigned s_split_top, s_split_bottom;
+
+/* Each Xbox Versus camera starts with a depth/stencil clear over its half
+ * of the 640x480 back buffer. Constrain its draws to that half so the next
+ * camera cannot overwrite it. Offscreen passes leave the split intact. */
+void rbx_d3d11_clear_rect(uint32_t va, unsigned width, unsigned height, unsigned aa_x,
+                          uint32_t flags, uint32_t horizontal, uint32_t vertical)
+{
+    unsigned top = vertical & 0xffffu;
+    unsigned bottom = (vertical >> 16) + 1;
+    if ((flags & 3u) && height == 480 && width == 640 * aa_x &&
+        horizontal == 0x027f0000u && bottom == top + height / 2 &&
+        (top == 0 || bottom == height)) {
+        s_split_va = va;
+        s_split_top = top;
+        s_split_bottom = bottom;
+    } else if (va == s_split_va) {
+        s_split_va = 0;
+    }
+}
 static ID3D11Texture2D *s_white;
 static ID3D11ShaderResourceView *s_white_srv;
 static uint32_t s_vb_off;
@@ -342,6 +363,8 @@ static int gb_init(void)
     rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE; rd.ScissorEnable = FALSE;
     rd.MultisampleEnable = TRUE;
     ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs);
+    rd.ScissorEnable = TRUE;
+    ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs_split);
     memset(&td, 0, sizeof td);
     td.Width = td.Height = 1; td.MipLevels = td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -2178,7 +2201,13 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
             layer_draw ? s_sf_dsv : (!force_white && ds ? ds->dsv : NULL));
         ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
         ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss, r->stencil_ref & 0xFF);
-        ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+        if (!layer_draw && s_rs_split && s_split_va && s_split_va == s->color_va) {
+            D3D11_RECT rect = { 0, s_split_top * s_scale, s->width * s_scale, s_split_bottom * s_scale };
+            ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &rect);
+            ID3D11DeviceContext_RSSetState(s_ctx, s_rs_split);
+        } else {
+            ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+        }
         /* Pixel-centre shift, default +0.5 px (RECOMP_GPU_PIXOFS=<px> overrides, 0 = the old mapping). */
         { static float po = -1.0f; if (po < 0) { const char *e = getenv("RECOMP_GPU_PIXOFS"); po = e ? (float)atof(e) : 0.5f; if (po < 0) po = 0; }
           if (layer_draw) { vp.TopLeftX = po * (float)SF_W / (float)s->width; vp.TopLeftY = po * (float)SF_H / (float)s->height; }
@@ -2302,13 +2331,39 @@ extern void gpu_present_frame_ready(void);
 extern volatile LONG rbx_input_guest_frame;
 static ID3D11Texture2D *s_share;
 static IDXGIKeyedMutex *s_share_mutex;
+static ID3D11Texture2D *s_share_retired;
 static uint32_t s_share_w, s_share_h;
 static int s_share_failed, s_share_on;
+static HANDLE s_share_handle;
+static volatile LONG s_share_abandoned;
+static unsigned s_share_serial;
+
+int rbx_present_trace(void)
+{
+    static volatile LONG mode;
+    LONG value = mode;
+    if (!value) {
+        const char *option = getenv("RECOMP_RBX_PRESENT_TRACE");
+        value = option && option[0] == '1' ? 1 : -1;
+        InterlockedExchange(&mode, value);
+    }
+    return value > 0;
+}
+
+void rbx_present_abandoned(void)
+{
+    InterlockedExchange(&s_share_abandoned, 1);
+}
 
 static void share_close(void)
 {
-    if (s_share_on) { gpu_present_set_source(NULL, 0, 0); s_share_on = 0; }
-    SAFE_REL(s_share_mutex); SAFE_REL(s_share);
+    if (s_share_on || s_share_retired)
+        gpu_present_set_source(NULL, 0, 0);
+    s_share_on = 0;
+    SAFE_REL(s_share_retired);
+    SAFE_REL(s_share_mutex);
+    SAFE_REL(s_share);
+    s_share_handle = NULL;
     s_share_w = s_share_h = 0;
 }
 
@@ -2372,6 +2427,8 @@ static void publish_frame(void)
     int i;
     Rt *rt = NULL;
     if (s_share_failed) return;
+    if (InterlockedExchange(&s_share_abandoned, 0))
+        share_close();
     {   /* Several targets can share the flip VA (the game changed the clip on that buffer). Showing whichever came
          * first in the table made the window alternate between them. Show the biggest; among equals, the one
          * drawn most recently. RECOMP_GPU_PUBFIRST=1 = old behaviour. */
@@ -2408,7 +2465,14 @@ static void publish_frame(void)
             D3D11_TEXTURE2D_DESC td;
             IDXGIResource *res = NULL;
             HANDLE handle = NULL;
-            share_close();
+            /* Keep the old completed frame visible until the replacement is ready. */
+            if (s_share_on) {
+                s_share_retired = s_share;
+                s_share = NULL;
+                s_share_on = 0;
+            }
+            SAFE_REL(s_share_mutex);
+            SAFE_REL(s_share);
             memset(&td, 0, sizeof td);
             td.Width = w; td.Height = h; td.MipLevels = td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
             td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -2425,8 +2489,7 @@ static void publish_frame(void)
             }
             SAFE_REL(res);
             s_share_w = w; s_share_h = h;
-            gpu_present_set_source(handle, w, h);
-            s_share_on = 1;
+            s_share_handle = handle;
         }
         /* Always refresh logical aspect: AA 1280×480 must letterbox as 640×480 (4:3). */
         {
@@ -2439,15 +2502,35 @@ static void publish_frame(void)
     }
     /* 0 ms: never block the PB/GPU thread on the window's present hold.
      * A multi-ms wait here was part of the Ch1 BusyLoop/present death spiral. */
-    if (FAILED(IDXGIKeyedMutex_AcquireSync(s_share_mutex, 0, 0))) return;
+    HRESULT acquired = IDXGIKeyedMutex_AcquireSync(s_share_mutex, 0, 0);
+    if (acquired != S_OK) {
+        if (rbx_present_trace())
+            fprintf(stderr, "[RBX PRESENT] write va=%08X frame=%u acquire=%08lX\n",
+                    va, s_frame, (unsigned long)acquired);
+        if (acquired == WAIT_ABANDONED)
+            share_close();
+        return;
+    }
     rt_resolve(rt);
     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_share, (ID3D11Resource *)rt->tex);
     ID3D11DeviceContext_Flush(s_ctx);
-    IDXGIKeyedMutex_ReleaseSync(s_share_mutex, 0);
-    present_dump(rt);
+    HRESULT released = IDXGIKeyedMutex_ReleaseSync(s_share_mutex, 0);
+    if (released != S_OK) {
+        share_close();
+        return;
+    }
+    if (!s_share_on) {
+        gpu_present_set_source(s_share_handle, s_share_w, s_share_h);
+        s_share_on = 1;
+        SAFE_REL(s_share_retired);
+    }
     rt->shown_dirty = 0;
+    if (rbx_present_trace())
+        fprintf(stderr, "[RBX PRESENT] write serial=%u va=%08X frame=%u tex=%ux%u\n",
+                ++s_share_serial, va, s_frame, s_share_w, s_share_h);
     gpu_present_frame_ready();
     st_pub++;
+    present_dump(rt);
     if (s_fps_limit) {
         unsigned long long interval = gb_qf() / s_fps_limit;
         unsigned long long current = (unsigned long long)now.QuadPart;
@@ -2491,6 +2574,7 @@ static void gb_flip_impl(void)
     static unsigned long last;
     unsigned long now;
     if (!s_inited || s_failed) return;
+    s_split_va = 0;
     s_frame++; s_tick++; st_flips++;
     {
         LARGE_INTEGER q; unsigned long long d, qf = gb_qf();
