@@ -3345,37 +3345,64 @@ static void raster_xf_clip_slow(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
         raster_xf_triangle(&p0[0], &p0[i], &p0[i + 1]);
 }
 
+/* Near-plane class of a transformed vertex: 0 = no finite position (the
+ * triangle is dropped), 1 = in front of a near plane (needs clipping),
+ * 3 = inside. */
+static int xf_vclass(const Nv2aVshOutput *v, int near_z)
+{
+    float w = v->pos[3];
+    float d = w - NV_CLIP_W;
+    int inside = 1;
+    if (d != d || d - d != 0.0f)
+        return 0;
+    if (d < 0.0f)
+        inside = 0;
+    if (near_z) {
+        float z = v->pos[2] * w;
+        d = z - s_xf_o[2] * w;
+        if (d != d || d - d != 0.0f)
+            return 0;                         /* not finite: no position at all */
+        if (d < 0.0f)
+            inside = 0;
+    }
+    return inside ? 3 : 1;
+}
+
 static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
                               const Nv2aVshOutput *c)
 {
+    /* RBX: a strip or indexed mesh tests each vertex for two or three
+     * triangles; keep each slot's class for the batch (s_bvc_gen). */
     static int near_z = -1;
+    static uint8_t *cls;
+    static uint32_t *cls_gen;
     const Nv2aVshOutput *in[3];
-    int i, inside = 1;
+    int i, k[3];
 
     if (near_z < 0) {
         const char *e = getenv("RECOMP_CLIP_NEAR_Z");
         near_z = !(e && e[0] == '0');
+        cls = (uint8_t *)malloc(NV_MAX_INDICES);
+        cls_gen = (uint32_t *)calloc(NV_MAX_INDICES, sizeof *cls_gen);
+        if (!cls || !cls_gen) { free(cls); free(cls_gen); cls = NULL; cls_gen = NULL; }
     }
     in[0] = a; in[1] = b; in[2] = c;
-    /* Only W and Z contribute to the near planes. Compute X and Y in
-     * clip space only for triangles that need polygon clipping. */
     for (i = 0; i < 3; i++) {
-        float w = in[i]->pos[3];
-        float d = w - NV_CLIP_W;
-        if (d != d || d - d != 0.0f)
-            return;
-        if (d < 0.0f)
-            inside = 0;
-        if (near_z) {
-            float z = in[i]->pos[2] * w;
-            d = z - s_xf_o[2] * w;
-            if (d != d || d - d != 0.0f)
-                return;                       /* not finite: no position at all */
-            if (d < 0.0f)
-                inside = 0;
+        const Nv2aVshOutput *v = in[i];
+        if (cls && s_xf && v >= s_xf && v < s_xf + NV_MAX_INDICES) {
+            uint32_t slot = (uint32_t)(v - s_xf);
+            if (cls_gen[slot] != s_bvc_gen) {
+                cls[slot] = (uint8_t)xf_vclass(v, near_z);
+                cls_gen[slot] = s_bvc_gen;
+            }
+            k[i] = cls[slot];
+        } else {
+            k[i] = xf_vclass(v, near_z);
         }
+        if (!k[i])
+            return;
     }
-    if (inside)
+    if ((k[0] & k[1] & k[2]) == 3)
         raster_xf_triangle(a, b, c);
     else
         raster_xf_clip_slow(a, b, c, near_z ? 2 : 1);
@@ -3555,11 +3582,33 @@ static void vsh_fast_ba9e(uint32_t index, Nv2aVshOutput *o)
     for (t = 0; t < 4; t++) vsh_in(9 + (uint32_t)t, index, o->tex[t]);
 }
 
+/* 892CED0FDB0FB299 / E0318D6247FFFA7A (same words, start 0 or 23; morph):
+ * R3 = v0 * c100.y + v2 * c100.x; oPos = R3 * c96..99; oD0 = v4; oT0 = v5;
+ * oFog.x = (R3.c110) * c106.x + c106.y */
+static void vsh_fast_892c(uint32_t index, Nv2aVshOutput *o)
+{
+    float v0[4], v2[4], v4[4], r3[4], r4z;
+    const float *c100 = nv2a_vsh_constant(100), *c106 = nv2a_vsh_constant(106);
+    int k;
+    vsh_in(0, index, v0); vsh_in(2, index, v2); vsh_in(4, index, v4);
+    vsh_defaults(o);
+    for (k = 0; k < 4; k++) r3[k] = v0[k] * c100[1] + v2[k] * c100[0];
+    vsh_color(o->d0, v4);
+    o->d0_written = 1;
+    r4z = vsh_dp4(r3, nv2a_vsh_constant(110));
+    vsh_in(5, index, o->tex[0]);
+    for (k = 0; k < 4; k++) o->pos[k] = vsh_dp4(r3, nv2a_vsh_constant(96 + k));
+    o->fog[0] = r4z * c106[0] + c106[1];
+    vsh_epilogue(o);
+}
+
 typedef void (*VshFastFn)(uint32_t, Nv2aVshOutput *);
 static struct { uint64_t hash; VshFastFn fn; volatile LONG off, ok; } s_vsh_fast[] = {
     { 0x0B25A84A2631EC80ULL, vsh_fast_0b25, 0, 0 },
     { 0x9CEE4A21EBB77FF1ULL, vsh_fast_9cee, 0, 0 },
     { 0xBA9E387C24FCECE1ULL, vsh_fast_ba9e, 0, 0 },
+    { 0x892CED0FDB0FB299ULL, vsh_fast_892c, 0, 0 },
+    { 0xE0318D6247FFFA7AULL, vsh_fast_892c, 0, 0 },
 };
 
 /* The fast transform for the batch's program, or -1 when there is none. */
