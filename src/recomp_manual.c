@@ -633,12 +633,59 @@ void sub_000242B0(void)
     }
 }
 
+/* RECOMP_RBX_PAUSE_LOG=1 also names the callers of the pad read (0x111410)
+ * and of the menu update/draw (0x24060): each new caller once, then, every
+ * game second, how often each was called. While the pause menu is up, that
+ * shows which loop drives it. */
+extern void sub_00111410_orig(void);
+#define RBX_CALLERS 32
+static struct { uint32_t fn, ret; unsigned long n; } s_callers[RBX_CALLERS];
+static int s_ncallers;
+
+static void rbx_note_caller(uint32_t fn)
+{
+    static int log = -1;
+    static DWORD last;
+    uint32_t ret = MEM32(g_esp);
+    int i;
+    if (log < 0) log = rbx_menu_flag("RECOMP_RBX_PAUSE_LOG", 0);
+    if (!log) return;
+    for (i = 0; i < s_ncallers; i++)
+        if (s_callers[i].fn == fn && s_callers[i].ret == ret) break;
+    if (i == s_ncallers) {
+        if (i == RBX_CALLERS) return;
+        s_callers[i].fn = fn; s_callers[i].ret = ret; s_callers[i].n = 0; s_ncallers++;
+        fprintf(stderr, "[RBX PAUSE] new caller of %06X: return %08X (paused %u, clock %u, menu loop %ld)\n",
+                fn, ret, MEM32(0x001E628Cu), MEM32(0x0023A48Cu), (long)s_menu_loop);
+        fflush(stderr);
+    }
+    s_callers[i].n++;
+    if (GetTickCount() - last >= 1000) {
+        last = GetTickCount();
+        fprintf(stderr, "[RBX PAUSE] last second (paused %u):", MEM32(0x001E628Cu));
+        for (i = 0; i < s_ncallers; i++) {
+            if (s_callers[i].n)
+                fprintf(stderr, " %06X<-%08X x%lu", s_callers[i].fn, s_callers[i].ret, s_callers[i].n);
+            s_callers[i].n = 0;
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+}
+
+void sub_00111410(void)
+{
+    rbx_note_caller(0x111410u);
+    sub_00111410_orig();
+}
+
 void sub_00024060(void)
 {
     static int on = -1;
     static HANDLE timer;
     static LARGE_INTEGER freq;
     static LONGLONG next;
+    rbx_note_caller(0x24060u);
     if (on < 0) {
         on = rbx_menu_flag("RECOMP_RBX_MENU_PACE", 1);
         QueryPerformanceFrequency(&freq);
