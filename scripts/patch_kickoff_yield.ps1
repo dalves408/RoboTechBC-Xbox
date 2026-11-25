@@ -108,3 +108,21 @@ if (Test-Path $stubs) {
         Write-Output "already patched: $stubs"
     }
 }
+
+# The camera's frustum builder (0x12B670) is wrapped by sub_0012B670 in
+# recomp_manual.c, which widens its x extents for widescreen (side pop-in).
+$gen = Join-Path $root 'src\recomp\gen'
+$hit = $false
+foreach ($f in Get-ChildItem -Path $gen -Filter 'recomp_*.c') {
+    $ft = [IO.File]::ReadAllText($f.FullName)
+    if ($ft -match 'void sub_0012B670_orig\(void\)') { $hit = $true; Write-Output "already patched: $($f.FullName) (0x12B670)"; break }
+    $re = [regex]'void sub_0012B670\(void\)(\s*)\{'
+    if ($re.IsMatch($ft)) {
+        $ft = $re.Replace($ft, '/* RBX: renamed; wrapped by sub_0012B670 in src/recomp_manual.c (widescreen culling). */' + "`n" + 'void sub_0012B670_orig(void)$1{', 1)
+        [IO.File]::WriteAllText($f.FullName, $ft)
+        Write-Output "patched $($f.FullName) (0x12B670)"
+        $hit = $true
+        break
+    }
+}
+if (-not $hit) { throw "sub_0012B670 definition not found in $gen" }

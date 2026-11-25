@@ -162,6 +162,7 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 | `RECOMP_XF_CONVCACHE=0` | A/B only: convert every triangle's vertices again instead of once per vertex per batch. |
 | `RECOMP_GPU_INDEXED=0` | A/B only: hand program batches to D3D11 as three full vertices per triangle instead of unique vertices plus an index buffer. |
 | `RECOMP_GPU_FLUSH=N` | Fallback for GPU drivers that show corrupted or flickering draws: flush the D3D11 queue after draws. `1` after glyph (text) draws, `2` after every textured draw, `3` after every draw. Default `0`. `3` used to be the default on Intel, but it cost about 3.5x in fps on the test laptop's UHD and fixed nothing there; try it only if an Intel GPU shows corruption. |
+| `RECOMP_RBX_WIDE_CULL=0` | A/B only: the game culls against its own 4:3 view again in widescreen, so objects pop in at the side edges (see docs/widescreen.md). |
 | `RECOMP_FFP_FOG=0` | A/B only: fixed-function meshes (mission world, terrain, buildings, sky) get no distance fog again, as before the fog-coordinate fix. The log says once per mode `[RBX XF] fixed-function fog: gen mode …`. |
 | `RECOMP_GPU_CLIP=0` | A/B or fallback: clip transformed batches at the near plane and back-face cull them on the CPU, as before, instead of on the GPU (default on). |
 | `RECOMP_GPU_CLIP_CPUCULL=0` | A/B only: with GPU clipping, leave back-face culling of triangles wholly in front of the eye to the GPU too (by default the CPU drops them before their vertices are converted). |
