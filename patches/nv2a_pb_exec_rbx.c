@@ -3395,6 +3395,49 @@ static int batch_uses_program(void)
     return (s_gpu.xf_mode & 3) == 2 && !no_vsh;
 }
 
+/* RBX: a shadow of the vertex program, from the same PROGRAM_LOAD / PROGRAM /
+ * PROGRAM_START methods the interpreter gets, so the executor can tell which
+ * program a batch runs (the toolkit exposes no program identity). The hash
+ * covers the slots from the start slot through the first FINAL. Used to pick
+ * a specialised transform (vsh_fast_*) and logged once per new program.
+ * ponytail: nv2a_vsh_set_instruction writes bypass this shadow; nothing in
+ * this title calls it. */
+static uint32_t s_vp_words[136 * 4], s_vp_load, s_vp_start;
+static int s_vp_dirty = 1;
+static uint64_t s_vp_hash;
+static uint32_t s_vp_len;
+
+static uint64_t vp_hash(void)
+{
+    if (s_vp_dirty) {
+        uint64_t h = 1469598103934665603ULL ^ s_vp_start;
+        uint32_t slot, k;
+        s_vp_len = 0;
+        for (slot = s_vp_start; slot < 136; slot++) {
+            for (k = 0; k < 4; k++)
+                h = (h ^ s_vp_words[slot * 4 + k]) * 1099511628211ULL;
+            s_vp_len++;
+            if (s_vp_words[slot * 4 + 3] & 1u)          /* FINAL */
+                break;
+        }
+        s_vp_hash = h;
+        s_vp_dirty = 0;
+        {
+            static uint64_t seen[32];
+            static unsigned nseen;
+            unsigned i;
+            for (i = 0; i < nseen && seen[i] != h; i++)
+                ;
+            if (i == nseen && nseen < 32) {
+                seen[nseen++] = h;
+                fprintf(stderr, "[VSH] program %016llX start %u slots %u\n",
+                        (unsigned long long)h, s_vp_start, s_vp_len);
+            }
+        }
+    }
+    return s_vp_hash;
+}
+
 static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 {
     float in[NV2A_VSH_INPUTS][4];
@@ -3617,6 +3660,8 @@ static void raster_batch_program(void)
 
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
+    if (batch_uses_program())
+        (void)vp_hash();          /* settle the program identity before workers read it */
     t0 = pb_ticks();
     {   /* Post-transform cache, as the hardware has: an indexed batch names
          * most vertices several times, and the state is fixed for the batch. */
@@ -5102,9 +5147,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case 0x1E9C:                                  /* _PROGRAM_LOAD */
         nv2a_vsh_set_load_slot(param);
+        s_vp_load = param < 136 ? param * 4 : 136 * 4;
         break;
     case 0x1EA0:                                  /* _PROGRAM_START */
         nv2a_vsh_set_start_slot(param);
+        s_vp_start = param; s_vp_dirty = 1;
         break;
     case 0x1EA4:                                  /* _CONSTANT_LOAD */
         nv2a_vsh_set_constant_load(param);
@@ -5180,6 +5227,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
         if (method >= 0x0B00 && method < 0x0B80) {    /* TRANSFORM_PROGRAM(i) */
             nv2a_vsh_program_word(param);
+            if (s_vp_load < 136 * 4) { s_vp_words[s_vp_load++] = param; s_vp_dirty = 1; }
             break;
         }
         if (method >= 0x0B80 && method < 0x0C00) {    /* TRANSFORM_CONSTANT(i) */
