@@ -131,7 +131,7 @@ static unsigned s_vb_i, s_cb_i;
 static ID3D11Buffer *s_ibr[VB_RING];   /* index ring for the executor's indexed batches */
 static unsigned s_ib_i, s_ib_off;
 static uint32_t s_xvb_off;
-static unsigned s_vendor, s_flush_mode, s_flush_tex; /* RECOMP_GPU_FLUSH_TEX=1: flush before and after every texture (re)creation */        /* RECOMP_GPU_FLUSH: 0 none, 1 P8 512-wide glyph draws, 2 all textured draws, 3 every draw; default 3 on Intel (0x8086), 0 elsewhere */
+static unsigned s_vendor, s_flush_mode, s_flush_tex; /* RECOMP_GPU_FLUSH_TEX=1: flush before and after every texture (re)creation */        /* RECOMP_GPU_FLUSH: 0 none, 1 P8 512-wide glyph draws, 2 all textured draws, 3 every draw; default 0 everywhere (Intel UHD on the test laptop: no corruption with 0, and 3 cost ~3.5x fps) */
 static unsigned long s_defer_n; static struct { IUnknown *o; uint32_t f; } s_grave[4096];
 static ID3D11RasterizerState *s_rs;
 static ID3D11Texture2D *s_white;
@@ -491,7 +491,7 @@ static int gb_init(void)
         IDXGIDevice *dd = NULL; IDXGIAdapter *ad = NULL; DXGI_ADAPTER_DESC desc;
         if (SUCCEEDED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice, (void **)&dd)) &&
             SUCCEEDED(IDXGIDevice_GetAdapter(dd, &ad)) && SUCCEEDED(IDXGIAdapter_GetDesc(ad, &desc)))
-            s_vendor = desc.VendorId; { const char *fm = getenv("RECOMP_GPU_FLUSH"); s_flush_mode = fm ? (unsigned)atoi(fm) : (s_vendor == 0x8086 ? 3u : 0u); { const char *ft = getenv("RECOMP_GPU_FLUSH_TEX"); s_flush_tex = ft ? (unsigned)atoi(ft) : 0u; } }
+            s_vendor = desc.VendorId; { const char *fm = getenv("RECOMP_GPU_FLUSH"); s_flush_mode = fm ? (unsigned)atoi(fm) : 0u; { const char *ft = getenv("RECOMP_GPU_FLUSH_TEX"); s_flush_tex = ft ? (unsigned)atoi(ft) : 0u; } }
             fprintf(stderr, "[RBX DX11] vendor 0x%04X flush_mode %u flush_tex %u\n", s_vendor, s_flush_mode, s_flush_tex);
             fprintf(stderr, "[RBX DX11] D3D11 back end up on '%ls' (feature level 0x%X)\n", desc.Description, (unsigned)fl);
         SAFE_REL(ad); SAFE_REL(dd);
