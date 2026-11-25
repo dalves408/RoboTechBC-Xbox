@@ -1315,9 +1315,24 @@ static int pack_make(const uint32_t *argb, uint32_t width, uint32_t height, TexE
     return ok;
 }
 
+/* Texture-cache index: bucket -> slot of the last entry seen with that key. A hint only (an entry is always
+ * checked against the texture before use), so a stale or colliding bucket just falls back to the scan. It was
+ * 256 buckets in get_tex only; the slow path scanned all 768 slots on every call. */
+#define TEX_IDX_BITS 12
+static uint16_t s_tex_idx[1u << TEX_IDX_BITS];
+static unsigned tex_bucket(const Nv2aTexture *t)
+{
+    return (((t->offset >> 4) * 2654435761u) ^ (t->width * 40503u) ^ (t->height * 9973u) ^ (t->color * 2246822519u) ^
+            (t->pitch * 3266489917u)) >> (32 - TEX_IDX_BITS);
+}
+static int tex_ent_is(const TexEnt *c, const Nv2aTexture *t)
+{
+    return c->tex && c->offset == t->offset && c->w == t->width && c->h == t->height && c->color == t->color && c->pitch == t->pitch;
+}
+
 static ID3D11ShaderResourceView *get_tex_slow(const Nv2aTexture *t)
 {
-    int i, free_i = -1, lru = 0;
+    int i, free_i = -1, lru = 0, first_i = -1;
     uint64_t h, th;
     uint32_t n = tex_bytes(t);
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -1338,10 +1353,17 @@ static ID3D11ShaderResourceView *get_tex_slow(const Nv2aTexture *t)
     st_th_full++;
     QueryPerformanceCounter(&hash_end);
     st_hash_ns_us += (uint32_t)((hash_end.QuadPart - hash_start.QuadPart) * 1000000ULL / gb_qf());
-    for (i = 0; i < MAX_TEX; i++) {
-        TexEnt *e = &s_tx[i];
+    {   /* Indexed hit: start the scan at that slot, so the matching entry is found at once. */
+        unsigned hint = s_tex_idx[tex_bucket(t)];
+        if (hint < MAX_TEX && tex_ent_is(&s_tx[hint], t)) first_i = (int)hint;
+    }
+    for (int k = 0; k < MAX_TEX; k++) {
+        TexEnt *e;
+        i = first_i >= 0 ? (k == 0 ? first_i : (k <= first_i ? k - 1 : k)) : k;
+        e = &s_tx[i];
         if (!e->tex) { if (free_i < 0) free_i = i; continue; }
         if (e->offset == t->offset && e->w == t->width && e->h == t->height && e->color == t->color && e->pitch == t->pitch) {
+            s_tex_idx[tex_bucket(t)] = (uint16_t)i;
             e->used = s_tick;
             { static int nc = -1; if (nc < 0) nc = getenv("RECOMP_GPU_NOTEXCACHE") ? 1 : 0; /* A/B switch: re-upload every draw */
               if (!nc && e->hash == h) { e->thash = th; e->sig = sample_sig(mem + t->offset, n); e->vframe = s_frame + 1; return e->srv; } }
@@ -1420,6 +1442,7 @@ made:
         if (s_flush_tex) ID3D11DeviceContext_Flush(s_ctx);
         e->offset = t->offset; e->w = t->width; e->h = t->height; e->color = t->color; e->pitch = t->pitch;
         e->hash = h; e->used = s_tick;
+        s_tex_idx[tex_bucket(t)] = (uint16_t)free_i;
         e->thash = th; e->sig = sample_sig(mem + t->offset, n); e->vframe = s_frame + 1;
         st_crt_us += qpc_us() - q1;
         st_decodes++;
@@ -1488,7 +1511,6 @@ static void texdump(const Nv2aTexture *t)
 static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t)
 {
     static int mode = -1, verify = 0;
-    static uint16_t idx[256];
     uint32_t n, k;
     int i;
     const uint8_t *mem;
@@ -1499,24 +1521,20 @@ static ID3D11ShaderResourceView *get_tex(const Nv2aTexture *t)
     if (!mode || !t->width || !t->height || t->width > 4096 || t->height > 4096) return get_tex_slow(t);
     for (i = 0; i < MAX_RT; i++)
         if (s_rt[i].tex && s_rt[i].srv && s_rt[i].va == t->offset && s_rt[i].w == t->width && s_rt[i].h == t->height) return get_tex_slow(t);
-    k = ((t->offset >> 4) * 2654435761u ^ t->width * 40503u ^ t->height * 9973u ^ t->color) >> 8 & 255;
+    k = tex_bucket(t);
     {
-        TexEnt *c = &s_tx[idx[k]];
+        TexEnt *c = &s_tx[s_tex_idx[k] < MAX_TEX ? s_tex_idx[k] : 0];
         if (c->tex && c->offset == t->offset && c->w == t->width && c->h == t->height && c->color == t->color && c->pitch == t->pitch) e = c;
     }
     if (!e) {
         for (i = 0; i < MAX_TEX; i++) {
             TexEnt *c = &s_tx[i];
-            if (c->tex && c->offset == t->offset && c->w == t->width && c->h == t->height && c->color == t->color && c->pitch == t->pitch) { e = c; idx[k] = (uint16_t)i; break; }
+            if (c->tex && c->offset == t->offset && c->w == t->width && c->h == t->height && c->color == t->color && c->pitch == t->pitch) { e = c; s_tex_idx[k] = (uint16_t)i; break; }
         }
     }
     if (!e || e->vframe != s_frame + 1 || !e->srv) {
         ID3D11ShaderResourceView *r = get_tex_slow(t);
-        for (i = 0; i < MAX_TEX; i++) { /* slot may be new: refresh the index */
-            TexEnt *c = &s_tx[i];
-            if (c->tex && c->srv == r) { idx[k] = (uint16_t)i; break; }
-        }
-        return r;
+        return r;   /* get_tex_slow keeps s_tex_idx current */
     }
     n = tex_bytes(t); mem = (const uint8_t *)xbox_GetMemoryOffset();
     {
