@@ -1092,6 +1092,20 @@ static void clear_surface(uint32_t param)
         g_rbx_clear_rect_h = s_gpu.clear_rect_h;
         g_rbx_clear_rect_v = s_gpu.clear_rect_v;
         g_rbx_clear_rect_set = s_gpu.clear_rect_set;
+        /* Capture the original hardware rectangles at the renderer boundary. */
+        static int trace_clear = -1;
+        if (trace_clear < 0)
+            trace_clear = getenv("RECOMP_RBX_CLEAR_TRACE") != NULL;
+        if (trace_clear)
+            fprintf(stderr, "[RBX CLEAR] va=%08X clip=%u,%u %ux%u rect=%08X,%08X rect_set=%d flags=%02X color=%08X\n",
+                    surf.color_va, s_gpu.clip_x, s_gpu.clip_y, surf.width, surf.height,
+                    s_gpu.clear_rect_h, s_gpu.clear_rect_v, s_gpu.clear_rect_set,
+                    param, s_gpu.clear_color);
+        extern void rbx_d3d11_clear_rect(uint32_t, unsigned, unsigned, unsigned,
+                                             uint32_t, uint32_t, uint32_t);
+        if (s_gpu.clear_rect_set == 3)
+            rbx_d3d11_clear_rect(surf.color_va, surf.width, surf.height, surf.aa_sx,
+                                 param, s_gpu.clear_rect_h, s_gpu.clear_rect_v);
         s_backend->clear(&surf, &rs, param, s_gpu.clear_color,
                          s_gpu.zstencil_clear);
         s_gpu.clears++;
@@ -3917,6 +3931,16 @@ static void gclip_tri(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
 static void xf_set_viewport(void)
 {
     const float *of = nv2a_vsh_constant(59);
+
+    static int trace_viewport = -1;
+    static float previous[4];
+    if (trace_viewport < 0)
+        trace_viewport = getenv("RECOMP_RBX_CLEAR_TRACE") != NULL;
+    if (trace_viewport && memcmp(previous, of, sizeof previous) != 0) {
+        fprintf(stderr, "[RBX VIEWPORT] offset=(%g,%g,%g,%g) mode=%u\n",
+                of[0], of[1], of[2], of[3], s_gpu.xf_mode & 3u);
+        memcpy(previous, of, sizeof previous);
+    }
 
     s_xf_o[0] = of[0] * s_gpu.aa_sx;
     s_xf_o[1] = of[1] * s_gpu.aa_sy;
