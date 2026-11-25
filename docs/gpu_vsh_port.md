@@ -1,6 +1,19 @@
 # GPU vertex programs: design for the port
 
-Status: design. Nothing in this note ships until the bench passes it. The new path is opt-in at first (`RECOMP_GPU_VSH=1`) and becomes the default only after it renders the same as the CPU path in menus, briefing, cutscenes, HUD and flight.
+Status: shipped, default on (`RECOMP_GPU_VSH=0` and `RECOMP_GPU_CLIP=0` turn the two parts off).
+
+## Result (bench, build 06bdfd0 = PR head plus the WIP)
+
+Stream-out verify (`RECOMP_GPU_VSH_VERIFY=64`): 0 mismatches on AMD 680M, RTX 3070, GTX 1650 and Intel UHD (0.5–0.7 M vertices each). Visuals identical in menus, briefing, cutscenes, HUD and flight; no crashes. Every 9CEE batch turned out to be an all-black outline pass, now skipped before transform on every path.
+
+| GPU | Mission median fps, CPU path → GPU path | Menus |
+| --- | --- | --- |
+| AMD 680M (dev PC) | 213 / 210 → 225 / 230 | 314 → 308–313 |
+| RTX 3070 (1800X) | 158 → 174 | 278 → 305 |
+| GTX 1650 (test laptop) | 229–234 → 329–335 | 298–340 → 284–379 |
+| Intel UHD (test laptop) | 220–277 → 282–290 | 239 → 282–291 |
+
+CPU use drops by 0.1–0.15 cores. GPU clipping on its own (no GPU vertex programs) cost 5–8% in menus, so it ships only together with the vertex programs.
 
 ## Why
 

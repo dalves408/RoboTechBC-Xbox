@@ -93,12 +93,12 @@ static ID3D11PixelShader *s_ps;
 static ID3D11InputLayout *s_il;
 static ID3D11VertexShader *s_rc_vs;
 static ID3D11InputLayout *s_rc_il;
-/* GPU clipping (executor RECOMP_GPU_CLIP=1): vertex shaders that also write the near planes as clip distances,
+/* GPU clipping (executor, default on; RECOMP_GPU_CLIP=0 off): vertex shaders that also write the near planes as clip distances,
  * and rasterizer states that cull ([front CCW][none, front, back]) with depth clip off. */
 static ID3D11VertexShader *s_vs_clip, *s_rc_vs_clip;
 static ID3D11RasterizerState *s_rs_clip[2][3];
 static int s_clip_failed;
-/* GPU vertex programs (executor RECOMP_GPU_VSH=1): one vertex shader and input layout per known program, the
+/* GPU vertex programs (executor, default on; RECOMP_GPU_VSH=0 off): one vertex shader and input layout per known program, the
  * constant buffer ring (RbxGvsConst at b2), and for RECOMP_GPU_VSH_VERIFY the stream-out readback. */
 static ID3D11VertexShader *s_gvs_vs[RBX_GVS_NPROG];
 static ID3D11InputLayout *s_gvs_il[RBX_GVS_NPROG];
@@ -204,7 +204,7 @@ static const char s_hlsl[] =
 "  if (!ok) discard;\n"
 "  return c; }\n";
 
-/* GPU clipping: the executor hands program and fixed-function batches over unclipped (RECOMP_GPU_CLIP=1). Same
+/* GPU clipping: the executor hands program and fixed-function batches over unclipped (default; RECOMP_GPU_CLIP=0 turns it off). Same
  * mapping as vs / vs_rc, but w keeps its sign and z is not clamped per vertex (the rasterizer clamps per pixel,
  * depth clip off), and the CPU clipper's two planes become clip distances: w >= 1e-3, and z >= clipz in screen z.
  * The inputs match s_il / s_rc_il; each output adds the clip distances after the fields its pixel shader reads. */
@@ -1878,7 +1878,7 @@ static void probe_after_draw(Rt *rt, ID3D11ShaderResourceView *srv, const Nv2aBa
 }
 
 extern int g_rbx_precull;   /* executor: this batch was back-face culled with exact strip parity */
-/* Executor (RECOMP_GPU_CLIP=1): this indexed batch is unclipped and unculled; bit 1 adds the z near plane at
+/* Executor (GPU clipping): this indexed batch is unclipped and unculled; bit 1 adds the z near plane at
  * g_rbx_clip_z (screen z). Odd strip triangles are already flipped, so one winding rule culls them all. */
 extern int g_rbx_gpuclip;
 extern float g_rbx_clip_z;

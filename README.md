@@ -158,10 +158,10 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 | `RECOMP_XF_CONVCACHE=0` | A/B only: convert every triangle's vertices again instead of once per vertex per batch. |
 | `RECOMP_GPU_INDEXED=0` | A/B only: hand program batches to D3D11 as three full vertices per triangle instead of unique vertices plus an index buffer. |
 | `RECOMP_GPU_FLUSH=N` | Fallback for GPU drivers that show corrupted or flickering draws: flush the D3D11 queue after draws. `1` after glyph (text) draws, `2` after every textured draw, `3` after every draw. Default `0`. `3` used to be the default on Intel, but it cost about 3.5x in fps on the test laptop's UHD and fixed nothing there; try it only if an Intel GPU shows corruption. |
-| `RECOMP_GPU_CLIP=1` | Test: transformed (program and fixed-function) batches are clipped at the near plane and back-face culled by the GPU instead of the CPU. Needs the indexed hand-off. |
-| `RECOMP_GPU_CLIP_CPUCULL=0` | A/B only, with `RECOMP_GPU_CLIP=1`: leave back-face culling of triangles wholly in front of the eye to the GPU too (by default the CPU drops them before their vertices are converted). |
-| `RECOMP_GPU_VSH=1` | Test: batches that run one of the title's known vertex programs are transformed by a GPU vertex shader instead of on the CPU (they are also clipped and culled on the GPU). Other batches are unchanged. |
-| `RECOMP_GPU_VSH_VERIFY=N` | With `RECOMP_GPU_VSH=1`: every Nth GPU-transformed batch, read back what the shader wrote for its first 32 vertices and compare it with the CPU path. Logs `[GVS] verify` lines. Slow; debugging only. |
+| `RECOMP_GPU_CLIP=0` | A/B or fallback: clip transformed batches at the near plane and back-face cull them on the CPU, as before, instead of on the GPU (default on). |
+| `RECOMP_GPU_CLIP_CPUCULL=0` | A/B only: with GPU clipping, leave back-face culling of triangles wholly in front of the eye to the GPU too (by default the CPU drops them before their vertices are converted). |
+| `RECOMP_GPU_VSH=0` | A/B or fallback: transform every batch on the CPU. By default, batches that run one of the title's known vertex programs are transformed by GPU vertex shaders (missions +6–10% on AMD, +10% on an RTX 3070, +42% on a GTX 1650). |
+| `RECOMP_GPU_VSH_VERIFY=N` | Every Nth GPU-transformed batch, read back what the shader wrote for its first 32 vertices and compare it with the CPU path. Logs `[GVS] verify` lines. Slow; debugging only. |
 | `RECOMP_VSH_FAST=0` | Run every vertex program through the interpreter instead of the specialised C transforms for the game's two main programs. |
 | `RECOMP_VSH_FASTCHECK=N` | Also run the interpreter on every Nth fast-path vertex and compare; a mismatch is logged and turns that program's fast path off. |
 | `RECOMP_FPS_CAP_DROP=1` | A/B only: the F1 FPS limit drops frames on their way to the window instead of holding the game to the cap. |

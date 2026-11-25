@@ -2336,7 +2336,7 @@ static void bidx_begin(void)
     s_bidx_mode = 1;
 }
 
-/* RBX: GPU clipping (RECOMP_GPU_CLIP=1). A program or fixed-function batch
+/* RBX: GPU clipping (default on; RECOMP_GPU_CLIP=0 turns it off). A program or fixed-function batch
  * goes to the back end unclipped and unculled: each transformed vertex once,
  * the primitive's triangles as indices with odd strip triangles flipped, so
  * the winding is the same for every triangle. The back end's vertex shader
@@ -2353,9 +2353,9 @@ static int gclip_on(void)
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("RECOMP_GPU_CLIP");
-        on = e && e[0] == '1';
-        if (on)
-            fprintf(stderr, "[RBX XF] GPU clipping on (RECOMP_GPU_CLIP=1)\n");
+        on = !(e && e[0] == '0');
+        if (!on)
+            fprintf(stderr, "[RBX XF] GPU clipping off (RECOMP_GPU_CLIP=0)\n");
     }
     return on;
 }
@@ -3873,7 +3873,7 @@ static int xp_transform(uint32_t *list, uint32_t n)
 }
 #endif
 
-/* One triangle for the GPU to clip and cull (RECOMP_GPU_CLIP=1). */
+/* One triangle for the GPU to clip and cull (GPU clipping). */
 static void gclip_tri(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
                       const Nv2aVshOutput *c)
 {
@@ -3923,7 +3923,8 @@ static void xf_set_viewport(void)
     s_xf_o[2] = of[2];
 }
 
-/* RBX: GPU vertex programs (RECOMP_GPU_VSH=1; patches/rbx_gvs.h). A program
+/* RBX: GPU vertex programs (default on, RECOMP_GPU_VSH=0 turns them off;
+ * patches/rbx_gvs.h). A program
  * batch whose program has a fast path above, drawn through the combiners, is
  * not transformed here: each unique vertex's raw inputs are gathered, the
  * primitive becomes triangle indices (odd strip triangles flipped, as with
@@ -3945,9 +3946,9 @@ static int gvs_on(void)
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("RECOMP_GPU_VSH");
-        on = e && e[0] == '1';
-        if (on)
-            fprintf(stderr, "[RBX XF] GPU vertex programs on (RECOMP_GPU_VSH=1)\n");
+        on = !(e && e[0] == '0');
+        if (!on)
+            fprintf(stderr, "[RBX XF] GPU vertex programs off (RECOMP_GPU_VSH=0)\n");
     }
     return on;
 }

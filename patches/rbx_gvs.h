@@ -1,4 +1,4 @@
-/* GPU vertex programs (RECOMP_GPU_VSH=1): the hand-off between the pushbuffer
+/* GPU vertex programs (default on; RECOMP_GPU_VSH=0 turns them off): the hand-off between the pushbuffer
  * executor (patches/nv2a_pb_exec_rbx.c) and the D3D11 back end
  * (src/rbx_d3d11.c). Included by both, so the layout cannot drift.
  *
