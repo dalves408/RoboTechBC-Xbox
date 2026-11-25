@@ -2349,6 +2349,30 @@ static void bidx_begin(void)
     s_bidx_mode = 1;
 }
 
+/* RBX: GPU clipping (RECOMP_GPU_CLIP=1). A program or fixed-function batch
+ * goes to the back end unclipped and unculled: each transformed vertex once,
+ * the primitive's triangles as indices with odd strip triangles flipped, so
+ * the winding is the same for every triangle. The back end's vertex shader
+ * writes the two near planes the CPU clipper used (w = NV_CLIP_W and the
+ * c[59].z plane) as clip distances, and the rasterizer culls with the NV2A
+ * cull state. g_rbx_gpuclip: bit 0 on, bit 1 the z plane too; g_rbx_clip_z is
+ * that plane's offset in screen z. */
+int g_rbx_gpuclip;
+float g_rbx_clip_z;
+static int s_gclip;
+extern int rbx_gpu_clip_ok(void);
+static int gclip_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_CLIP");
+        on = e && e[0] == '1';
+        if (on)
+            fprintf(stderr, "[RBX XF] GPU clipping on (RECOMP_GPU_CLIP=1)\n");
+    }
+    return on;
+}
+
 /* The hand-off index of a vertex, converting it on first use; ~0u when full. */
 static uint32_t bidx_vertex(const Nv2aVshOutput *v)
 {
@@ -2362,6 +2386,16 @@ static uint32_t bidx_vertex(const Nv2aVshOutput *v)
     if (s_bcount >= NV_BACKEND_MAX_VERTS)
         return ~0u;
     backend_from_xf(v, &s_bverts[s_bcount]);
+    if (s_gclip) {
+        /* Unclipped: a vertex behind the eye is drawn too, so it needs a usable
+         * position. w = -0 gives rhw = -inf: keep it just behind the w plane. */
+        Nv2aVertex *o = &s_bverts[s_bcount];
+        float x = o->x, y = o->y, z = o->z;
+        if (x - x != 0.0f || y - y != 0.0f || z - z != 0.0f || o->rhw != o->rhw)
+            return ~0u;
+        if (o->rhw - o->rhw != 0.0f)
+            o->rhw = o->rhw > 0.0f ? 1e30f : -1e30f;
+    }
     if (cached) {
         s_bslot_tag[slot] = s_bslot_gen;
         s_bslot_out[slot] = s_bcount;
@@ -3345,64 +3379,37 @@ static void raster_xf_clip_slow(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
         raster_xf_triangle(&p0[0], &p0[i], &p0[i + 1]);
 }
 
-/* Near-plane class of a transformed vertex: 0 = no finite position (the
- * triangle is dropped), 1 = in front of a near plane (needs clipping),
- * 3 = inside. */
-static int xf_vclass(const Nv2aVshOutput *v, int near_z)
-{
-    float w = v->pos[3];
-    float d = w - NV_CLIP_W;
-    int inside = 1;
-    if (d != d || d - d != 0.0f)
-        return 0;
-    if (d < 0.0f)
-        inside = 0;
-    if (near_z) {
-        float z = v->pos[2] * w;
-        d = z - s_xf_o[2] * w;
-        if (d != d || d - d != 0.0f)
-            return 0;                         /* not finite: no position at all */
-        if (d < 0.0f)
-            inside = 0;
-    }
-    return inside ? 3 : 1;
-}
-
 static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
                               const Nv2aVshOutput *c)
 {
-    /* RBX: a strip or indexed mesh tests each vertex for two or three
-     * triangles; keep each slot's class for the batch (s_bvc_gen). */
     static int near_z = -1;
-    static uint8_t *cls;
-    static uint32_t *cls_gen;
     const Nv2aVshOutput *in[3];
-    int i, k[3];
+    int i, inside = 1;
 
     if (near_z < 0) {
         const char *e = getenv("RECOMP_CLIP_NEAR_Z");
         near_z = !(e && e[0] == '0');
-        cls = (uint8_t *)malloc(NV_MAX_INDICES);
-        cls_gen = (uint32_t *)calloc(NV_MAX_INDICES, sizeof *cls_gen);
-        if (!cls || !cls_gen) { free(cls); free(cls_gen); cls = NULL; cls_gen = NULL; }
     }
     in[0] = a; in[1] = b; in[2] = c;
+    /* Only W and Z contribute to the near planes. Compute X and Y in
+     * clip space only for triangles that need polygon clipping. */
     for (i = 0; i < 3; i++) {
-        const Nv2aVshOutput *v = in[i];
-        if (cls && s_xf && v >= s_xf && v < s_xf + NV_MAX_INDICES) {
-            uint32_t slot = (uint32_t)(v - s_xf);
-            if (cls_gen[slot] != s_bvc_gen) {
-                cls[slot] = (uint8_t)xf_vclass(v, near_z);
-                cls_gen[slot] = s_bvc_gen;
-            }
-            k[i] = cls[slot];
-        } else {
-            k[i] = xf_vclass(v, near_z);
-        }
-        if (!k[i])
+        float w = in[i]->pos[3];
+        float d = w - NV_CLIP_W;
+        if (d != d || d - d != 0.0f)
             return;
+        if (d < 0.0f)
+            inside = 0;
+        if (near_z) {
+            float z = in[i]->pos[2] * w;
+            d = z - s_xf_o[2] * w;
+            if (d != d || d - d != 0.0f)
+                return;                       /* not finite: no position at all */
+            if (d < 0.0f)
+                inside = 0;
+        }
     }
-    if ((k[0] & k[1] & k[2]) == 3)
+    if (inside)
         raster_xf_triangle(a, b, c);
     else
         raster_xf_clip_slow(a, b, c, near_z ? 2 : 1);
@@ -3873,6 +3880,26 @@ static int xp_transform(uint32_t *list, uint32_t n)
 }
 #endif
 
+/* One triangle for the GPU to clip and cull (RECOMP_GPU_CLIP=1). */
+static void gclip_tri(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+                      const Nv2aVshOutput *c)
+{
+    static unsigned pace;
+    uint32_t ia, ib, ic;
+
+    if ((++pace & 0x3Fu) == 0)
+        swm5_pace_wake();
+    if (s_bidx_n + 3 > NV_BACKEND_MAX_VERTS)
+        return;
+    ia = bidx_vertex(a); ib = bidx_vertex(b); ic = bidx_vertex(c);
+    if (ia == ~0u || ib == ~0u || ic == ~0u)
+        return;
+    if (s_xf_odd) { uint32_t t = ib; ib = ic; ic = t; }
+    s_bidx[s_bidx_n] = ia; s_bidx[s_bidx_n + 1] = ib; s_bidx[s_bidx_n + 2] = ic;
+    s_bidx_n += 3;
+}
+#define XF_TRI(a, b, c) (s_gclip ? gclip_tri((a), (b), (c)) : raster_xf_clipped((a), (b), (c)))
+
 static void xf_set_viewport(void)
 {
     const float *of = nv2a_vsh_constant(59);
@@ -4086,12 +4113,18 @@ xf_done:
 
     if (++s_bvc_gen == 0)          /* new batch: converted vertices are stale */
         s_bvc_gen = 1;
-    if (backend_draws())
+    s_gclip = 0;
+    if (backend_draws()) {
         bidx_begin();
+        if (s_bidx_mode && gclip_on() && rbx_gpu_clip_ok()) {
+            uint32_t bpp = surface_bpp();
+            s_gclip = bpp == 4 || bpp == 2;
+        }
+    }
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < n; i += 3)
-            raster_xf_clipped(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+1]], &s_xf[vertex_slot[i+2]]);
+            XF_TRI(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+1]], &s_xf[vertex_slot[i+2]]);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
         /* RBX-17: do NOT flip odd triangles here. That "DX11 cull" experiment
@@ -4099,25 +4132,25 @@ xf_done:
          * for 3D strips belongs in the backend, not by rewriting NV2A order. */
         for (i = 0; i + 2 < n; i++) {
             s_xf_odd = (int)(i & 1);
-            raster_xf_clipped(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+1]], &s_xf[vertex_slot[i+2]]);
+            XF_TRI(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+1]], &s_xf[vertex_slot[i+2]]);
         }
         s_xf_odd = 0;
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
         for (i = 1; i + 1 < n; i++)
-            raster_xf_clipped(&s_xf[vertex_slot[0]], &s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+1]]);
+            XF_TRI(&s_xf[vertex_slot[0]], &s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+1]]);
         break;
     case NV_PRIM_QUADS:
         for (i = 0; i + 3 < n; i += 4) {
-            raster_xf_clipped(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+1]], &s_xf[vertex_slot[i+2]]);
-            raster_xf_clipped(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+2]], &s_xf[vertex_slot[i+3]]);
+            XF_TRI(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+1]], &s_xf[vertex_slot[i+2]]);
+            XF_TRI(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+2]], &s_xf[vertex_slot[i+3]]);
         }
         break;
     case NV_PRIM_QUAD_STRIP:
         for (i = 0; i + 3 < n; i += 2) {
-            raster_xf_clipped(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+1]], &s_xf[vertex_slot[i+3]]);
-            raster_xf_clipped(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+3]], &s_xf[vertex_slot[i+2]]);
+            XF_TRI(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+1]], &s_xf[vertex_slot[i+3]]);
+            XF_TRI(&s_xf[vertex_slot[i]], &s_xf[vertex_slot[i+3]], &s_xf[vertex_slot[i+2]]);
         }
         break;
     default:
@@ -4128,10 +4161,19 @@ xf_done:
     t0 = pb_ticks();
     g_pb_t_clip += t0 - t1;
     if (backend_draws()) {
+        static int near_z = -1;
+        if (near_z < 0) {
+            const char *e = getenv("RECOMP_CLIP_NEAR_Z");
+            near_z = !(e && e[0] == '0');
+        }
         g_rbx_precull = 1;
+        g_rbx_gpuclip = s_gclip ? (near_z ? 3 : 1) : 0;
+        g_rbx_clip_z = s_xf_o[2];
         backend_flush(!s_xf_no_tex);
         g_rbx_precull = 0;
+        g_rbx_gpuclip = 0;
     }
+    s_gclip = 0;
     g_pb_t_flush += pb_ticks() - t0;
 }
 
