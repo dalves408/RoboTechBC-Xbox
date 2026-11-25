@@ -2193,7 +2193,14 @@ static void gb_draw_gvs(const Nv2aSurface *s, const Nv2aBatch *b)
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rtv, ds ? ds->dsv : NULL);
     ID3D11DeviceContext_OMSetBlendState(s_ctx, get_blend(r), bf, 0xFFFFFFFFu);
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, get_dss(r, ds != NULL), r->stencil_ref & 0xFF);
-    ID3D11DeviceContext_RSSetState(s_ctx, clip_rs(r));
+    {   /* Versus split screen: keep this camera's draws on its half (see rbx_d3d11_clear_rect). */
+        int split = s_rs_split && s_split_va && s_split_va == s->color_va;
+        if (split) {
+            D3D11_RECT rect = { 0, s_split_top * s_scale, s->width * s_scale, s_split_bottom * s_scale };
+            ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &rect);
+        }
+        ID3D11DeviceContext_RSSetState(s_ctx, clip_rs(r, split));
+    }
     { static float po = -1.0f; if (po < 0) { const char *e = getenv("RECOMP_GPU_PIXOFS"); po = e ? (float)atof(e) : 0.5f; if (po < 0) po = 0; }
       vp.TopLeftX = vp.TopLeftY = po * (float)s_scale; }
     vp.Width = (float)(s->width * (uint32_t)s_scale); vp.Height = (float)(s->height * (uint32_t)s_scale);
