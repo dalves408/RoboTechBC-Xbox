@@ -157,6 +157,7 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 | `RECOMP_XF_SPIN_US=n` | How long an idle vertex-transform worker spins before sleeping (default 200 µs). |
 | `RECOMP_XF_CONVCACHE=0` | A/B only: convert every triangle's vertices again instead of once per vertex per batch. |
 | `RECOMP_GPU_INDEXED=0` | A/B only: hand program batches to D3D11 as three full vertices per triangle instead of unique vertices plus an index buffer. |
+| `RECOMP_GPU_CLIP=1` | Test: transformed (program and fixed-function) batches are clipped at the near plane and back-face culled by the GPU instead of the CPU. Needs the indexed hand-off. |
 | `RECOMP_VSH_FAST=0` | Run every vertex program through the interpreter instead of the specialised C transforms for the game's two main programs. |
 | `RECOMP_VSH_FASTCHECK=N` | Also run the interpreter on every Nth fast-path vertex and compare; a mismatch is logged and turns that program's fast path off. |
 | `RECOMP_FPS_CAP_DROP=1` | A/B only: the F1 FPS limit drops frames on their way to the window instead of holding the game to the cap. |
