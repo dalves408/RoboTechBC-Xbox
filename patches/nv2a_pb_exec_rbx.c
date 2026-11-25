@@ -3363,7 +3363,15 @@ static int xp_workers(void)
         SYSTEM_INFO si;
         int n, i;
         GetSystemInfo(&si);
-        n = e ? atoi(e) : si.dwNumberOfProcessors >= 4;
+        /* Default by logical CPUs. It used to be `>= 4`, i.e. at most one
+         * worker however many cores the host had, while vertex programs are
+         * interpreted on the CPU and the pushbuffer thread is what the title
+         * waits on. Leave room for the render, audio and present threads. */
+        if (e) n = atoi(e);
+        else {
+            DWORD c = si.dwNumberOfProcessors;
+            n = c >= 12 ? 4 : c >= 8 ? 3 : c >= 6 ? 2 : c >= 4 ? 1 : 0;
+        }
         if (getenv("RECOMP_VSH_DUMP") || getenv("RECOMP_VSH_VERIFY") || getenv("RECOMP_VSH_NODECODE"))
             n = 0;
         if (n > XP_MAXW) n = XP_MAXW;
