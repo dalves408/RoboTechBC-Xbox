@@ -345,6 +345,73 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* Crash dumps for players.
+ *
+ * The VEH above prints the guest view of a fault to stderr, which a player
+ * running the release never sees. An exception nothing handles also writes
+ * crashes\RoboTechBC_<date>_<time>.dmp beside the exe: threads, their stacks
+ * and the memory they point at, a few MB, enough to open in WinDbg or Visual
+ * Studio with the matching .pdb. The dump is written from its own thread so a
+ * stack overflow still gets one. RECOMP_MINIDUMP=0 turns it off;
+ * RECOMP_MINIDUMP=full adds all process memory (large). */
+static PEXCEPTION_POINTERS s_crash_ep;
+static DWORD s_crash_tid;
+static WCHAR s_crash_path[MAX_PATH];
+
+static DWORD WINAPI crash_dump_thread(LPVOID arg)
+{
+    const char *mode = getenv("RECOMP_MINIDUMP");
+    MINIDUMP_EXCEPTION_INFORMATION mei;
+    MINIDUMP_TYPE type = (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory |
+                                         MiniDumpWithUnloadedModules | MiniDumpWithHandleData);
+    SYSTEMTIME st;
+    HANDLE f;
+    BOOL ok;
+    (void)arg;
+    if (mode && strcmp(mode, "full") == 0)
+        type = (MINIDUMP_TYPE)(type | MiniDumpWithFullMemory);
+    CreateDirectoryW(L"crashes", NULL);
+    GetLocalTime(&st);
+    swprintf_s(s_crash_path, MAX_PATH, L"crashes\\RoboTechBC_%04u%02u%02u_%02u%02u%02u.dmp",
+               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    f = CreateFileW(s_crash_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE)
+        return 1;
+    mei.ThreadId = s_crash_tid;
+    mei.ExceptionPointers = s_crash_ep;
+    mei.ClientPointers = FALSE;
+    ok = MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f, type, &mei, NULL, NULL);
+    CloseHandle(f);
+    if (!ok)
+        DeleteFileW(s_crash_path);
+    return ok ? 0 : 1;
+}
+
+static LONG WINAPI crash_filter(PEXCEPTION_POINTERS ep)
+{
+    static volatile LONG once;
+    HANDLE t;
+    DWORD rc = 1;
+    if (InterlockedExchange(&once, 1))
+        return EXCEPTION_CONTINUE_SEARCH;
+    s_crash_ep = ep;
+    s_crash_tid = GetCurrentThreadId();
+    fprintf(stderr, "[CRASH] unhandled exception 0x%08lX at 0x%p\n",
+            (unsigned long)ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+    t = CreateThread(NULL, 0, crash_dump_thread, NULL, 0, NULL);
+    if (t) {
+        WaitForSingleObject(t, 60000);
+        GetExitCodeThread(t, &rc);
+        CloseHandle(t);
+    }
+    if (rc == 0)
+        fprintf(stderr, "[CRASH] dump written to %ls\n", s_crash_path);
+    else
+        fprintf(stderr, "[CRASH] could not write a crash dump\n");
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 /* ── WinMain ───────────────────────────────────────────────── */
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
@@ -473,6 +540,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
     AddVectoredExceptionHandler(1, veh_handler);
+    {
+        const char *md = getenv("RECOMP_MINIDUMP");
+        if (!(md && strcmp(md, "0") == 0))
+            SetUnhandledExceptionFilter(crash_filter);
+    }
 
     /* Step 1: Load XBE */
     if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {
