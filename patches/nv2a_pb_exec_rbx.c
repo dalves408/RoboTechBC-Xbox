@@ -3534,10 +3534,32 @@ static void vsh_fast_9cee(uint32_t index, Nv2aVshOutput *o)
     vsh_epilogue(o);
 }
 
+/* BA9E387C24FCECE1 (pretransformed pass-through): R1 = v0 with w = rcp(v0.w);
+ * oPos = R1 * c0 + c1; oD0 = v3; oD1 = v4 (ILU mov); oFog = rcp(v0.w);
+ * oT0..3 = v9..v12. oPts and the back colours (v1, v7, v8) have no output
+ * slot here. */
+static float vsh_rcp(float x) { return x == 0.0f ? INFINITY : 1.0f / x; }
+static void vsh_fast_ba9e(uint32_t index, Nv2aVshOutput *o)
+{
+    float v0[4], v3[4], v4[4], r1[4];
+    const float *c0 = nv2a_vsh_constant(0), *c1 = nv2a_vsh_constant(1);
+    int k, t;
+    vsh_in(0, index, v0); vsh_in(3, index, v3); vsh_in(4, index, v4);
+    vsh_defaults(o);
+    r1[0] = v0[0]; r1[1] = v0[1]; r1[2] = v0[2]; r1[3] = vsh_rcp(v0[3]);
+    vsh_color(o->d0, v3);
+    o->d0_written = 1;
+    for (k = 0; k < 4; k++) o->fog[k] = r1[3];
+    vsh_color(o->d1, v4);
+    for (k = 0; k < 4; k++) o->pos[k] = r1[k] * c0[k] + c1[k];
+    for (t = 0; t < 4; t++) vsh_in(9 + (uint32_t)t, index, o->tex[t]);
+}
+
 typedef void (*VshFastFn)(uint32_t, Nv2aVshOutput *);
-static struct { uint64_t hash; VshFastFn fn; volatile LONG off; } s_vsh_fast[] = {
-    { 0x0B25A84A2631EC80ULL, vsh_fast_0b25, 0 },
-    { 0x9CEE4A21EBB77FF1ULL, vsh_fast_9cee, 0 },
+static struct { uint64_t hash; VshFastFn fn; volatile LONG off, ok; } s_vsh_fast[] = {
+    { 0x0B25A84A2631EC80ULL, vsh_fast_0b25, 0, 0 },
+    { 0x9CEE4A21EBB77FF1ULL, vsh_fast_9cee, 0, 0 },
+    { 0xBA9E387C24FCECE1ULL, vsh_fast_ba9e, 0, 0 },
 };
 
 /* The fast transform for the batch's program, or -1 when there is none. */
@@ -3577,8 +3599,7 @@ static void vsh_fast_check(int fi, const float in[NV2A_VSH_INPUTS][4], const Nv2
         if (!vsh_close(a[k], b[k]))
             break;
     if (k == n && f->d0_written == r.d0_written) {
-        static volatile LONG ok;
-        if (InterlockedIncrement(&ok) == 1000)
+        if (InterlockedIncrement(&s_vsh_fast[fi].ok) == 1000)
             fprintf(stderr, "[VSH] fast path %016llX matched the interpreter on 1000 checked vertices\n",
                     (unsigned long long)s_vsh_fast[fi].hash);
         return;
