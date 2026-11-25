@@ -146,3 +146,22 @@ foreach ($f in Get-ChildItem $gen -Filter 'recomp_*.c') {
     }
 }
 if (-not $cheatDone) { throw 'sub_0002F350 (isCheat) not found in src\recomp\gen' }
+
+# The pause menu's loop (0x242B0) and its update/draw (0x24060) are wrapped
+# in recomp_manual.c, which holds each pass of that loop to 30 a second.
+foreach ($va in @('000242B0', '00024060')) {
+    $re = [regex]('void sub_' + $va + '\(void\)(\s*)\{')
+    $done = $false
+    foreach ($f in Get-ChildItem $gen -Filter 'recomp_*.c') {
+        $ft = [IO.File]::ReadAllText($f.FullName)
+        if ($ft.Contains('void sub_' + $va + '_orig(void)')) { $done = $true; Write-Output "already patched: $($f.FullName) (0x$va)"; break }
+        if ($re.IsMatch($ft)) {
+            $ft = $re.Replace($ft, '/* RBX: renamed; wrapped in src/recomp_manual.c (pause menu pace). */' + "`n" + 'void sub_' + $va + '_orig(void)$1{', 1)
+            [IO.File]::WriteAllText($f.FullName, $ft)
+            Write-Output "patched $($f.FullName) (0x$va)"
+            $done = $true
+            break
+        }
+    }
+    if (-not $done) { throw "sub_$va definition not found in $gen" }
+}

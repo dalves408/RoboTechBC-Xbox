@@ -586,112 +586,99 @@ void sub_0012B670(void)
 
 /* RBX pause menu at high frame rates (one press skipped several entries).
  *
- * The mission loop (0x10FC80) runs the game in 33 ms ticks (0x11080) and,
- * every pass, draws (0x11300) and then runs a per-frame callback (0x11370).
- * START pauses through 0x245D0, which sets 0x1E628C. While it is set the tick
- * skips the game, and the per-frame callback reads the pads (0x111410: copy
- * current to previous, sample, set the pressed/released edges) and drives the
- * pause menu. On the Xbox that was once per displayed frame, 30 a second at
- * most. Uncapped here it is 200-400 a second, so the menu's input is sampled
- * and acted on ten times as often as the title was built for, and one press
- * walks down several entries.
+ * START in a mission calls 0x245D0 (pause), and the pause menu then runs its
+ * own loop at 0x242B0, inside the game tick:
  *
- * While paused, run that callback only on passes where a tick advanced the
- * game clock (0x23A48C, +33 per tick, one tick per pass at most while paused:
- * 0x10FC50), which is the Xbox's cadence. On the passes in between, clear the
- * edge flags it set last time, so the draw callback, which runs before it on
- * the next pass, also sees each press once. Nothing changes while the game is
- * running. RECOMP_RBX_PAUSE_TICK=0 turns it off; RECOMP_RBX_PAUSE_LOG=1 logs
- * pause changes, player 1's stick and d-pad changes as the menu sampled them,
- * and once a game second how many passes ran and were skipped. */
-#define RBX_PAUSED_VA       0x001E628Cu
-#define RBX_GAME_CLOCK_VA   0x0023A48Cu
-#define RBX_INPUT_VA        0x002BE140u   /* per player, 0x210 apart */
-#define RBX_INPUT_PLAYERS   8u            /* 0x111410 updates eight */
-#define RBX_INPUT_PLAYER    0x210u
-#define RBX_INPUT_EDGES     0x60u         /* pressed[24], released[24], double[24] */
-#define RBX_INPUT_EDGE_DW   72u
-extern void sub_00011370(void);
+ *     do { 0x111410 read pads; 0x24940 pad changes; 0x24060 menu update+draw;
+ *          menu->time (+0x15C) += 33; } while (!menu->done (+0x164));
+ *
+ * The menu's clock moves 33 ms per pass, so the title counts on one pass per
+ * 30 Hz frame, which the Xbox's present gave it. Here the present does not
+ * wait unless the FPS limit is set, so the loop runs 200-400 times a second,
+ * menu time runs ten times too fast, and its input timing with it.
+ *
+ * Hold each pass of that loop to 1/30 s, measured from the previous one. The
+ * menu's draws (0x24060) are counted only while 0x242B0 is running: 0x24060
+ * is also called from elsewhere. RECOMP_RBX_MENU_PACE=0 turns it off;
+ * RECOMP_RBX_PAUSE_LOG=1 logs each menu loop with its passes and how long
+ * they were held. scripts/patch_kickoff_yield.ps1 renames both generated
+ * functions to _orig. */
+extern void sub_000242B0_orig(void);
+extern void sub_00024060_orig(void);
+static volatile LONG s_menu_loop;      /* depth of 0x242B0 on the game thread */
+static unsigned long s_menu_passes, s_menu_held_us;
 
-static void rbx_clear_input_edges(void)
+static int rbx_menu_flag(const char *name, int dflt)
 {
-    uint32_t p, i;
-    for (p = 0; p < RBX_INPUT_PLAYERS; p++) {
-        uint32_t edges = RBX_INPUT_VA + p * RBX_INPUT_PLAYER + RBX_INPUT_EDGES;
-        for (i = 0; i < RBX_INPUT_EDGE_DW; i++)
-            MEM32(edges + 4 * i) = 0;
+    const char *e = getenv(name);
+    return e && *e ? e[0] != '0' : dflt;
+}
+
+void sub_000242B0(void)
+{
+    static int log = -1;
+    if (log < 0) log = rbx_menu_flag("RECOMP_RBX_PAUSE_LOG", 0);
+    if (log && !s_menu_loop) {
+        fprintf(stderr, "[RBX PAUSE] menu loop entered\n");
+        fflush(stderr);
+        s_menu_passes = s_menu_held_us = 0;
+    }
+    s_menu_loop++;
+    sub_000242B0_orig();
+    s_menu_loop--;
+    if (log && !s_menu_loop) {
+        fprintf(stderr, "[RBX PAUSE] menu loop left: %lu passes, held %lu ms in all\n",
+                s_menu_passes, s_menu_held_us / 1000);
+        fflush(stderr);
     }
 }
 
-static void rbx_pause_frame(void)
+void sub_00024060(void)
 {
-    static int on = -1, log;
-    static int was_paused, have_clock;
-    static uint32_t last_clock;
-    static unsigned long passes, skipped;
-    uint32_t paused;
-
+    static int on = -1;
+    static HANDLE timer;
+    static LARGE_INTEGER freq;
+    static LONGLONG next;
     if (on < 0) {
-        const char *e = getenv("RECOMP_RBX_PAUSE_TICK");
-        const char *l = getenv("RECOMP_RBX_PAUSE_LOG");
-        on = !(e && e[0] == '0');
-        log = l && l[0] == '1';
+        on = rbx_menu_flag("RECOMP_RBX_MENU_PACE", 1);
+        QueryPerformanceFrequency(&freq);
+        timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+        if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
     }
-    paused = MEM32(RBX_PAUSED_VA);
-    passes++;
-    if (log && (paused != 0) != was_paused) {
-        fprintf(stderr, "[RBX PAUSE] %s (clock %u, pass %lu, %lu passes skipped so far)\n",
-                paused ? "paused" : "resumed", MEM32(RBX_GAME_CLOCK_VA), passes, skipped);
-        fflush(stderr);
-    }
-    was_paused = paused != 0;
-    if (!on || !paused) {
-        have_clock = 0;
-        sub_00011370();
-        return;
-    }
-    {
-        uint32_t clock = MEM32(RBX_GAME_CLOCK_VA);
-        if (have_clock && clock == last_clock) {
-            /* No tick since the menu last ran: what the guest call would do,
-             * minus the call. It pops its return address and leaves eax
-             * alone (the loop ignores it). */
-            rbx_clear_input_edges();
-            skipped++;
-            g_esp += 4;
-            return;
-        }
-        have_clock = 1;
-        last_clock = clock;
-    }
-    sub_00011370();
-    if (log) {
-        /* Player 1's raw pad record as the menu's last sample read it (current
-         * state at +0x1F8: bytes 0-3 sticks, 6 d-pad up, 7 d-pad down). The
-         * edge flags are no use here: the menu may clear them when it acts. */
-        static uint32_t last_raw = 0xFFFFFFFFu, last_report;
-        uint32_t cur = RBX_INPUT_VA + 0x1F8u;
-        uint32_t raw = MEM8(cur) | MEM8(cur + 1) << 8 | MEM8(cur + 6) << 16 | MEM8(cur + 7) << 24;
-        uint32_t clock = MEM32(RBX_GAME_CLOCK_VA);
-        if (raw != last_raw) {
-            fprintf(stderr, "[RBX PAUSE] pad sticks %02X %02X up %02X down %02X (clock %u, pass %lu)\n",
-                    MEM8(cur), MEM8(cur + 1), MEM8(cur + 6), MEM8(cur + 7), clock, passes);
-            fflush(stderr);
-            last_raw = raw;
-        }
-        if (clock - last_report >= 1000u) {
-            fprintf(stderr, "[RBX PAUSE] paused: %lu passes, %lu skipped so far (clock %u)\n",
-                    passes, skipped, clock);
-            fflush(stderr);
-            last_report = clock;
+    if (on && s_menu_loop) {
+        LONGLONG interval = freq.QuadPart / 30;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        s_menu_passes++;
+        /* First pass, or one that ran late (a slow frame, a stall): start
+         * the count again rather than hurry to catch up. */
+        if (!next || now.QuadPart > next + interval) {
+            next = now.QuadPart + interval;
+        } else {
+            LONGLONG start = now.QuadPart;
+            while (now.QuadPart < next) {
+                LONGLONG left_us = (next - now.QuadPart) * 1000000 / freq.QuadPart;
+                if (left_us > 1500 && timer) {
+                    LARGE_INTEGER due;
+                    due.QuadPart = -(left_us - 1000) * 10;   /* 100 ns, relative */
+                    if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 50);
+                    else Sleep(1);
+                } else if (left_us > 1500) {
+                    Sleep(1);
+                } else {
+                    SwitchToThread();
+                }
+                QueryPerformanceCounter(&now);
+            }
+            s_menu_held_us += (unsigned long)((now.QuadPart - start) * 1000000 / freq.QuadPart);
+            next += interval;
         }
     }
+    sub_00024060_orig();
 }
 
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
-    if (xbox_va == 0x00011370u)
-        return rbx_pause_frame;
     if (xbox_va == 0x00155730u) {
         static LONG s_look;
         LONG n = InterlockedIncrement(&s_look);
