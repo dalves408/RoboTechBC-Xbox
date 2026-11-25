@@ -21,6 +21,8 @@ METRICS = [
     ("readback_ms_per_s", -1), ("shader_compiles", -1), ("shader_compile_ms", -1),
     ("forced_get_catchups", -1), ("fence_early_wakes", -1), ("fence_timeouts", -1),
     ("mmio_traps_per_s", -1), ("apu_lock_waits", -1), ("apu_lock_timeouts", -1),
+    ("shader_cache_hits", +1), ("fence_rewait_ms_per_s", -1), ("pb_dropped_walks", -1),
+    ("pb_midwalk_get_moves", -1),
 ]
 
 

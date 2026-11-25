@@ -180,7 +180,8 @@ RBX_STAT = re.compile(r"^\[RBX DX11\] frame=(\d+) flips=(\d+) draws=(\d+).*?us_d
 RBX_PERF = re.compile(r"^\[RBXPERF\] (.*)$")
 PERF_FIELDS = ["ms", "flips", "pub", "ft_avg_us", "ft_max_us", "hitch33", "hitch50", "hitch100",
                "rb_n", "rb_us", "sh_n", "sh_us", "sh_total", "catchup", "fence_early", "fence_timeout",
-               "mmio_traps", "apu_lock_waits", "apu_lock_timeouts"]
+               "mmio_traps", "apu_lock_waits", "apu_lock_timeouts", "sh_hits", "fence_wait_us",
+               "pb_drops", "pb_midwalk_get"]
 XA2_UNDERRUN = re.compile(r"^\[XA2\] underrun x(\d+)\b")
 AUDIO_HOST_UNDERRUN = re.compile(r"^\[AUDIO-HOST\].*\bunderruns=(\d+)\b")
 FRAME_PRESS = re.compile(r"^\[RBX PAD\] (\w+) observed at f(\d+) \(scheduled f(\d+)\)$", re.M)
@@ -299,6 +300,9 @@ def summarize_perf(perf, out: Path):
         "fence_timeouts": total("fence_timeout"),
         "mmio_traps_per_s": round(total("mmio_traps") / secs),
         "apu_lock_waits": total("apu_lock_waits"), "apu_lock_timeouts": total("apu_lock_timeouts"),
+        "shader_cache_hits": total("sh_hits"),
+        "fence_rewait_ms_per_s": round(total("fence_wait_us") / 1000 / secs, 2),
+        "pb_dropped_walks": total("pb_drops"), "pb_midwalk_get_moves": total("pb_midwalk_get"),
     }
 
 
@@ -633,6 +637,8 @@ def verdicts(r):
             v.append(f"PB: {p['fence_timeouts']} BlockOnFence recheck timeout(s) (2 s each)")
         if p["shader_compiles"]:
             v.append(f"SHADERS: {p['shader_compiles']} compile(s) during the run, {p['shader_compile_ms']} ms total")
+        if p.get("pb_dropped_walks"):
+            v.append(f"PB: {p['pb_dropped_walks']} walk(s) abandoned at PUT (commands skipped)")
         if p["apu_lock_timeouts"]:
             v.append(f"AUDIO: {p['apu_lock_timeouts']} voice-lock wait timeout(s)")
     if r["log"]["fault"]["count"]:

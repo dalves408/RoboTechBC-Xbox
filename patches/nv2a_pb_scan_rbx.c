@@ -299,6 +299,11 @@ static int      s_pend_noninc;
  * follows. */
 static uint32_t s_pub = 0xFFFFFFFFu;
 
+/* For the [RBXPERF] stats line (rbx_d3d11.c): walks abandoned at PUT (bad
+ * jump/call target, runaway, lost sync -- the rest of those commands are
+ * never executed), and GETs moved under the walk by someone else. */
+volatile unsigned g_rbx_pb_drops, g_rbx_pb_midwalk_get;
+
 /* RECOMP_PB_GETLOG=1: log every GET the title moves (resync or mid-walk) with
  * where the walk was and PUT, so a frame that lost commands can be traced. */
 static int pb_getlog(void)
@@ -400,7 +405,7 @@ void nv2a_pb_scan(uint32_t put_phys)
         if (get_reg) {
             uint32_t g = *get_reg;
 
-            if (g != s_pub) {                 /* the title moved GET mid-walk */
+            if (g != s_pub) { g_rbx_pb_midwalk_get++;                 /* the title moved GET mid-walk */
                 if (pb_getlog())
                     fprintf(stderr, "[PBGET] midwalk walk=%08X pub=%08X -> %08X put=%08X pend=%u call=%d\n",
                             s_get, s_pub, g & PB_PHYS_MASK, put, s_pend_left, s_in_call);
@@ -440,7 +445,7 @@ void nv2a_pb_scan(uint32_t put_phys)
         }
 
         if (s_get >= PB_RAM_BYTES) {
-            s_get = put, s_pend_left = 0;
+            s_get = put, s_pend_left = 0, g_rbx_pb_drops++;
             break;
         }
         w = *(const uint32_t *)(mem + (0x80000000u | s_get));
@@ -449,14 +454,14 @@ void nv2a_pb_scan(uint32_t put_phys)
         s_hist_n++;
 
         if (++words > 0x400000u || unknown > 64) {
-            s_get = put, s_pend_left = 0;                      /* lost sync, or runaway */
+            s_get = put, s_pend_left = 0, g_rbx_pb_drops++;                      /* lost sync, or runaway */
             break;
         }
         s_get = (s_get + 4) & PB_PHYS_MASK;
 
         if ((w & 0xE0000003u) == 0x20000000u) {         /* old-style jump */
             target = w & 0x1FFFFFFCu;
-            if (pb_bad_target(w, at, target, put)) { s_get = put, s_pend_left = 0; break; }
+            if (pb_bad_target(w, at, target, put)) { s_get = put, s_pend_left = 0, g_rbx_pb_drops++; break; }
             pb_flow(at, w, target);
             s_get = target;
             jumps++;
@@ -464,7 +469,7 @@ void nv2a_pb_scan(uint32_t put_phys)
         }
         if ((w & 3u) == 1u) {                            /* jump */
             target = w & 0xFFFFFFFCu;
-            if (pb_bad_target(w, at, target, put)) { s_get = put, s_pend_left = 0; break; }
+            if (pb_bad_target(w, at, target, put)) { s_get = put, s_pend_left = 0, g_rbx_pb_drops++; break; }
             pb_flow(at, w, target);
             s_get = target;
             jumps++;
@@ -472,13 +477,13 @@ void nv2a_pb_scan(uint32_t put_phys)
         }
         if ((w & 3u) == 2u) {                            /* call */
             target = w & 0xFFFFFFFCu;
-            if (pb_bad_target(w, at, target, put)) { s_get = put, s_pend_left = 0; break; }
+            if (pb_bad_target(w, at, target, put)) { s_get = put, s_pend_left = 0, g_rbx_pb_drops++; break; }
             if (s_in_call) {
                 /* One level only: the hardware raises a CALL error and stops
                  * the pusher. Taking it would overwrite the return address
                  * and send the first RETURN to the wrong place. */
                 s_in_call = 0;
-                s_get = put, s_pend_left = 0;
+                s_get = put, s_pend_left = 0, g_rbx_pb_drops++;
                 break;
             }
             s_ret = s_get;

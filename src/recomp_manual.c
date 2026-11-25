@@ -120,6 +120,7 @@ static int rbx_d3d_dma_busy(uint32_t device)
 volatile LONG g_rbx_forced_catchups;   /* times GET was snapped to PUT before the walker read the commands */
 volatile LONG g_rbx_fence_spurious;    /* BlockOnFence returned before its fence was reached */
 volatile LONG g_rbx_fence_timeouts;    /* ...and the 2 s recheck gave up */
+volatile LONG g_rbx_fence_wait_us;     /* time spent re-waiting after early wakes */
 
 static void rbx_d3d_force_get_catchup(uint32_t device)
 {
@@ -415,6 +416,8 @@ void sub_001558D0(void)
     t0 = GetTickCount();
     {
     unsigned spins = 0;
+    LARGE_INTEGER wq0, wq1, wqf;
+    QueryPerformanceCounter(&wq0);
     while (counter - target < counter - MEM32(fence_va)) {
         /* Sleep(0) only yields to threads of the same priority, so on a busy
          * CPU it could starve the pushbuffer walk this is waiting for. Spin
@@ -437,6 +440,9 @@ void sub_001558D0(void)
             break;
         }
     }
+    QueryPerformanceCounter(&wq1);
+    QueryPerformanceFrequency(&wqf);
+    InterlockedExchangeAdd(&g_rbx_fence_wait_us, (LONG)((wq1.QuadPart - wq0.QuadPart) * 1000000 / wqf.QuadPart));
     }
 }
 
