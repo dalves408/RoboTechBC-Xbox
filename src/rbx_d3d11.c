@@ -2638,14 +2638,22 @@ static void pace_flip(void)
     static unsigned long long next;
     unsigned long long qf = gb_qf(), interval, now;
     LARGE_INTEGER q;
-    if (s_fps_limit != last_cap) { next = 0; last_cap = s_fps_limit; }
-    if (!s_fps_limit || s_cap_drop) return;
+    /* Read the F1 setting here, not only through video_apply: that runs inside gb_flip_impl, which returns early
+     * before the back end is ready (or if it failed), and the cap must hold whatever the renderer is doing. */
+    static const unsigned limits[] = {30, 60, 120, 144, 240, 360, 0};
+    unsigned rate = (rbx_settings_video() >> 9) & 7u, cap = limits[rate < 7u ? rate : 6u];
+    if (cap != last_cap) {
+        fprintf(stderr, "[RBX DX11] FPS limit %s%u (%s)\n", cap ? "" : "off ", cap,
+                s_cap_drop ? "RECOMP_FPS_CAP_DROP: frames dropped, game not held" : "game held to it at each flip");
+        next = 0; last_cap = cap;
+    }
+    if (!cap || s_cap_drop) return;
     if (!timer_init) {
         timer_init = 1;
         timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
         if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
     }
-    interval = qf / s_fps_limit;
+    interval = qf / cap;
     QueryPerformanceCounter(&q); now = (unsigned long long)q.QuadPart;
     if (!next || now > next + interval) { next = now + interval; return; }
     if (now < next) { st_pace_n++; st_pace_us += (unsigned)((next - now) * 1000000ULL / qf); }
