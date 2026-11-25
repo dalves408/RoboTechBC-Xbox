@@ -3541,11 +3541,33 @@ static void vsh_fast_ba9e(uint32_t index, Nv2aVshOutput *o)
     for (t = 0; t < 4; t++) vsh_in(9 + (uint32_t)t, index, o->tex[t]);
 }
 
+/* 892CED0FDB0FB299 / E0318D6247FFFA7A (same words, start 0 or 23; morph):
+ * R3 = v0 * c100.y + v2 * c100.x; oPos = R3 * c96..99; oD0 = v4; oT0 = v5;
+ * oFog.x = (R3.c110) * c106.x + c106.y */
+static void vsh_fast_892c(uint32_t index, Nv2aVshOutput *o)
+{
+    float v0[4], v2[4], v4[4], r3[4], r4z;
+    const float *c100 = nv2a_vsh_constant(100), *c106 = nv2a_vsh_constant(106);
+    int k;
+    vsh_in(0, index, v0); vsh_in(2, index, v2); vsh_in(4, index, v4);
+    vsh_defaults(o);
+    for (k = 0; k < 4; k++) r3[k] = v0[k] * c100[1] + v2[k] * c100[0];
+    vsh_color(o->d0, v4);
+    o->d0_written = 1;
+    r4z = vsh_dp4(r3, nv2a_vsh_constant(110));
+    vsh_in(5, index, o->tex[0]);
+    for (k = 0; k < 4; k++) o->pos[k] = vsh_dp4(r3, nv2a_vsh_constant(96 + k));
+    o->fog[0] = r4z * c106[0] + c106[1];
+    vsh_epilogue(o);
+}
+
 typedef void (*VshFastFn)(uint32_t, Nv2aVshOutput *);
 static struct { uint64_t hash; VshFastFn fn; volatile LONG off, ok; } s_vsh_fast[] = {
     { 0x0B25A84A2631EC80ULL, vsh_fast_0b25, 0, 0 },
     { 0x9CEE4A21EBB77FF1ULL, vsh_fast_9cee, 0, 0 },
     { 0xBA9E387C24FCECE1ULL, vsh_fast_ba9e, 0, 0 },
+    { 0x892CED0FDB0FB299ULL, vsh_fast_892c, 0, 0 },
+    { 0xE0318D6247FFFA7AULL, vsh_fast_892c, 0, 0 },
 };
 
 /* The fast transform for the batch's program, or -1 when there is none. */
