@@ -53,6 +53,16 @@
  * #include "xinput_xbox.h"
  */
 
+/* Hybrid-graphics laptops (NVIDIA Optimus, AMD switchable): ask the driver to
+ * run this process on the discrete GPU. Without these exports D3D11's default
+ * adapter is the integrated one that drives the panel, so the game rendered
+ * on Intel UHD -- slower, and with the Intel-only per-draw flush workaround
+ * (RECOMP_GPU_FLUSH) -- while the dGPU sat idle. The drivers look the symbols
+ * up by name in the exe; they do nothing on single-GPU machines. A per-app
+ * choice in Windows Graphics settings still overrides them. */
+__declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+
 /* ── Global register state (defined in xbox_memory_layout.c) ── */
 
 /* RECOMP_TLS is not optional here. The runtime defines these thread-local, and
