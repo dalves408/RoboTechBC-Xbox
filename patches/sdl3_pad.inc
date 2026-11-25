@@ -100,12 +100,28 @@ static void sdlpad_init(void)
 
 /* At most once a second: free the slots of removed pads and open new ones.
  * `force` rescans now (a slot just lost its XInput pad, for instance). */
+static void sdlpad_rescan_now(void);
 static void sdlpad_rescan(int force)
 {
     Uint64 now = SDL_GetTicks();
     if (!force && now - sp_last_scan < 1000)
         return;
     sp_last_scan = now;
+    {
+        /* This runs on whichever guest thread polls the pad, once a second. Opening a pad (HIDAPI, Bluetooth)
+         * can take long enough to show as a hitch, so time it: a slow scan is logged, and if they show up in
+         * hitch reports, the scan moves to its own thread. */
+        Uint64 t0 = SDL_GetTicksNS(), dt;
+        sdlpad_rescan_now();
+        dt = (SDL_GetTicksNS() - t0) / 1000000;
+        static unsigned logged;
+        if (dt >= 4 && logged++ < 20)
+            fprintf(stderr, "[PAD] rescan took %u ms on the game thread\n", (unsigned)dt);
+    }
+}
+
+static void sdlpad_rescan_now(void)
+{
     /* SDL learns about plugged and unplugged devices when it is updated; with no pad open nothing
      * else calls that, so a pad plugged in later would never show up. */
     SDL_UpdateGamepads();
