@@ -1,9 +1,12 @@
-/* Robotech's host settings. The Esc/F1 workflow follows the NHLHitzPro player. */
+/* Robotech's host settings. The Esc/F1 workflow follows the NHLHitzPro player;
+ * the look (rbx_menu.c, rbx_ui.c) is shared with Config.exe. */
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "rbx_settings.h"
+#include "rbx_menu.h"
+#include "rbx_ui.h"
 #include "video/gpu_present.h"
 #include "input/keyboard.h"
 #include "input/xinput_xbox.h"
@@ -20,30 +23,17 @@ extern int rbx_pad_peek(DWORD port, XBOX_INPUT_STATE *state);
 extern int (*rbx_input_block_hook)(void);
 extern int rbx_sdl_window_tick(HWND, int (*)(unsigned, long, int), int (*)(void));
 
-enum { SCALE, FULLSCREEN, STRETCH, WIDE, VSYNC, RATE, AA, ANISO, HIRES, CLOSE, QUIT, ROWS };
+/* The options themselves are in rbx_options.h (shared with Config.exe). */
+enum { SCALE = RBX_OPT_SCALE, FULLSCREEN = RBX_OPT_FULLSCREEN, STRETCH = RBX_OPT_STRETCH,
+       WIDE = RBX_OPT_WIDE, VSYNC = RBX_OPT_VSYNC, RATE = RBX_OPT_RATE, AA = RBX_OPT_AA,
+       ANISO = RBX_OPT_ANISO, HIRES = RBX_OPT_HIRES, CLOSE = RBX_ROW_RESUME, QUIT = RBX_ROW_QUIT,
+       ROWS = RBX_ROW_COUNT };
 enum { CLOSED, SETTINGS, CONFIRM };
-static const struct {
-    const char *label, *key;
-    unsigned count, initial;
-    const char *values[7];
-} options[ROWS] = {
-    {"Render scale", "scale", 5, 0, {"1x / 640 x 480", "2x / 1280 x 960", "3x / 1920 x 1440", "4x / 2560 x 1920", "5x / 3200 x 2400"}},
-    {"Fullscreen", "fullscreen", 2, 0, {"Off", "On"}},
-    {"Stretch image", "stretch", 2, 0, {"Off / Keep shape", "On / Fill window"}},
-    /* Widescreen renders more of the scene left and right (Hor+) and keeps the HUD and menus at 4:3 in the middle. */
-    {"Widescreen", "widescreen", 5, 1, {"Off / 4:3", "Auto / Match window", "16:9", "16:10", "21:9"}},
-    {"VSync", "vsync", 2, 0, {"Off", "On"}},
-    {"FPS limit", "rate", 7, 6, {"30 FPS", "60 FPS", "120 FPS", "144 FPS", "240 FPS", "360 FPS", "Uncapped"}},
-    {"Anti-aliasing", "msaa", 4, 0, {"Off", "2x MSAA", "4x MSAA", "8x MSAA"}},
-    {"Anisotropic filtering", "anisotropy", 5, 0, {"Off", "2x", "4x", "8x", "16x"}},
-    {"Hi-res textures", "hires", 2, 1, {"Off", "On"}},
-    {"Close settings"}, {"Quit game"}
-};
+#define options rbx_options
 static unsigned choice[ROWS];
 static WCHAR ini[MAX_PATH];
 static HWND overlay;
-static HFONT body, heading;
-static int mode, selected, yes, initialized, sdl_window_input, scenario_mode;
+static int mode, selected, yes, initialized, sdl_window_input, scenario_mode, pad_input, from_pad;
 static volatile LONG block_input, hold_frame, video, available_msaa;
 static DWORD release_at;
 static WORD last_pad;
@@ -56,6 +46,8 @@ void rbx_settings_wait(void)
     while (InterlockedCompareExchange(&hold_frame, 0, 0))
         Sleep(8);
 }
+
+static void paint_overlay(void);
 
 static void store_choice(int row)
 {
@@ -83,78 +75,80 @@ static void fullscreen_changed(int fullscreen)
 {
     choice[FULLSCREEN] = (unsigned)fullscreen;
     store_choice(FULLSCREEN);
-    if (overlay) InvalidateRect(overlay, NULL, FALSE);
-}
-
-static void fill(HDC dc, RECT rect, COLORREF color)
-{
-    HBRUSH brush = CreateSolidBrush(color);
-    FillRect(dc, &rect, brush);
-    DeleteObject(brush);
-}
-
-static void label(HDC dc, const char *text, RECT rect, COLORREF color, UINT alignment)
-{
-    SetTextColor(dc, color);
-    DrawTextA(dc, text, -1, &rect, alignment | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (mode) paint_overlay();
 }
 
 static LRESULT CALLBACK overlay_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
 {
     if (message == WM_NCHITTEST) return HTTRANSPARENT;
-    if (message == WM_PAINT) {
-        PAINTSTRUCT paint;
-        HDC dc = BeginPaint(window, &paint);
-        RECT r;
-        GetClientRect(window, &r);
-        fill(dc, r, RGB(16, 24, 36));
-        fill(dc, (RECT){0, 0, r.right, 3}, RGB(65, 202, 196));
-        SetBkMode(dc, TRANSPARENT);
-        SelectObject(dc, heading);
-        label(dc, mode == SETTINGS ? "Video settings" : "Quit Robotech: Battlecry?",
-              (RECT){20, 12, r.right - 20, 49}, RGB(242, 249, 255), DT_LEFT);
-        SelectObject(dc, body);
-        if (mode == SETTINGS) {
-            for (int row = 0; row < ROWS; row++) {
-                int y = 55 + row * 24;
-                if (row == selected)
-                    fill(dc, (RECT){11, y, r.right - 11, y + 24}, RGB(31, 69, 82));
-                label(dc, options[row].label, (RECT){20, y, r.right - 20, y + 24},
-                      RGB(242, 249, 255), DT_LEFT);
-                if (options[row].count)
-                    label(dc, options[row].values[choice[row]],
-                          (RECT){20, y, r.right - 20, y + 24},
-                          RGB(126, 226, 218), DT_RIGHT);
-            }
-            label(dc, "Arrows change settings   Enter selects   Esc or F1 closes",
-                  (RECT){20, r.bottom - 32, r.right - 20, r.bottom - 8},
-                  RGB(171, 192, 209), DT_LEFT);
-        } else {
-            fill(dc, yes ? (RECT){r.right / 2, 59, r.right - 15, 89}
-                         : (RECT){15, 59, r.right / 2, 89}, RGB(31, 69, 82));
-            label(dc, "Keep playing", (RECT){15, 59, r.right / 2, 89}, RGB(242, 249, 255), DT_CENTER);
-            label(dc, "Quit game", (RECT){r.right / 2, 59, r.right - 15, 89}, RGB(242, 249, 255), DT_CENTER);
-        }
-        EndPaint(window, &paint);
-        return 0;
-    }
     return DefWindowProcA(window, message, wparam, lparam);
 }
 
+/* Draw the menu (rbx_menu.c) into a 32-bit bitmap the size of the game
+ * window: the panel solid, the game around it dimmed, then hand it to the
+ * layered window. Painted only when something changes. */
+static void paint_overlay(void)
+{
+    RECT client, panel, window;
+    int cut = 0;
+    if (!overlay || !mode || !GetClientRect(overlay, &client)) return;
+    int w = client.right, h = client.bottom;
+    if (w <= 0 || h <= 0) return;
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    HDC screen = GetDC(overlay), dc = CreateCompatibleDC(screen);
+    unsigned *pixels = NULL;
+    HBITMAP bitmap = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&pixels, NULL, 0);
+    if (bitmap && pixels) {
+        HGDIOBJ old = SelectObject(dc, bitmap);
+        memset(pixels, 0, (size_t)w * h * 4);
+        if (mode == SETTINGS)
+            rbx_menu_draw_settings(dc, w, h, choice, selected, pad_input, &panel, &cut);
+        else
+            rbx_menu_draw_quit(dc, w, h, yes, pad_input, &panel, &cut);
+        GdiFlush();
+        /* GDI leaves alpha at 0: make the panel opaque and the rest black at 66%. */
+        for (int y = 0; y < h; y++) {
+            unsigned *row = pixels + (size_t)y * w;
+            int inside_row = y >= panel.top && y < panel.bottom;
+            for (int x = 0; x < w; x++)
+                row[x] = inside_row && rbx_in_panel(&panel, cut, x, y) ? row[x] | 0xFF000000u
+                                                                       : 0xA8000000u;
+        }
+        POINT source = {0, 0}, target;
+        SIZE size = {w, h};
+        BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        GetWindowRect(overlay, &window);
+        target.x = window.left;
+        target.y = window.top;
+        UpdateLayeredWindow(overlay, screen, &target, &size, dc, &source, 0, &blend, ULW_ALPHA);
+        SelectObject(dc, old);
+    }
+    if (bitmap) DeleteObject(bitmap);
+    DeleteDC(dc);
+    ReleaseDC(overlay, screen);
+}
+
+/* The overlay covers the game window's client area. */
 static void position_overlay(void)
 {
     HWND parent = xbox_fb_window();
     RECT client, current;
     POINT origin = {0, 0};
-    int width = 444, height = mode == SETTINGS ? 358 : 105;
     if (!overlay || !parent || !GetClientRect(parent, &client)) return;
     ClientToScreen(parent, &origin);
-    int x = origin.x + (client.right - width) / 2;
-    int y = origin.y + (client.bottom - height) / 2;
+    int width = client.right > 1 ? client.right : 1, height = client.bottom > 1 ? client.bottom : 1;
     GetWindowRect(overlay, &current);
-    if (current.left != x || current.top != y ||
-        current.right - current.left != width || current.bottom - current.top != height)
-        SetWindowPos(overlay, HWND_TOP, x, y, width, height, SWP_NOACTIVATE);
+    if (current.left != origin.x || current.top != origin.y ||
+        current.right - current.left != width || current.bottom - current.top != height) {
+        SetWindowPos(overlay, HWND_TOP, origin.x, origin.y, width, height, SWP_NOACTIVATE);
+        paint_overlay();
+    }
 }
 
 static void open_overlay(int next)
@@ -172,11 +166,6 @@ static void open_overlay(int next)
                                   WS_EX_TRANSPARENT, wc.lpszClassName, "", WS_POPUP,
                                   0, 0, 1, 1, parent, NULL, instance, NULL);
         if (!overlay) return;
-        SetLayeredWindowAttributes(overlay, 0, 248, LWA_ALPHA);
-        body = CreateFontA(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, "Segoe UI");
-        heading = CreateFontA(-23, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
-                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, "Segoe UI");
     }
     if (!mode) {
         InterlockedExchange(&block_input, 1);
@@ -187,8 +176,8 @@ static void open_overlay(int next)
     mode = next;
     selected = yes = 0;
     position_overlay();
+    paint_overlay();
     ShowWindow(overlay, SW_SHOWNOACTIVATE);
-    InvalidateRect(overlay, NULL, FALSE);
 }
 
 static void close_overlay(void)
@@ -203,6 +192,11 @@ static void close_overlay(void)
 
 static void change_value(int direction)
 {
+    if (selected >= RBX_OPT_COUNT) {
+        /* The button row: left and right move between RESUME and QUIT GAME. */
+        selected = selected == CLOSE ? QUIT : CLOSE;
+        return;
+    }
     int count = (int)options[selected].count;
     if (!count) return;
     int value = (int)choice[selected];
@@ -220,6 +214,11 @@ int rbx_settings_key(unsigned key, long flags, int down)
 {
     if (scenario_mode) return 1;
     int repeat = (flags & (1L << 30)) != 0;
+    if (down && pad_input != from_pad) {
+        /* The key hints follow the last thing used: keyboard or controller. */
+        pad_input = from_pad;
+        if (mode) paint_overlay();
+    }
     if (key == VK_ESCAPE || key == VK_F1) {
         if (down && !repeat) {
             int next = key == VK_F1 ? SETTINGS : CONFIRM;
@@ -232,8 +231,8 @@ int rbx_settings_key(unsigned key, long flags, int down)
     if (!down) return 1;
     if (mode == SETTINGS) {
         switch (key) {
-        case VK_UP: selected = (selected + ROWS - 1) % ROWS; break;
-        case VK_DOWN: selected = (selected + 1) % ROWS; break;
+        case VK_UP: selected = selected >= CLOSE ? CLOSE - 1 : (selected + ROWS - 1) % ROWS; break;
+        case VK_DOWN: selected = selected >= CLOSE ? 0 : selected + 1; break;
         case VK_LEFT: change_value(-1); break;
         case VK_RIGHT: change_value(1); break;
         case VK_RETURN:
@@ -250,7 +249,7 @@ int rbx_settings_key(unsigned key, long flags, int down)
             close_overlay();
         }
     }
-    if (mode) InvalidateRect(overlay, NULL, FALSE);
+    if (mode) paint_overlay();
     return 1;
 }
 
@@ -279,7 +278,7 @@ void rbx_settings_tick(void)
     if (mask && !(mask & (1u << choice[AA]))) {
         do { choice[AA]--; } while (!(mask & (1u << choice[AA])));
         apply_choice(AA);
-        if (mode) InvalidateRect(overlay, NULL, FALSE);
+        if (mode) paint_overlay();
     }
     if (mode) position_overlay();
     else rbx_fb_focus_tick();
@@ -298,14 +297,20 @@ void rbx_settings_tick(void)
     WORD pressed = pad & ~last_pad;
     last_pad = pad;
     if (GetForegroundWindow() == parent) {
-        if (!mode && (pad & 0x30) == 0x30 && (pressed & 0x10)) open_overlay(SETTINGS);
+        if (!mode && (pad & 0x30) == 0x30 && (pressed & 0x10)) {
+            pad_input = 1;
+            open_overlay(SETTINGS);
+        }
         else if (mode) {
+            from_pad = 1;
+            if (pressed && !pad_input) { pad_input = 1; paint_overlay(); }
             if (pressed & (0x2000 | 0x10)) close_overlay();
             else if (pressed & 1) rbx_settings_key(VK_UP, 0, 1);
             else if (pressed & 2) rbx_settings_key(VK_DOWN, 0, 1);
             else if (pressed & 4) rbx_settings_key(VK_LEFT, 0, 1);
             else if (pressed & 8) rbx_settings_key(VK_RIGHT, 0, 1);
             else if (pressed & 0x1000) rbx_settings_key(VK_RETURN, 0, 1);
+            from_pad = 0;
         }
     }
     if (!mode && rbx_settings_input_blocked() && !pad &&
