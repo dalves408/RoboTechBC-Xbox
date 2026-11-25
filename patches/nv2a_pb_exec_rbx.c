@@ -35,6 +35,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -3424,6 +3425,157 @@ static uint64_t vp_hash(void)
     return s_vp_hash;
 }
 
+/* RBX: specialised transforms for the vertex programs this title runs.
+ *
+ * The whole game uses seven programs; two of them (the world/model transform
+ * and its skinned twin) are ~86% of all transformed vertices on the bench.
+ * Interpreting them cost ~16-23% of the pushbuffer thread, the bottleneck.
+ * Each function below is the program written out in C, reading only the
+ * inputs and constants it uses, with the interpreter's semantics: outputs
+ * not written keep the interpreter's defaults (oD0.w = oD1.w = 1, oTn =
+ * 0,0,0,1, the rest 0), colours clamp to [0,1], R12 aliases oPos, and the
+ * paired MAC+ILU of the epilogue reads before it writes (ILU result to R1).
+ * An unknown program, CXT_WRITE or RECOMP_VSH_FAST=0 uses the interpreter.
+ * RECOMP_VSH_FASTCHECK=N also runs the interpreter on every Nth vertex and
+ * compares; a mismatch is logged and turns that program's fast path off. */
+static uint32_t s_rbx_cxt_write;   /* defined with the transform workers below */
+static void vsh_in(uint32_t a, uint32_t index, float v[4])
+{
+    if (!s_gpu.attr[a].size)
+        memcpy(v, s_gpu.imm_attr[a], 4 * sizeof(float));
+    else
+        fetch_attr(&s_gpu.attr[a], index, v);
+}
+static float vsh_dp4(const float *a, const float *b) { return ((a[0] * b[0] + a[1] * b[1]) + a[2] * b[2]) + a[3] * b[3]; }
+static float vsh_dp3(const float *a, const float *b) { return (a[0] * b[0] + a[1] * b[1]) + a[2] * b[2]; }
+static float vsh_clamp01(float x) { return x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x; }
+static float vsh_rcc(float x)
+{
+    float r = 1.0f / x;
+    if (r >= 0.0f) { if (r < 5.42101e-20f) r = 5.42101e-20f; else if (r > 1.884467e19f) r = 1.884467e19f; }
+    else { if (r > -5.42101e-20f) r = -5.42101e-20f; else if (r < -1.884467e19f) r = -1.884467e19f; }
+    return r;
+}
+static void vsh_defaults(Nv2aVshOutput *o)
+{
+    int t;
+    memset(o, 0, sizeof *o);
+    o->d0[3] = o->d1[3] = 1.0f;
+    for (t = 0; t < 4; t++) o->tex[t][3] = 1.0f;
+}
+/* oPos epilogue shared by the D3D programs: pos.xyz = pos.xyz * c58 * rcc(w) + c59. */
+static void vsh_epilogue(Nv2aVshOutput *o)
+{
+    const float *c58 = nv2a_vsh_constant(58), *c59 = nv2a_vsh_constant(59);
+    float r1 = vsh_rcc(o->pos[3]);
+    int k;
+    for (k = 0; k < 3; k++)
+        o->pos[k] = (o->pos[k] * c58[k]) * r1 + c59[k];
+}
+static void vsh_color(float d[4], const float *c)
+{
+    int k;
+    for (k = 0; k < 4; k++) d[k] = vsh_clamp01(c[k]);
+}
+
+/* 0B25A84A2631EC80: oPos = v0 * c96..99; oD0 = c100; oT0 = v2;
+ * oFog.x = (v0.c110) * c106.x + c106.y; oT1.x = v1.-c101 (dp3); oT1.y = c102.w */
+static void vsh_fast_0b25(uint32_t index, Nv2aVshOutput *o)
+{
+    float v0[4], v1[4], r2z, nc101[4];
+    const float *c101 = nv2a_vsh_constant(101), *c106 = nv2a_vsh_constant(106);
+    int k;
+    vsh_in(0, index, v0); vsh_in(1, index, v1);
+    vsh_defaults(o);
+    for (k = 0; k < 4; k++) o->pos[k] = vsh_dp4(v0, nv2a_vsh_constant(96 + k));
+    vsh_color(o->d0, nv2a_vsh_constant(100));
+    o->d0_written = 1;
+    r2z = vsh_dp4(v0, nv2a_vsh_constant(110));
+    vsh_in(2, index, o->tex[0]);
+    o->fog[0] = r2z * c106[0] + c106[1];
+    for (k = 0; k < 4; k++) nc101[k] = -c101[k];
+    o->tex[1][0] = vsh_dp3(v1, nc101);
+    o->tex[1][1] = nv2a_vsh_constant(102)[3];
+    vsh_epilogue(o);
+}
+
+/* 9CEE4A21EBB77FF1: R3 = v0 + v1 * c101.xxxy; oPos = R3 * c96..99; oD0 = c100;
+ * oFog.x = (v0.c110) * c106.x + c106.y */
+static void vsh_fast_9cee(uint32_t index, Nv2aVshOutput *o)
+{
+    float v0[4], v1[4], r3[4], r4z;
+    const float *c101 = nv2a_vsh_constant(101), *c106 = nv2a_vsh_constant(106);
+    int k;
+    vsh_in(0, index, v0); vsh_in(1, index, v1);
+    vsh_defaults(o);
+    r3[0] = v0[0] + v1[0] * c101[0];
+    r3[1] = v0[1] + v1[1] * c101[0];
+    r3[2] = v0[2] + v1[2] * c101[0];
+    r3[3] = v0[3] + v1[3] * c101[1];
+    vsh_color(o->d0, nv2a_vsh_constant(100));
+    o->d0_written = 1;
+    r4z = vsh_dp4(v0, nv2a_vsh_constant(110));
+    for (k = 0; k < 4; k++) o->pos[k] = vsh_dp4(r3, nv2a_vsh_constant(96 + k));
+    o->fog[0] = r4z * c106[0] + c106[1];
+    vsh_epilogue(o);
+}
+
+typedef void (*VshFastFn)(uint32_t, Nv2aVshOutput *);
+static struct { uint64_t hash; VshFastFn fn; volatile LONG off; } s_vsh_fast[] = {
+    { 0x0B25A84A2631EC80ULL, vsh_fast_0b25, 0 },
+    { 0x9CEE4A21EBB77FF1ULL, vsh_fast_9cee, 0 },
+};
+
+/* The fast transform for the batch's program, or -1 when there is none. */
+static int vsh_fast_lookup(void)
+{
+    static int on = -1;
+    int i;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VSH_FAST");
+        on = !(e && e[0] == '0') && !getenv("RECOMP_VSH_DUMP") && !getenv("RECOMP_VSH_VERIFY")
+             && !getenv("RECOMP_VSH_NODECODE");
+    }
+    if (!on || s_rbx_cxt_write)
+        return -1;
+    for (i = 0; i < (int)(sizeof s_vsh_fast / sizeof s_vsh_fast[0]); i++)
+        if (s_vsh_fast[i].hash == s_vp_hash && !s_vsh_fast[i].off)
+            return i;
+    return -1;
+}
+
+static int vsh_close(float a, float b)
+{
+    float d = fabsf(a - b), m = fabsf(a) > fabsf(b) ? fabsf(a) : fabsf(b);
+    return d <= 1e-4f + m * 1e-4f || (a != a && b != b);
+}
+
+/* RECOMP_VSH_FASTCHECK: compare a fast result with the interpreter's. */
+static void vsh_fast_check(int fi, const float in[NV2A_VSH_INPUTS][4], const Nv2aVshOutput *f)
+{
+    Nv2aVshOutput r;
+    const float *a = (const float *)f, *b = (const float *)&r;
+    size_t k, n = offsetof(Nv2aVshOutput, d0_written) / sizeof(float);
+    static volatile LONG logged;
+    if (!nv2a_vsh_run(in, &r))
+        return;
+    for (k = 0; k < n; k++)
+        if (!vsh_close(a[k], b[k]))
+            break;
+    if (k == n && f->d0_written == r.d0_written) {
+        static volatile LONG ok;
+        if (InterlockedIncrement(&ok) == 1000)
+            fprintf(stderr, "[VSH] fast path %016llX matched the interpreter on 1000 checked vertices\n",
+                    (unsigned long long)s_vsh_fast[fi].hash);
+        return;
+    }
+    InterlockedExchange(&s_vsh_fast[fi].off, 1);
+    if (InterlockedIncrement(&logged) <= 20)
+        fprintf(stderr, "[VSH] fast path %016llX MISMATCH at float %u: fast %g interp %g (pos %g %g %g %g vs %g %g %g %g); turned off\n",
+                (unsigned long long)s_vsh_fast[fi].hash, (unsigned)k, k < n ? a[k] : 0.0f, k < n ? b[k] : 0.0f,
+                f->pos[0], f->pos[1], f->pos[2], f->pos[3], r.pos[0], r.pos[1], r.pos[2], r.pos[3]);
+}
+
 static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 {
     float in[NV2A_VSH_INPUTS][4];
@@ -3431,6 +3583,25 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 
     if (!batch_uses_program())
         return ffp_vertex(index, out);
+    {
+        int fi = vsh_fast_lookup();
+        if (fi >= 0) {
+            static int every = -1;
+            static volatile LONG tick;
+            if (every < 0) { const char *e = getenv("RECOMP_VSH_FASTCHECK"); every = e ? atoi(e) : 0; }
+            s_vsh_fast[fi].fn(index, out);
+            if (every > 0 && InterlockedIncrement(&tick) % every == 0) {
+                for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+                    if (!s_gpu.attr[a].size && a < NV_VERTEX_ATTRS)
+                        memcpy(in[a], s_gpu.imm_attr[a], sizeof in[a]);
+                    else
+                        fetch_attr(&s_gpu.attr[a], index, in[a]);
+                }
+                vsh_fast_check(fi, (const float (*)[4])in, out);
+            }
+            goto post;
+        }
+    }
     for (a = 0; a < NV2A_VSH_INPUTS; a++) {
         /* An attribute with no array (size 0) reads its current value, the
          * one the SET_VERTEX_DATA* methods left -- as the hardware does --
@@ -3446,6 +3617,7 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
     }
     if (!nv2a_vsh_run((const float (*)[4])in, out))
         return 0;
+post:
     /* oPos.w == 0 comes from a program that never divided by w: x, y and z
      * are already surface units. The hardware draws such a vertex (xemu
      * clamps w away from zero, in front of the eye), but raster_xf_clipped
