@@ -2288,6 +2288,71 @@ static void backend_conv(const Nv2aVshOutput *v, Nv2aVertex *o)
     backend_from_xf(v, o);
 }
 
+/* RBX: indexed hand-off. A program batch used to reach the back end as three
+ * full vertices per triangle (~112 bytes each), which the back end copied
+ * again per triangle: together ~20% of this thread in the bench profile.
+ * Now each transformed vertex is converted and handed over once, and the
+ * triangles as 32-bit indices (g_rbx_bidx); the back end draws them with
+ * DrawIndexed. Clipped vertices (stack copies) are appended as new ones.
+ * RECOMP_GPU_INDEXED=0 restores the expanded hand-off. */
+const uint32_t *g_rbx_bidx;
+uint32_t g_rbx_bidx_n;
+static uint32_t *s_bidx, s_bidx_n, *s_bslot_tag, *s_bslot_out, s_bslot_gen;
+static int s_bidx_mode;
+extern int rbx_gpu_indexed_ok(void);
+
+/* At the start of a program batch's triangles: use the indexed hand-off? */
+static void bidx_begin(void)
+{
+    static int on = -1;
+    s_bidx_mode = 0;
+    s_bidx_n = 0;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_INDEXED");
+        on = !(e && e[0] == '0');
+    }
+    if (!on || s_bcount || !rbx_gpu_indexed_ok())
+        return;
+    if (!s_bverts && !(s_bverts = (Nv2aVertex *)calloc(NV_BACKEND_MAX_VERTS, sizeof *s_bverts)))
+        return;
+    if (!s_bidx && !(s_bidx = (uint32_t *)malloc(NV_BACKEND_MAX_VERTS * sizeof *s_bidx)))
+        return;
+    if (!s_bslot_tag) {
+        s_bslot_tag = (uint32_t *)calloc(NV_MAX_INDICES, sizeof *s_bslot_tag);
+        s_bslot_out = (uint32_t *)malloc(NV_MAX_INDICES * sizeof *s_bslot_out);
+        if (!s_bslot_tag || !s_bslot_out) {
+            free(s_bslot_tag); free(s_bslot_out);
+            s_bslot_tag = s_bslot_out = NULL;
+            return;
+        }
+    }
+    if (++s_bslot_gen == 0) {          /* wrapped: forget every slot */
+        memset(s_bslot_tag, 0, NV_MAX_INDICES * sizeof *s_bslot_tag);
+        s_bslot_gen = 1;
+    }
+    s_bidx_mode = 1;
+}
+
+/* The hand-off index of a vertex, converting it on first use; ~0u when full. */
+static uint32_t bidx_vertex(const Nv2aVshOutput *v)
+{
+    uint32_t slot = 0;
+    int cached = s_xf && v >= s_xf && v < s_xf + NV_MAX_INDICES;
+    if (cached) {
+        slot = (uint32_t)(v - s_xf);
+        if (s_bslot_tag[slot] == s_bslot_gen)
+            return s_bslot_out[slot];
+    }
+    if (s_bcount >= NV_BACKEND_MAX_VERTS)
+        return ~0u;
+    backend_from_xf(v, &s_bverts[s_bcount]);
+    if (cached) {
+        s_bslot_tag[slot] = s_bslot_gen;
+        s_bslot_out[slot] = s_bcount;
+    }
+    return s_bcount++;
+}
+
 /* `textured`: the batch carried texture coordinates, so the bound texture is
  * part of it. */
 uint32_t g_dbg_batches, g_dbg_flush0, g_dbg_xffail, g_dbg_short, g_dbg_begin, g_dbg_ilf, g_dbg_dpn, g_dbg_dp;
@@ -2301,7 +2366,9 @@ static void backend_flush(int textured)
     unsigned st;
     int use_rgb, use_a, in_textured = textured;
 
-    if (!s_bcount) { g_dbg_flush0++; return; }
+    int indexed = s_bidx_mode;
+    s_bidx_mode = 0;
+    if (!s_bcount || (indexed && !s_bidx_n)) { g_dbg_flush0++; s_bcount = 0; s_bidx_n = 0; return; }
     current_surface(&surf);
     current_render_state(&rs);
     batch.vertices = s_bverts;
@@ -2395,8 +2462,10 @@ static void backend_flush(int textured)
         tex.use_mask = (use_rgb ? 1u : 0u) | (use_a ? 2u : 0u);
         batch.texture = &tex;
     }
+    if (indexed) { g_rbx_bidx = s_bidx; g_rbx_bidx_n = s_bidx_n; }
     s_backend->draw(&surf, &batch);
-    s_gpu.tris_drawn += s_bcount / 3;
+    s_gpu.tris_drawn += (indexed ? s_bidx_n : s_bcount) / 3;
+    g_rbx_bidx = NULL; g_rbx_bidx_n = 0; s_bidx_n = 0;
     s_bcount = 0;
     note_drawn();
 }
@@ -3038,6 +3107,17 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
             int front = ff == 0x901 ? sa < 0.0f : sa > 0.0f;
             if ((cf == 0x405 && !front) || (cf == 0x404 && front) || cf == 0x408)
                 return;
+        }
+        if (s_bidx_mode) {
+            uint32_t ia, ib, ic;
+            if (s_bidx_n + 3 > NV_BACKEND_MAX_VERTS)
+                return;
+            ia = bidx_vertex(va); ib = bidx_vertex(vb); ic = bidx_vertex(vc);
+            if (ia == ~0u || ib == ~0u || ic == ~0u)
+                return;
+            s_bidx[s_bidx_n] = ia; s_bidx[s_bidx_n + 1] = ib; s_bidx[s_bidx_n + 2] = ic;
+            s_bidx_n += 3;
+            return;
         }
         if ((o = backend_slot()) != NULL) {
             backend_conv(va, &o[0]);
@@ -3688,6 +3768,8 @@ xf_done:
 
     if (++s_bvc_gen == 0)          /* new batch: converted vertices are stale */
         s_bvc_gen = 1;
+    if (backend_draws())
+        bidx_begin();
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < n; i += 3)
