@@ -1,6 +1,6 @@
 # Native widescreen
 
-F1 → **Widescreen**: `Off / 4:3` (default), `Auto / Match window`, `16:9`, `16:10`, `21:9`. Saved as `widescreen=` in
+F1 → **Widescreen**: `Off / 4:3`, `Auto / Match window` (default), `16:9`, `16:10`, `21:9`. Saved as `widescreen=` in
 `settings.ini` (`[video]`, 0–4). Environment override: `RECOMP_RBX_WIDESCREEN=off|auto|16:9|16:10|21:9`, or any
 other shape as `w:h` / a plain ratio (`32:9`, `2.4`), which the renderer uses directly.
 

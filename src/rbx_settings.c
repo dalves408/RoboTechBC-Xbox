@@ -31,7 +31,7 @@ static const struct {
     {"Fullscreen", "fullscreen", 2, 0, {"Off", "On"}},
     {"Stretch image", "stretch", 2, 0, {"Off / Keep shape", "On / Fill window"}},
     /* Widescreen renders more of the scene left and right (Hor+) and keeps the HUD and menus at 4:3 in the middle. */
-    {"Widescreen", "widescreen", 5, 0, {"Off / 4:3", "Auto / Match window", "16:9", "16:10", "21:9"}},
+    {"Widescreen", "widescreen", 5, 1, {"Off / 4:3", "Auto / Match window", "16:9", "16:10", "21:9"}},
     {"VSync", "vsync", 2, 0, {"Off", "On"}},
     {"FPS limit", "rate", 7, 6, {"30 FPS", "60 FPS", "120 FPS", "144 FPS", "240 FPS", "360 FPS", "Uncapped"}},
     {"Anti-aliasing", "msaa", 4, 0, {"Off", "2x MSAA", "4x MSAA", "8x MSAA"}},
