@@ -121,6 +121,7 @@ static uint32_t s_vb_off;
 /* F1 options, requested from the window's thread and applied at a flip. */
 static int s_scale = 1, s_resets;
 static unsigned s_msaa = 1, s_msaa_mask = 1, s_aniso = 1, s_fps_limit;
+static int s_cap_drop;   /* RECOMP_FPS_CAP_DROP=1: the FPS limit only drops frames on their way to the window (old) */
 static ID3D11VertexShader *s_bl_vs;
 static ID3D11PixelShader *s_bl_ps;
 static ID3D11Buffer *s_bl_cb;
@@ -382,7 +383,7 @@ static int gb_ready(void)
     if (s_failed) return 0;
     if (!s_inited) {
         s_inited = 1;
-        s_verbose = getenv("RECOMP_GPU_STATS") != NULL; s_trace = getenv("RECOMP_GPU_TRACE") != NULL; { const char *ta = getenv("RECOMP_GPU_TRACEALL"); s_trace_all = ta != NULL; if (ta && sscanf(ta, "%u-%u", &s_ta_lo, &s_ta_hi) != 2) { s_ta_lo = 0; s_ta_hi = 0xFFFFFFFFu; s_ta_sig = (ta[0] == (char)115); } } { const char *re = getenv("RECOMP_GPU_RBEVERY"); s_rb_every = re ? atoi(re) : 8; if (s_rb_every < 0) s_rb_every = 1; if (getenv("RECOMP_GPU_SKIPRB")) s_rb_every = 0; } /* targets the GPU samples are read back every Nth flip (1 = every flip, 0 = never) */ s_rb_sync = getenv("RECOMP_GPU_SYNC_RB") != NULL;
+        s_verbose = getenv("RECOMP_GPU_STATS") != NULL; s_trace = getenv("RECOMP_GPU_TRACE") != NULL; { const char *ta = getenv("RECOMP_GPU_TRACEALL"); s_trace_all = ta != NULL; if (ta && sscanf(ta, "%u-%u", &s_ta_lo, &s_ta_hi) != 2) { s_ta_lo = 0; s_ta_hi = 0xFFFFFFFFu; s_ta_sig = (ta[0] == (char)115); } } { const char *re = getenv("RECOMP_GPU_RBEVERY"); s_rb_every = re ? atoi(re) : 8; if (s_rb_every < 0) s_rb_every = 1; if (getenv("RECOMP_GPU_SKIPRB")) s_rb_every = 0; } /* targets the GPU samples are read back every Nth flip (1 = every flip, 0 = never) */ s_rb_sync = getenv("RECOMP_GPU_SYNC_RB") != NULL; s_cap_drop = getenv("RECOMP_FPS_CAP_DROP") != NULL;
         { const char *c = getenv("RECOMP_GPU_CULL"); if (c && c[0] == '0') s_cull_on = 0; }
         if (!gb_init()) { s_failed = 1; fprintf(stderr, "[RBX DX11] init failed\n"); return 0; }
     }
@@ -2398,7 +2399,7 @@ static void publish_frame(void)
     }
     if (!rt->shown_dirty && s_share_on) return;
     if (s_fps_limit != last_limit) { next_frame = 0; last_limit = s_fps_limit; }
-    if (s_fps_limit) {
+    if (s_fps_limit && s_cap_drop) {
         QueryPerformanceCounter(&now);
         if ((unsigned long long)now.QuadPart < next_frame) return;
     }
@@ -2448,7 +2449,7 @@ static void publish_frame(void)
     rt->shown_dirty = 0;
     gpu_present_frame_ready();
     st_pub++;
-    if (s_fps_limit) {
+    if (s_fps_limit && s_cap_drop) {
         unsigned long long interval = gb_qf() / s_fps_limit;
         unsigned long long current = (unsigned long long)now.QuadPart;
         next_frame = next_frame && current - next_frame < interval ? next_frame + interval : current + interval;
@@ -2579,7 +2580,45 @@ static void gb_flip_impl(void)
 static unsigned qpc_us(void) { static LARGE_INTEGER f; LARGE_INTEGER t; if (!f.QuadPart) QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t); return (unsigned)((t.QuadPart * 1000000ULL) / f.QuadPart); }
 static void gb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t flags, uint32_t argb, uint32_t zst) { unsigned t0 = qpc_us(); gb_mark(1); gb_clear_impl(s, rs, flags, argb, zst); gb_mark(0); st_us_clear += qpc_us() - t0; }
 static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b) { unsigned t0 = qpc_us(); gb_mark(2); gb_draw_impl(s, b); gb_mark(0); st_us_draw += qpc_us() - t0; }
-static void gb_flip(void) { unsigned t0 = qpc_us(); gb_mark(4); gb_flip_impl(); gb_mark(0); st_us_flip += qpc_us() - t0; }
+/* The FPS limit (F1 menu). It used to drop frames on their way to the window while the game kept flipping as fast as
+ * it could, so the rate on screen wandered around the cap (each shown frame waited for the next guest flip past its
+ * deadline) and the game still used the whole CPU and GPU. Now the pushbuffer thread holds each flip until its slot:
+ * the game waits on its fences as it would on vsync, and runs at the cap. A run more than one frame late re-anchors
+ * instead of bursting to catch up. A high-resolution waitable timer sleeps to ~1 ms before the slot, then a short
+ * yield loop lands on it. RECOMP_FPS_CAP_DROP=1 restores the old behaviour. */
+static void pace_flip(void)
+{
+    static HANDLE timer;
+    static int timer_init;
+    static unsigned last_cap;
+    static unsigned long long next;
+    unsigned long long qf = gb_qf(), interval, now;
+    LARGE_INTEGER q;
+    if (s_fps_limit != last_cap) { next = 0; last_cap = s_fps_limit; }
+    if (!s_fps_limit || s_cap_drop) return;
+    if (!timer_init) {
+        timer_init = 1;
+        timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+        if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+    }
+    interval = qf / s_fps_limit;
+    QueryPerformanceCounter(&q); now = (unsigned long long)q.QuadPart;
+    if (!next || now > next + interval) { next = now + interval; return; }
+    while (now < next) {
+        unsigned long long left_us = (next - now) * 1000000ULL / qf;
+        if (left_us > 1500) {
+            if (timer) {
+                LARGE_INTEGER due;
+                due.QuadPart = -(LONGLONG)((left_us - 1000) * 10);   /* 100 ns units, relative */
+                if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 50);
+                else Sleep(1);
+            } else Sleep(1);
+        } else SwitchToThread();
+        QueryPerformanceCounter(&q); now = (unsigned long long)q.QuadPart;
+    }
+    next += interval;
+}
+static void gb_flip(void) { unsigned t0 = qpc_us(); gb_mark(4); gb_flip_impl(); gb_mark(0); st_us_flip += qpc_us() - t0; pace_flip(); }
 static const Nv2aBackend s_backend = { gb_clear, gb_draw, gb_flip };
 
 
