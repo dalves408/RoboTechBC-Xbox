@@ -139,6 +139,8 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 | `-DRBX_ABI_CHECK=ON` (CMake) | Diagnostic build that reports lifted functions which fail to restore ebx/esi/edi/esp. |
 | `RECOMP_STUB_LOG=1` | Logs when an unresolved lifter stub is reached. |
 | `RECOMP_PROF=lo-hi` | Samples the busiest thread between those seconds and prints hot source lines. |
+| `RECOMP_KICK_STALL_MS=n` | How long KickOff waits with no pushbuffer-walk progress before forcing GET to PUT (default 500). Forced catch-ups drop commands; they show as `forced_get_catchups` in `--gpu-stats` runs. |
+| `RECOMP_KICK_FORCE_MS=n` | A/B only: restores the old behaviour, forcing GET to PUT after a fixed n ms whether or not the walk is moving. |
 | `RECOMP_XF_THREADS=n` | Overrides the vertex-transform worker count (0 disables workers, max 7). Default: one worker on hosts with at least four logical CPUs. |
 
 ## Hard constraints (do not regress)
