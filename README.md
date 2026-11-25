@@ -60,7 +60,7 @@ That launcher:
 
 Keys work even when the console keeps focus (raw INPUTSINK + async). Enter/Space/Z skip guest Bink/Attract once the pad map is open (~20–40s in). Wait through logos to the title menu.
 
-Versus supports two players. Connect two SDL3 gamepads for separate controls. If Player 2 disconnects, their controls go neutral and resume when SDL3 reconnects the pad. Keyboard and mouse control Player 1. Controller 1 can hold Back and press Start to open Video settings. Use the D-pad or left stick and A to adjust settings, and B or Start to close the overlay.
+Versus supports two players. Connect two SDL3 gamepads for separate controls; the game sees Player 2's controller once a second gamepad is connected (with one, there is no Player 2). If Player 2 disconnects, their controls go neutral and resume when SDL3 reconnects the pad. Keyboard and mouse control Player 1. Controller 1 can hold Back and press Start to open Video settings. Use the D-pad or left stick and A to adjust settings, and B or Start to close the overlay.
 
 `Config.exe` ([screenshot](docs/ui/config.png), [controls](docs/ui/config_controls.png)), built beside the game, edits the same settings outside the game: the same options, mouse or keyboard, with Save & Play.
 

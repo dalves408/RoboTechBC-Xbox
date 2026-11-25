@@ -183,6 +183,7 @@ static int s_device_hc;
 static unsigned s_ndp = OHCI_PORTS;
 static int s_npads = 1;          /* RECOMP_USB_PADS */
 static int s_auto_pads = 1;      /* RECOMP_USB_PADS unset: pads 2-4 follow the host controllers (hot-plug) */
+static int s_sticky_pads;        /* RECOMP_USB_PADS=sticky: as auto, but a pad once plugged stays plugged */
 static int s_synth_inflight;     /* SYNTH work TD on done queue until WDH ACK */
 static int s_enabled;
 static int s_trace;
@@ -1373,7 +1374,9 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * RECOMP_USB_PADS=N plugs pads 1..N and leaves them. Unset, pads 2-4
          * follow the host: a controller that appears in XInput is plugged
          * into the next port, and one that goes away for ~1.5 s is unplugged
-         * (the title sees a removal and an arrival, as with a real pad). */
+         * (the title sees a removal and an arrival, as with a real pad).
+         * RECOMP_USB_PADS=sticky plugs them the same way but never unplugs:
+         * a controller that drops out leaves its player neutral, not gone. */
         if (plugged) {
             int q, all_configured = 1;
             static unsigned long absent_since[USB_GAMEPAD_MAX];
@@ -1396,7 +1399,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                         settle = 0;
                         all_configured = 0;
                     }
-                } else if (!want && s_pad_plugged[q] && s_auto_pads) {
+                } else if (!want && s_pad_plugged[q] && s_auto_pads && !s_sticky_pads) {
                     unsigned long now = (unsigned long)GetTickCount();
                     if (!absent_since[q])
                         absent_since[q] = now ? now : 1;
@@ -1633,7 +1636,9 @@ void xbox_OhciInit(void)
             int n = atoi(ndpspec);
             if (n >= 1 && n <= 4) s_ndp = (unsigned)n;
         }
-        if (padspec) {
+        if (padspec && !_stricmp(padspec, "sticky"))
+            s_sticky_pads = 1;          /* auto plug, no unplug */
+        else if (padspec) {
             int n = atoi(padspec);
             if (n >= 1 && n <= USB_GAMEPAD_MAX) { s_npads = n; s_auto_pads = 0; }
         }

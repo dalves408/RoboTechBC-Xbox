@@ -476,8 +476,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             { "RECOMP_FB_WINDOW", "1" },
             { "RECOMP_KEYBOARD", "1" },
             { "RECOMP_USB", "1" },
-            /* Keep both Versus ports enumerated while SDL reconnects host pads. */
-            { "RECOMP_USB_PADS", "2" },
+            /* Pad 2 is plugged when a second host controller appears and then
+             * stays plugged, so Versus keeps both ports while SDL reconnects
+             * a pad, but one controller never shows the game a phantom
+             * player 2 (it waited for input from a pad that was not there). */
+            { "RECOMP_USB_PADS", "sticky" },
             /* Off for Ch1 bring-up: FENCE_EXEC held the guest on unpublished
              * fences while the cinematic walker crawled (~draws freeze at
              * 331). Opt in once HUD flight is solid. */
