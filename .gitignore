@@ -75,6 +75,7 @@ analysis/vsh*/
 xbox_kernel.log
 *.log
 /SaveData/
+/shader_cache/
 /settings.ini
 /texture_pack/
 
@@ -97,3 +98,4 @@ build_abi/
 
 # Packaged test releases (contain disc data - never commit)
 dist/
+/crashes/

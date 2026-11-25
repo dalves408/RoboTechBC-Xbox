@@ -116,6 +116,12 @@ static int rbx_d3d_dma_busy(uint32_t device)
     return put != get;
 }
 
+/* Perf counters, read by the [RBXPERF] stats line in rbx_d3d11.c. */
+volatile LONG g_rbx_forced_catchups;   /* times GET was snapped to PUT before the walker read the commands */
+volatile LONG g_rbx_fence_spurious;    /* BlockOnFence returned before its fence was reached */
+volatile LONG g_rbx_fence_timeouts;    /* ...and the 2 s recheck gave up */
+volatile LONG g_rbx_fence_wait_us;     /* time spent re-waiting after early wakes */
+
 static void rbx_d3d_force_get_catchup(uint32_t device)
 {
     uint32_t pb, put;
@@ -129,6 +135,7 @@ static void rbx_d3d_force_get_catchup(uint32_t device)
     put = MEM32(device + 0x2Cu) & 0x0FFFFFFFu;
     if (pb)
         MEM32(pb + 0x44u) = put;
+    InterlockedIncrement(&g_rbx_forced_catchups);
     hw_put = xbox_Nv2aRegPtr(RBX_NV2A_USER_DMA_PUT);
     hw_get = xbox_Nv2aRegPtr(RBX_NV2A_USER_DMA_GET);
     if (hw_put && hw_get)
@@ -153,13 +160,16 @@ void rbx_d3d_pfb_spin_yield(void)
     SwitchToThread();
 }
 
-/* Called from gen KickOff when 0x156840 still reports busy after one yield. */
+static void rbx_d3d_wait_get(uint32_t device);
+
+/* Called from gen KickOff when 0x156840 still reports busy after one yield.
+ * This used to force GET to PUT at once, marking commands the walk had not
+ * read as consumed; it now waits for the walk like the indirect KickOff. */
 void rbx_d3d_kick_get_yield(void)
 {
     uint32_t device = MEM32(0x00166B48u);
     xbox_Nv2aKickHint();
-    rbx_d3d_force_get_catchup(device);
-    SwitchToThread();
+    rbx_d3d_wait_get(device);
 }
 
 static void rbx_d3d_wait_pfb(uint32_t regs)
@@ -179,17 +189,63 @@ static void rbx_d3d_wait_pfb(uint32_t regs)
         xbox_Nv2aAckBusyBits();
 }
 
-/* Wait until GET catches PUT, or force catch-up after ~budget_ms. */
-static void rbx_d3d_wait_get(uint32_t device, int budget_ms)
+/* How long KickOff waits for the pushbuffer walk before it gives up and
+ * snaps GET to PUT.
+ *
+ * Snapping GET tells XDK D3D that commands the walk has not read are
+ * consumed. The walk then sees a GET it did not publish, takes it as the
+ * title moving GET, and jumps to PUT: the rest of that frame's commands --
+ * fences and semaphore releases among them -- are never executed, and D3D
+ * may reuse that ring space (the menu-flash class of bug). It used to happen
+ * after a fixed 4 ms, or at once on the direct-call path, so any slow walk
+ * (a shader compile, a texture decode, a busy CPU) could drop commands.
+ *
+ * Now the wait only gives up when the walk stops moving: GET unchanged for
+ * RECOMP_KICK_STALL_MS (default 500). RECOMP_KICK_FORCE_MS=n restores the
+ * old fixed budget of n ms, for A/B. */
+static int rbx_kick_force_ms(void)
 {
-    LARGE_INTEGER t0, t, freq;
-    int spins = 0;
+    static int v = -2;
+    if (v == -2) {
+        const char *e = getenv("RECOMP_KICK_FORCE_MS");
+        v = (e && *e) ? atoi(e) : -1;
+        if (v == 0) v = 1;
+    }
+    return v;
+}
+
+static int rbx_kick_stall_ms(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_KICK_STALL_MS");
+        v = (e && *e) ? atoi(e) : 500;
+        if (v < 1) v = 1;
+    }
+    return v;
+}
+
+/* Upper bound on one KickOff wait even while the walk keeps moving. */
+#define RBX_KICK_MAX_MS 3000
+
+/* Wait until GET catches PUT. Gives up (and forces catch-up) only after the
+ * walk has made no progress for the stall budget -- see above. */
+static void rbx_d3d_wait_get(uint32_t device)
+{
+    LARGE_INTEGER t0, tstart, t, freq;
+    int spins = 0, force_ms = rbx_kick_force_ms();
+    int budget_ms = force_ms > 0 ? force_ms : rbx_kick_stall_ms();
+    uint32_t pb, last_get;
 
     if (!rbx_d3d_dma_busy(device))
         return;
+    pb = MEM32(device + 0x23BCu);
+    last_get = MEM32(pb + 0x44u) & 0x0FFFFFFFu;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
+    tstart = t0;
     for (;;) {
+        uint32_t get;
         xbox_Nv2aKickHint();
         if (!rbx_d3d_dma_busy(device))
             return;
@@ -200,7 +256,20 @@ static void rbx_d3d_wait_get(uint32_t device, int budget_ms)
         spins = 0;
         SwitchToThread();
         QueryPerformanceCounter(&t);
+        get = MEM32(pb + 0x44u) & 0x0FFFFFFFu;
+        if (force_ms <= 0 && get != last_get &&
+            (t.QuadPart - tstart.QuadPart) * 1000 < freq.QuadPart * (LONGLONG)RBX_KICK_MAX_MS) {
+            last_get = get;      /* the walk is moving: restart the stall clock */
+            t0 = t;
+            continue;
+        }
         if ((t.QuadPart - t0.QuadPart) * 1000 >= freq.QuadPart * (LONGLONG)budget_ms) {
+            static LONG s_stall_log;
+            if (force_ms <= 0 && InterlockedIncrement(&s_stall_log) <= 8) {
+                fprintf(stderr, "[RBX] KickOff: pushbuffer walk made no progress for %d ms (GET=%08X); forcing catch-up\n",
+                        budget_ms, get);
+                fflush(stderr);
+            }
             rbx_d3d_force_get_catchup(device);
             return;
         }
@@ -284,9 +353,9 @@ static void rbx_d3d_kickoff_yield(void)
     if (MEM32(0x00166B4Cu) != 0) {
         uint32_t get0 = pb ? (MEM32(pb + 0x44u) & 0x0FFFFFFFu) : 0;
         int busy0 = rbx_d3d_dma_busy(self);
-        /* ~4 ms: long enough for a hot ack/walker tick, short enough that a
-         * stuck GET cannot freeze the Ch1 cinematic for minutes. */
-        rbx_d3d_wait_get(self, 4);
+        /* Waits while the walk is making progress; a walk stuck for the
+         * stall budget is still forced through (see rbx_kick_stall_ms). */
+        rbx_d3d_wait_get(self);
         if ((n0 % 256) == 1) {
             uint32_t get1 = pb ? (MEM32(pb + 0x44u) & 0x0FFFFFFFu) : 0;
             fprintf(stderr,
@@ -315,11 +384,30 @@ static void rbx_d3d_kickoff_yield(void)
  * unread ring as free and overwrote commands the walk had not read (menu
  * flashes, "[PB] bad target" resyncs). Re-check the fence before returning;
  * a spurious wake now only costs a short spin. RECOMP_FENCE_RECHECK=0 = off. */
+extern void *volatile g_rbx_fence_event;        /* patches/nv2a_pb_exec_rbx.c */
+extern volatile long g_rbx_fence_event_live;
+
+/* Auto-reset event the pushbuffer walk sets on every fence write.
+ * RECOMP_FENCE_EVENT=0 keeps the spinning wait. */
+static HANDLE rbx_fence_event(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_FENCE_EVENT");
+        on = !(e && e[0] == '0');
+    }
+    if (on && !g_rbx_fence_event) {
+        HANDLE h = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (h && InterlockedCompareExchangePointer((PVOID volatile *)&g_rbx_fence_event, h, NULL) != NULL)
+            CloseHandle(h);
+    }
+    return on ? (HANDLE)g_rbx_fence_event : NULL;
+}
+
 extern void sub_001558D0_orig(void);
 void sub_001558D0(void)
 {
     static int on = -1;
-    static LONG s_spurious, s_timeouts;
     uint32_t target = MEM32(g_esp + 4);
     uint32_t dev, fence_va, counter;
     DWORD t0;
@@ -338,7 +426,7 @@ void sub_001558D0(void)
     if (counter - target >= counter - MEM32(fence_va))
         return;
     {
-        LONG n = InterlockedIncrement(&s_spurious);
+        LONG n = InterlockedIncrement(&g_rbx_fence_spurious);
         if (n <= 4 || (n & (n - 1)) == 0) {
             fprintf(stderr, "[RBX] BlockOnFence woke early: fence=%08X target=%08X counter=%08X (#%ld)\n",
                     MEM32(fence_va), target, counter, (long)n);
@@ -346,9 +434,31 @@ void sub_001558D0(void)
         }
     }
     t0 = GetTickCount();
+    {
+    unsigned spins = 0;
+    HANDLE fence_ev = rbx_fence_event();
+    LARGE_INTEGER wq0, wq1, wqf;
+    QueryPerformanceCounter(&wq0);
     while (counter - target < counter - MEM32(fence_va)) {
+        /* Sleep(0) only yields to threads of the same priority, so on a busy
+         * CPU it could starve the pushbuffer walk this is waiting for. Spin
+         * briefly, then SwitchToThread (any ready thread on this core), then
+         * Sleep(1) once the wait is clearly not short. */
+        xbox_Nv2aKickHint();
+        if (++spins < 256)
+            YieldProcessor();
+        else if (fence_ev && g_rbx_fence_event_live)
+            /* Sleep until the walk writes the fence word (it signals this
+             * event); the 1 ms timeout covers a write that raced the reset.
+             * Spinning here took ~48% of the render thread in missions and
+             * competed with the pushbuffer thread for CPU. */
+            WaitForSingleObject(fence_ev, 1);
+        else if (GetTickCount() - t0 < 50u)
+            SwitchToThread();
+        else
+            Sleep(1);
         if (GetTickCount() - t0 > 2000u) {
-            LONG n = InterlockedIncrement(&s_timeouts);
+            LONG n = InterlockedIncrement(&g_rbx_fence_timeouts);
             if (n <= 8) {
                 fprintf(stderr, "[RBX] BlockOnFence recheck timeout fence=%08X target=%08X\n",
                         MEM32(fence_va), target);
@@ -356,7 +466,10 @@ void sub_001558D0(void)
             }
             break;
         }
-        Sleep(0);
+    }
+    QueryPerformanceCounter(&wq1);
+    QueryPerformanceFrequency(&wqf);
+    InterlockedExchangeAdd(&g_rbx_fence_wait_us, (LONG)((wq1.QuadPart - wq0.QuadPart) * 1000000 / wqf.QuadPart));
     }
 }
 

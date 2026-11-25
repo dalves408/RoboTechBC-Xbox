@@ -31,7 +31,7 @@ static const struct {
     {"Fullscreen", "fullscreen", 2, 0, {"Off", "On"}},
     {"Stretch image", "stretch", 2, 0, {"Off / 4:3", "On / Fill window"}},
     {"VSync", "vsync", 2, 0, {"Off", "On"}},
-    {"Display FPS limit", "rate", 7, 6, {"30 FPS", "60 FPS", "120 FPS", "144 FPS", "240 FPS", "360 FPS", "Uncapped"}},
+    {"FPS limit", "rate", 7, 6, {"30 FPS", "60 FPS", "120 FPS", "144 FPS", "240 FPS", "360 FPS", "Uncapped"}},
     {"Anti-aliasing", "msaa", 4, 0, {"Off", "2x MSAA", "4x MSAA", "8x MSAA"}},
     {"Anisotropic filtering", "anisotropy", 5, 0, {"Off", "2x", "4x", "8x", "16x"}},
     {"Hi-res textures", "hires", 2, 1, {"Off", "On"}},

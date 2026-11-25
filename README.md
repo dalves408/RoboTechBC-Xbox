@@ -107,15 +107,66 @@ For repeatable input timing, use `--frame-pad "f360:a,f540:a,f720:a:18"` instead
 
 Add `--frame-dump-every 240` to capture numbered BMPs. On a second run add `--compare-frames analysis/diag/<first-run>/frames` to report matching frame numbers, missing captures, and mean RGB errors. Guest clocks and audio still run in real time, so matching input numbers alone do not guarantee pixel-identical frames.
 
+### Performance baseline and A/B
+
+Add `--gpu-stats` to any `rbx_diag.py` run. Every 2 s the game prints an `[RBXPERF]` line, and the report adds a `perf` summary and writes `perf.csv`:
+
+| Field | Meaning |
+| --- | --- |
+| `guest_fps`, `presented_fps` | Game flips per second, and frames handed to the window |
+| `frame_ms_avg`, `frame_ms_worst`, `hitches_over_33/50/100ms` | Flip-to-flip time on the pushbuffer thread |
+| `readback_ms_per_s` | Time spent copying render targets back into Xbox memory |
+| `shader_compiles`, `shader_compile_ms`, `shader_cache_hits` | Shaders compiled during the run (each one is a hitch), and shaders loaded from the disk cache instead |
+| `fence_rewait_ms_per_s` | Time BlockOnFence spends waiting again after an early wake |
+| `pb_dropped_walks`, `pb_midwalk_get_moves` | Pushbuffer walks abandoned at PUT (commands skipped), and GET moved under the walk |
+| `rt_created`, `rt_evicted`, `rt_alias_created` | Render targets created, evicted from the 8 slots, and created at an address that already had one |
+| `partial_clears` | Colour clears limited to a rectangle or to some channels (drawn, not wiped) |
+| `flips_without_gpu_target`, `flips_with_several_targets` | Flips the window had to show from guest memory, and flips with more than one candidate image |
+| `forced_get_catchups` | KickOff gave up waiting and marked unread pushbuffer commands as consumed |
+| `fence_early_wakes`, `fence_timeouts` | BlockOnFence woke before its fence; the 2 s recheck gave up |
+| `mmio_traps_per_s` | APU/USB register accesses handled by an exception trap |
+| `apu_lock_waits`, `apu_lock_timeouts` | Voice processor waits on the title's VOICE_LOCK, and waits that hit the limit |
+
+Compare two runs (for example a baseline and `--env RECOMP_XF_THREADS=4`):
+
+```powershell
+python scripts\diag\rbx_diag.py --secs 100 --gpu-stats --name base --keys $keys
+python scripts\diag\rbx_diag.py --secs 100 --gpu-stats --name xf4 --keys $keys --env RECOMP_XF_THREADS=4
+python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
+```
+
 | Tool | Use |
 | --- | --- |
+| `scripts\diag\perf_compare.py <runA> <runB>` | Side-by-side perf counters of two `--gpu-stats` runs. |
 | `scripts\diag\rbx_diag.py` | Harness: timed keys, fps/CPU/threads, frozen-frame + hang detection, audio WAV analysis. |
 | `scripts\diag\stackdump.py <pid>` | Symbolized stacks of every thread (guest functions show as `sub_XXXXXXXX`). |
 | `scripts\diag\flash_scan.py` | Finds flashing frames in a `RECOMP_GPU_PRESDUMP` capture. |
 | `-DRBX_ABI_CHECK=ON` (CMake) | Diagnostic build that reports lifted functions which fail to restore ebx/esi/edi/esp. |
 | `RECOMP_STUB_LOG=1` | Logs when an unresolved lifter stub is reached. |
 | `RECOMP_PROF=lo-hi` | Samples the busiest thread between those seconds and prints hot source lines. |
-| `RECOMP_XF_THREADS=n` | Overrides the vertex-transform worker count (0 disables workers, max 7). Default: one worker on hosts with at least four logical CPUs. |
+| `RECOMP_SHADER_CACHE=<dir>` | Where compiled shaders are kept between runs (default `shader_cache\` beside the game; `0` turns the cache off). A first run fills it; later runs load instead of compiling, which removes ~30 ms hitches per new combiner variant. `shader_cache_hits` in `--gpu-stats` runs counts loads. |
+| `RECOMP_FENCE_EVENT=0` | A/B only: BlockOnFence's recheck spins again instead of sleeping until the pushbuffer walk writes the fence. |
+| `RECOMP_GPU_CLEARFULL=1` | A/B only: colour clears wipe the whole target again, ignoring the clear rectangle and channel mask. |
+| `RECOMP_GPU_RTSEED=0` | A/B only: new render targets start black again instead of copying the image already at that address. |
+| `RECOMP_GPU_RBEVERY=N` | Render targets the GPU also samples are written back to guest memory every Nth flip (default 8). `1` restores every flip; `RECOMP_GPU_SKIPRB=1` means never. |
+| `RECOMP_GPU_NORTFLIPS=N` | Flips with no GPU image before the window falls back to guest memory (default 3). |
+| `RECOMP_GPU_PUBFIRST=1` | A/B only: the window shows the first render target at the flip address instead of the largest, most recent one. |
+| `RECOMP_KICK_STALL_MS=n` | How long KickOff waits with no pushbuffer-walk progress before forcing GET to PUT (default 500). Forced catch-ups drop commands; they show as `forced_get_catchups` in `--gpu-stats` runs. |
+| `RECOMP_KICK_FORCE_MS=n` | A/B only: restores the old behaviour, forcing GET to PUT after a fixed n ms whether or not the walk is moving. |
+| `RECOMP_XF_THREADS=n` | Overrides the vertex-transform worker count (0 disables workers, max 7). Default: one worker on 4+ logical CPUs; more measured no faster. |
+| `RECOMP_XF_SPIN_US=n` | How long an idle vertex-transform worker spins before sleeping (default 200 µs). |
+| `RECOMP_XF_CONVCACHE=0` | A/B only: convert every triangle's vertices again instead of once per vertex per batch. |
+| `RECOMP_GPU_INDEXED=0` | A/B only: hand program batches to D3D11 as three full vertices per triangle instead of unique vertices plus an index buffer. |
+| `RECOMP_GPU_FLUSH=N` | Fallback for GPU drivers that show corrupted or flickering draws: flush the D3D11 queue after draws. `1` after glyph (text) draws, `2` after every textured draw, `3` after every draw. Default `0`. `3` used to be the default on Intel, but it cost about 3.5x in fps on the test laptop's UHD and fixed nothing there; try it only if an Intel GPU shows corruption. |
+| `RECOMP_GPU_CLIP=0` | A/B or fallback: clip transformed batches at the near plane and back-face cull them on the CPU, as before, instead of on the GPU (default on). |
+| `RECOMP_GPU_CLIP_CPUCULL=0` | A/B only: with GPU clipping, leave back-face culling of triangles wholly in front of the eye to the GPU too (by default the CPU drops them before their vertices are converted). |
+| `RECOMP_GPU_VSH=0` | A/B or fallback: transform every batch on the CPU. By default, batches that run one of the title's known vertex programs are transformed by GPU vertex shaders (missions +6–10% on AMD, +10% on an RTX 3070, +42% on a GTX 1650). |
+| `RECOMP_GPU_VSH_VERIFY=N` | Every Nth GPU-transformed batch, read back what the shader wrote for its first 32 vertices and compare it with the CPU path. Logs `[GVS] verify` lines. Slow; debugging only. |
+| `RECOMP_VSH_FAST=0` | Run every vertex program through the interpreter instead of the specialised C transforms for the game's two main programs. |
+| `RECOMP_VSH_FASTCHECK=N` | Also run the interpreter on every Nth fast-path vertex and compare; a mismatch is logged and turns that program's fast path off. |
+| `RECOMP_FPS_CAP_DROP=1` | A/B only: the F1 FPS limit drops frames on their way to the window instead of holding the game to the cap. |
+| `RECOMP_MINIDUMP=0` / `full` | A crash writes `crashes\RoboTechBC_<date>_<time>.dmp` beside the exe (open with the matching .pdb). `0` turns it off; `full` includes all memory. |
+| `RECOMP_FB_COPY_EVERY=N` | While the window shows the GPU frame, copy guest memory into the GDI fallback buffer every Nth flip (default 8; 1 = every flip). |
 
 ## Hard constraints (do not regress)
 

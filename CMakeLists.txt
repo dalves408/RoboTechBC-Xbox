@@ -28,6 +28,7 @@ set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/xboxrecomp" CACHE PATH
 
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 include(patches/rbx_virtual_disk.cmake)
+include(patches/rbx_present.cmake)
 
 # Interactive pad input for this title requires bak OHCI. Shared toolkit
 # ohci.c is frequently overwritten by XAPI_TD WIP (empty interrupt EDs /
@@ -84,6 +85,7 @@ if(EXISTS "${_RBX_APUVP}" AND TARGET xbox_apu)
     endforeach()
     set_property(TARGET xbox_apu PROPERTY SOURCES ${_APU_FILTERED})
     target_sources(xbox_apu PRIVATE "${_RBX_APUVP}")
+    set(_RBX_HAVE_APUVP ON)
     message(STATUS "Robotech: linking pinned APU voice processor (${_RBX_APUVP})")
 endif()
 
@@ -101,6 +103,10 @@ add_executable(${PROJECT_NAME} WIN32
     ${GAME_SOURCES}
     ${RECOMP_GEN_SOURCES}
 )
+if(_RBX_HAVE_APUVP)
+    # rbx_d3d11.c reads the pinned voice processor's lock-wait counters.
+    target_compile_definitions(${PROJECT_NAME} PRIVATE RBX_HAVE_APU_VP=1)
+endif()
 
 get_filename_component(_RBX_TOOLS_DIR "${XBOXRECOMP_DIR}" DIRECTORY)
 set(RBX_SDL3_ROOT "${_RBX_TOOLS_DIR}/SDL3-3.4.20" CACHE PATH "SDL3 Windows development package")

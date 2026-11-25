@@ -53,6 +53,16 @@
  * #include "xinput_xbox.h"
  */
 
+/* Hybrid-graphics laptops (NVIDIA Optimus, AMD switchable): ask the driver to
+ * run this process on the discrete GPU. Without these exports D3D11's default
+ * adapter is the integrated one that drives the panel, so the game rendered
+ * on Intel UHD -- slower, and with the Intel-only per-draw flush workaround
+ * (RECOMP_GPU_FLUSH) -- while the dGPU sat idle. The drivers look the symbols
+ * up by name in the exe; they do nothing on single-GPU machines. A per-app
+ * choice in Windows Graphics settings still overrides them. */
+__declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+
 /* ── Global register state (defined in xbox_memory_layout.c) ── */
 
 /* RECOMP_TLS is not optional here. The runtime defines these thread-local, and
@@ -263,6 +273,10 @@ typedef struct MCPXAPUState MCPXAPUState;
 extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 extern MCPXAPUState *g_apu_state;
 
+/* Hardware-register accesses handled by trapping (each costs an exception
+ * round trip); read by the [RBXPERF] stats line in rbx_d3d11.c. */
+volatile LONG g_rbx_mmio_traps;
+
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -286,9 +300,30 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
          * drives the APU directly, so the registers have to fault to be seen.
          * "Handled" means the access was decoded and the instruction stepped
          * over, so execution resumes instead of unwinding. */
-        if (xbox_VehMmioFault(ep))
+        if (xbox_VehMmioFault(ep)) {
+            InterlockedIncrement(&g_rbx_mmio_traps);
             return EXCEPTION_CONTINUE_EXECUTION;
+        }
 
+        /* A fault inside ntdll (its unwinder under a profiler's stack
+         * sampling, for instance) is handled by ntdll's own SEH; printing it
+         * as [CRASH] misled. Faults in the game image or the CRT (a guest
+         * block copy running off its buffer) are still reported, and an
+         * unhandled one of any kind gets the crash dump (crash_filter). */
+        {
+            static uintptr_t nt_lo, nt_hi;
+            uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+            if (!nt_lo) {
+                HMODULE m = GetModuleHandleW(L"ntdll.dll");
+                if (m) {
+                    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((uint8_t *)m + ((PIMAGE_DOS_HEADER)m)->e_lfanew);
+                    nt_hi = (uintptr_t)m + nt->OptionalHeader.SizeOfImage;
+                    nt_lo = (uintptr_t)m;
+                }
+            }
+            if (rip >= nt_lo && rip < nt_hi)
+                return EXCEPTION_CONTINUE_SEARCH;
+        }
         fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
             (unsigned long long)ep->ContextRecord->Rip,
             (unsigned long long)fault_addr,
@@ -326,6 +361,73 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         fflush(stderr);
     }
 
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Crash dumps for players.
+ *
+ * The VEH above prints the guest view of a fault to stderr, which a player
+ * running the release never sees. An exception nothing handles also writes
+ * crashes\RoboTechBC_<date>_<time>.dmp beside the exe: threads, their stacks
+ * and the memory they point at, a few MB, enough to open in WinDbg or Visual
+ * Studio with the matching .pdb. The dump is written from its own thread so a
+ * stack overflow still gets one. RECOMP_MINIDUMP=0 turns it off;
+ * RECOMP_MINIDUMP=full adds all process memory (large). */
+static PEXCEPTION_POINTERS s_crash_ep;
+static DWORD s_crash_tid;
+static WCHAR s_crash_path[MAX_PATH];
+
+static DWORD WINAPI crash_dump_thread(LPVOID arg)
+{
+    const char *mode = getenv("RECOMP_MINIDUMP");
+    MINIDUMP_EXCEPTION_INFORMATION mei;
+    MINIDUMP_TYPE type = (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory |
+                                         MiniDumpWithUnloadedModules | MiniDumpWithHandleData);
+    SYSTEMTIME st;
+    HANDLE f;
+    BOOL ok;
+    (void)arg;
+    if (mode && strcmp(mode, "full") == 0)
+        type = (MINIDUMP_TYPE)(type | MiniDumpWithFullMemory);
+    CreateDirectoryW(L"crashes", NULL);
+    GetLocalTime(&st);
+    swprintf_s(s_crash_path, MAX_PATH, L"crashes\\RoboTechBC_%04u%02u%02u_%02u%02u%02u.dmp",
+               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    f = CreateFileW(s_crash_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE)
+        return 1;
+    mei.ThreadId = s_crash_tid;
+    mei.ExceptionPointers = s_crash_ep;
+    mei.ClientPointers = FALSE;
+    ok = MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f, type, &mei, NULL, NULL);
+    CloseHandle(f);
+    if (!ok)
+        DeleteFileW(s_crash_path);
+    return ok ? 0 : 1;
+}
+
+static LONG WINAPI crash_filter(PEXCEPTION_POINTERS ep)
+{
+    static volatile LONG once;
+    HANDLE t;
+    DWORD rc = 1;
+    if (InterlockedExchange(&once, 1))
+        return EXCEPTION_CONTINUE_SEARCH;
+    s_crash_ep = ep;
+    s_crash_tid = GetCurrentThreadId();
+    fprintf(stderr, "[CRASH] unhandled exception 0x%08lX at 0x%p\n",
+            (unsigned long)ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+    t = CreateThread(NULL, 0, crash_dump_thread, NULL, 0, NULL);
+    if (t) {
+        WaitForSingleObject(t, 60000);
+        GetExitCodeThread(t, &rc);
+        CloseHandle(t);
+    }
+    if (rc == 0)
+        fprintf(stderr, "[CRASH] dump written to %ls\n", s_crash_path);
+    else
+        fprintf(stderr, "[CRASH] could not write a crash dump\n");
+    fflush(stderr);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -457,6 +559,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
     AddVectoredExceptionHandler(1, veh_handler);
+    {
+        const char *md = getenv("RECOMP_MINIDUMP");
+        if (!(md && strcmp(md, "0") == 0))
+            SetUnhandledExceptionFilter(crash_filter);
+    }
 
     /* Step 1: Load XBE */
     if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {
