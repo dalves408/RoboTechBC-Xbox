@@ -384,6 +384,26 @@ static void rbx_d3d_kickoff_yield(void)
  * unread ring as free and overwrote commands the walk had not read (menu
  * flashes, "[PB] bad target" resyncs). Re-check the fence before returning;
  * a spurious wake now only costs a short spin. RECOMP_FENCE_RECHECK=0 = off. */
+extern void *volatile g_rbx_fence_event;        /* patches/nv2a_pb_exec_rbx.c */
+extern volatile long g_rbx_fence_event_live;
+
+/* Auto-reset event the pushbuffer walk sets on every fence write.
+ * RECOMP_FENCE_EVENT=0 keeps the spinning wait. */
+static HANDLE rbx_fence_event(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_FENCE_EVENT");
+        on = !(e && e[0] == '0');
+    }
+    if (on && !g_rbx_fence_event) {
+        HANDLE h = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (h && InterlockedCompareExchangePointer((PVOID volatile *)&g_rbx_fence_event, h, NULL) != NULL)
+            CloseHandle(h);
+    }
+    return on ? (HANDLE)g_rbx_fence_event : NULL;
+}
+
 extern void sub_001558D0_orig(void);
 void sub_001558D0(void)
 {
@@ -416,6 +436,7 @@ void sub_001558D0(void)
     t0 = GetTickCount();
     {
     unsigned spins = 0;
+    HANDLE fence_ev = rbx_fence_event();
     LARGE_INTEGER wq0, wq1, wqf;
     QueryPerformanceCounter(&wq0);
     while (counter - target < counter - MEM32(fence_va)) {
@@ -426,6 +447,12 @@ void sub_001558D0(void)
         xbox_Nv2aKickHint();
         if (++spins < 256)
             YieldProcessor();
+        else if (fence_ev && g_rbx_fence_event_live)
+            /* Sleep until the walk writes the fence word (it signals this
+             * event); the 1 ms timeout covers a write that raced the reset.
+             * Spinning here took ~48% of the render thread in missions and
+             * competed with the pushbuffer thread for CPU. */
+            WaitForSingleObject(fence_ev, 1);
         else if (GetTickCount() - t0 < 50u)
             SwitchToThread();
         else

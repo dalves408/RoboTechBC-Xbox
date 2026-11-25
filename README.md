@@ -145,6 +145,7 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 | `RECOMP_STUB_LOG=1` | Logs when an unresolved lifter stub is reached. |
 | `RECOMP_PROF=lo-hi` | Samples the busiest thread between those seconds and prints hot source lines. |
 | `RECOMP_SHADER_CACHE=<dir>` | Where compiled shaders are kept between runs (default `shader_cache\` beside the game; `0` turns the cache off). A first run fills it; later runs load instead of compiling, which removes ~30 ms hitches per new combiner variant. `shader_cache_hits` in `--gpu-stats` runs counts loads. |
+| `RECOMP_FENCE_EVENT=0` | A/B only: BlockOnFence's recheck spins again instead of sleeping until the pushbuffer walk writes the fence. |
 | `RECOMP_GPU_CLEARFULL=1` | A/B only: colour clears wipe the whole target again, ignoring the clear rectangle and channel mask. |
 | `RECOMP_GPU_RTSEED=0` | A/B only: new render targets start black again instead of copying the image already at that address. |
 | `RECOMP_GPU_PUBFIRST=1` | A/B only: the window shows the first render target at the flip address instead of the largest, most recent one. |

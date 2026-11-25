@@ -4410,6 +4410,11 @@ static void flipsum_flip(void)
 }
 
 uint32_t g_rbx_last_sem;   /* last BACK_END_WRITE_SEMAPHORE_RELEASE the walk executed */
+/* Set when the walk writes the title's fence word (fence-exec mode), so a
+ * thread waiting for the fence (BlockOnFence's recheck, recomp_manual.c) can
+ * sleep on it instead of spinning. Created by that waiter; NULL = nobody. */
+void *volatile g_rbx_fence_event;
+volatile long g_rbx_fence_event_live;   /* the walk has signalled it at least once */
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
@@ -4428,12 +4433,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         extern int xbox_Nv2aFenceExecMode(void);
         static int fx_log;
         if (xbox_Nv2aFenceExecMode() && !s_sem_va) s_sem_va = xbox_Nv2aFenceWordVa();
-        if (getenv("RECOMP_FENCE_LOG") && fx_log++ < 40)
+        static int fence_log = -1;
+        if (fence_log < 0) fence_log = getenv("RECOMP_FENCE_LOG") != NULL;   /* once, not per release */
+        if (fence_log && fx_log++ < 40)
             fprintf(stderr, "[FENCE] semaphore release param=%08X sem_va=%08X\n", param, s_sem_va);
     }
     if (subch == 0 && method == 0x1D70 && s_sem_va) {
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         *(volatile uint32_t *)(mem + s_sem_va) = param;
+        if (g_rbx_fence_event) {
+            SetEvent((HANDLE)g_rbx_fence_event);
+            g_rbx_fence_event_live = 1;
+        }
         return;
     }
     if (!inited) {
