@@ -572,7 +572,12 @@ static uint32_t attr_elem_bytes(const VertexAttr *a)
  * caller sees a degenerate vertex rather than reading past the array. */
 static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 {
-    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    /* RBX: guest RAM is mapped once for the life of the process. This runs
+     * for every attribute of every vertex (7% of the pushbuffer thread in the
+     * bench profile), so keep the base instead of an out-of-line call each
+     * time. Workers may race to set it; they all store the same value. */
+    static const uint8_t *volatile s_mem_base;
+    const uint8_t *mem = s_mem_base;
     const uint8_t *p;
     uint32_t i;
 
@@ -594,6 +599,8 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 
         if (!a->offset || !guest_span_ok(at, attr_elem_bytes(a)))
             return 0;
+        if (!mem)
+            s_mem_base = mem = (const uint8_t *)xbox_GetMemoryOffset();
         p = mem + at;
     }
 
