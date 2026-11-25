@@ -156,6 +156,7 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 | `RECOMP_XF_THREADS=n` | Overrides the vertex-transform worker count (0 disables workers, max 7). Default: one worker on 4+ logical CPUs; more measured no faster. |
 | `RECOMP_XF_SPIN_US=n` | How long an idle vertex-transform worker spins before sleeping (default 200 µs). |
 | `RECOMP_XF_CONVCACHE=0` | A/B only: convert every triangle's vertices again instead of once per vertex per batch. |
+| `RECOMP_GPU_INDEXED=0` | A/B only: hand program batches to D3D11 as three full vertices per triangle instead of unique vertices plus an index buffer. |
 | `RECOMP_FPS_CAP_DROP=1` | A/B only: the F1 FPS limit drops frames on their way to the window instead of holding the game to the cap. |
 | `RECOMP_MINIDUMP=0` / `full` | A crash writes `crashes\RoboTechBC_<date>_<time>.dmp` beside the exe (open with the matching .pdb). `0` turns it off; `full` includes all memory. |
 | `RECOMP_FB_COPY_EVERY=N` | While the window shows the GPU frame, copy guest memory into the GDI fallback buffer every Nth flip (default 4; 1 = every flip). |
