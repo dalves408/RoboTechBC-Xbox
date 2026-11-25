@@ -147,9 +147,9 @@ foreach ($f in Get-ChildItem $gen -Filter 'recomp_*.c') {
 }
 if (-not $cheatDone) { throw 'sub_0002F350 (isCheat) not found in src\recomp\gen' }
 
-# The pause menu's loop (0x242B0) and its update/draw (0x24060) are wrapped
-# in recomp_manual.c, which holds each pass of that loop to 30 a second.
-foreach ($va in @('000242B0', '00024060', '00111410')) {
+# The pad read (0x111410) is wrapped in recomp_manual.c, which holds the
+# paused mission loop's read to 30 a second (pause menu speed).
+foreach ($va in @('00111410')) {
     $re = [regex]('void sub_' + $va + '\(void\)(\s*)\{')
     $done = $false
     foreach ($f in Get-ChildItem $gen -Filter 'recomp_*.c') {
