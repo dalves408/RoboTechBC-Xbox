@@ -3292,42 +3292,22 @@ static int xf_clip_poly(const Nv2aVshOutput *in, int n, int pl,
     return m;
 }
 
-static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
-                              const Nv2aVshOutput *c)
+/* The near-plane clip itself, out of line. Its two 8-vertex polygons are
+ * ~2.5 KB of stack; inlined, every triangle paid for that frame (and its
+ * security cookie) although few need clipping. RBX. */
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+static void raster_xf_clip_slow(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+                                const Nv2aVshOutput *c, int planes)
 {
-    static int near_z = -1;
     const Nv2aVshOutput *in[3];
     Nv2aVshOutput p0[8], p1[8];
-    int n = 3, i, planes, inside = 1;
+    int n = 3, i;
 
-    if (near_z < 0) {
-        const char *e = getenv("RECOMP_CLIP_NEAR_Z");
-        near_z = !(e && e[0] == '0');
-    }
-    planes = near_z ? 2 : 1;
     in[0] = a; in[1] = b; in[2] = c;
-    /* Only W and Z contribute to the near planes. Compute X and Y in
-     * clip space only for triangles that need polygon clipping. */
-    for (i = 0; i < 3; i++) {
-        float w = in[i]->pos[3];
-        float d = w - NV_CLIP_W;
-        if (d != d || d - d != 0.0f)
-            return;
-        if (d < 0.0f)
-            inside = 0;
-        if (near_z) {
-            float z = in[i]->pos[2] * w;
-            d = z - s_xf_o[2] * w;
-            if (d != d || d - d != 0.0f)
-                return;                       /* not finite: no position at all */
-            if (d < 0.0f)
-                inside = 0;
-        }
-    }
-    if (inside) {
-        raster_xf_triangle(a, b, c);
-        return;
-    }
     for (i = 0; i < 3; i++) {
         p0[i] = *in[i];
         for (int j = 0; j < 3; j++)
@@ -3348,6 +3328,42 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
             p0[i].pos[j] /= p0[i].pos[3];
     for (i = 1; i + 1 < n; i++)
         raster_xf_triangle(&p0[0], &p0[i], &p0[i + 1]);
+}
+
+static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+                              const Nv2aVshOutput *c)
+{
+    static int near_z = -1;
+    const Nv2aVshOutput *in[3];
+    int i, inside = 1;
+
+    if (near_z < 0) {
+        const char *e = getenv("RECOMP_CLIP_NEAR_Z");
+        near_z = !(e && e[0] == '0');
+    }
+    in[0] = a; in[1] = b; in[2] = c;
+    /* Only W and Z contribute to the near planes. Compute X and Y in
+     * clip space only for triangles that need polygon clipping. */
+    for (i = 0; i < 3; i++) {
+        float w = in[i]->pos[3];
+        float d = w - NV_CLIP_W;
+        if (d != d || d - d != 0.0f)
+            return;
+        if (d < 0.0f)
+            inside = 0;
+        if (near_z) {
+            float z = in[i]->pos[2] * w;
+            d = z - s_xf_o[2] * w;
+            if (d != d || d - d != 0.0f)
+                return;                       /* not finite: no position at all */
+            if (d < 0.0f)
+                inside = 0;
+        }
+    }
+    if (inside)
+        raster_xf_triangle(a, b, c);
+    else
+        raster_xf_clip_slow(a, b, c, near_z ? 2 : 1);
 }
 
 /* s_xf (declared above backend_conv): about 7 MB, so allocated by the first
