@@ -478,3 +478,59 @@ void rbx_keyhints(HDC dc, const RbxFonts *f, const RECT *r, const char *const *p
         x += ww + rbx_px(f, 18);
     }
 }
+
+void rbx_tabs(HDC dc, const RbxFonts *f, const RECT *r, const char *const *names, int n, int active,
+              int focused, RECT *rects)
+{
+    int x = r->left, i, extra = rbx_px(f, 3);
+    TEXTMETRICA tm;
+    HGDIOBJ old = SelectObject(dc, f->head);
+    GetTextMetricsA(dc, &tm);
+    SelectObject(dc, old);
+    for (i = 0; i < n; i++) {
+        int w = spaced_w(dc, f->head, names[i], extra) + rbx_px(f, 36);
+        RECT t;
+        SetRect(&t, x, r->top, x + w, r->bottom);
+        if (i == active)
+            chamfer(dc, &t, rbx_px(f, 8), focused ? C_AMBER : C_AMBER_DK, C_AMBER);
+        else
+            chamfer(dc, &t, rbx_px(f, 8), C_BOX, C_EDGE);
+        spaced(dc, f->head, i == active ? (focused ? RGB(24, 14, 0) : C_WHITE) : C_DIM,
+               t.left + rbx_px(f, 18) + extra / 2, (t.top + t.bottom) / 2 - tm.tmHeight / 2, names[i], extra);
+        if (rects) rects[i] = t;
+        x = t.right + rbx_px(f, 8);
+    }
+}
+
+void rbx_keyslot(HDC dc, const RbxFonts *f, const RECT *r, const char *name, int selected, int hover,
+                 int listening)
+{
+    COLORREF bg = listening ? C_AMBER_DK : (selected ? C_ROW_LIT : (hover ? C_ROW_HOVER : C_BOX));
+    COLORREF edge = listening || selected ? C_AMBER : (hover ? C_TEXT : C_EDGE);
+    chamfer(dc, r, rbx_px(f, 5), bg, edge);
+    if (listening)
+        rbx_text(dc, f->tag, C_AMBER, r, "PRESS A KEY", DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    else
+        rbx_text(dc, f->key, name && strcmp(name, "-") ? (selected ? C_WHITE : C_SKY) : C_DIM, r,
+                 name ? name : "-", DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+void rbx_keyrow(HDC dc, const RbxFonts *f, const RECT *row, const char *label, int selected, int hover,
+                int nslots, RECT *slots)
+{
+    int rw = row->right - row->left, sw = rw * 26 / 100, gap = rbx_px(f, 5), i;
+    RECT lr = *row;
+    if (selected || hover) {
+        fill(dc, row->left, row->top, row->right, row->bottom, selected ? C_ROW_LIT : C_ROW_HOVER);
+        if (selected)
+            fill(dc, row->left, row->top, row->left + rbx_px(f, 3), row->bottom, C_AMBER);
+    }
+    lr.left += rbx_px(f, 12);
+    lr.right = row->right - nslots * (sw + gap);
+    rbx_text(dc, f->body, selected ? C_WHITE : C_TEXT, &lr, label,
+             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    for (i = 0; i < nslots; i++) {
+        int x = row->right - (nslots - i) * (sw + gap) + gap;
+        SetRect(&slots[i], x, row->top + rbx_px(f, 2), x + sw, row->bottom - rbx_px(f, 2));
+    }
+}

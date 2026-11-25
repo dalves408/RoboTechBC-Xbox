@@ -90,6 +90,8 @@ CONTROLS
   F1            Video settings    Esc                 Quit confirmation
   F11           Fullscreen
   Controller 1: hold Back and press Start to open settings.
+  Keys can be rebound, and A/B or X/Y swapped for Nintendo-style pads, on the
+  CONTROLS page of F1 or Config.exe.
 
 FILES
   SaveData\\     Save data and Xbox filesystem data

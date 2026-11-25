@@ -47,6 +47,17 @@ void rbx_button(HDC dc, const RbxFonts *f, const RECT *r, const char *text, int 
                 int selected, int hover);
 /* A "NOTE" strip: the field manual's call-out box. */
 void rbx_note(HDC dc, const RbxFonts *f, const RECT *r, const char *tag, const char *text);
+/* Page tabs in a row: the active one lit amber (outlined when focused).
+ * rects (may be NULL) gets each tab's rectangle. */
+void rbx_tabs(HDC dc, const RbxFonts *f, const RECT *r, const char *const *names, int n, int active,
+              int focused, RECT *rects);
+/* A key slot: the key's name in a keycap, "Press a key" while listening. */
+void rbx_keyslot(HDC dc, const RbxFonts *f, const RECT *r, const char *name, int selected, int hover,
+                 int listening);
+/* A key binding row: label, then the slots' rectangles in slots[] (the
+ * caller draws them with rbx_keyslot). */
+void rbx_keyrow(HDC dc, const RbxFonts *f, const RECT *row, const char *label, int selected, int hover,
+                int nslots, RECT *slots);
 /* Key hints: pairs of {keycap, meaning}, drawn left to right. */
 void rbx_keyhints(HDC dc, const RbxFonts *f, const RECT *r, const char *const *pairs, int npairs);
 

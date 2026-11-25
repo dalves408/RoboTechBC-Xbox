@@ -62,7 +62,9 @@ Keys work even when the console keeps focus (raw INPUTSINK + async). Enter/Space
 
 Versus supports two players. Connect two SDL3 gamepads for separate controls. If Player 2 disconnects, their controls go neutral and resume when SDL3 reconnects the pad. Keyboard and mouse control Player 1. Controller 1 can hold Back and press Start to open Video settings. Use the D-pad or left stick and A to adjust settings, and B or Start to close the overlay.
 
-`Config.exe` ([screenshot](docs/ui/config.png)), built beside the game, edits the same settings outside the game: the same options, mouse or keyboard, with Save & Play. The F1 menu, the Esc quit prompt and Config.exe share one look (`src/rbx_ui.c`), taken from the game's own blueprint-grid menus and the field-manual styling of the strategy guide.
+`Config.exe` ([screenshot](docs/ui/config.png), [controls](docs/ui/config_controls.png)), built beside the game, edits the same settings outside the game: the same options, mouse or keyboard, with Save & Play.
+
+Both have a **CONTROLS** page. Every keyboard control above can be rebound (two keys each; a key does one thing, so binding it elsewhere moves it). Controllers with A/B or X/Y the other way round (Nintendo layout) can swap them. In the F1 menu, Tab or Page Down (White/Black on a pad) switches pages; Enter on a key slot waits for a key, Delete clears it. The map is stored in `settings.ini` under `[keyboard]` and `[controls]`. `RECOMP_RBX_TOOLKIT_KEYS=1` goes back to the toolkit's fixed map. The F1 menu, the Esc quit prompt and Config.exe share one look (`src/rbx_ui.c`), taken from the game's own blueprint-grid menus and the field-manual styling of the strategy guide.
 
 Video settings include 1×–5× internal resolution, borderless fullscreen, aspect-correct or stretched output, native widescreen (Off, Auto from the window, 16:9, 16:10, 21:9; see [docs/widescreen.md](docs/widescreen.md)), VSync, 30–360 FPS presentation limits or uncapped presentation, 2×/4×/8× MSAA where supported, 2×–16× anisotropic filtering, and hi-res texture replacements. The presentation limit leaves the Xbox game clock unchanged. Settings are saved to `settings.ini`.
 

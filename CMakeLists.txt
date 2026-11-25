@@ -98,6 +98,7 @@ set(GAME_SOURCES
     src/rbx_settings.c
     src/rbx_menu.c
     src/rbx_ui.c
+    src/rbx_keymap.c
     src/rbx_sdl_window.c
 )
 
@@ -158,7 +159,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 
 # Config.exe: the settings window outside the game. It edits the same
 # settings.ini as the F1 menu and draws with the same src/rbx_ui.c.
-add_executable(rbx_config WIN32 src/config/rbx_config.c src/rbx_ui.c src/config/rbx_config.rc)
+add_executable(rbx_config WIN32 src/config/rbx_config.c src/rbx_ui.c src/rbx_menu.c src/rbx_keymap.c
+    src/config/rbx_config.rc)
 target_include_directories(rbx_config PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(rbx_config PRIVATE WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 set_target_properties(rbx_config PROPERTIES OUTPUT_NAME "Config")
