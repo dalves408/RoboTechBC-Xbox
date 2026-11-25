@@ -153,7 +153,8 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 | `RECOMP_GPU_PUBFIRST=1` | A/B only: the window shows the first render target at the flip address instead of the largest, most recent one. |
 | `RECOMP_KICK_STALL_MS=n` | How long KickOff waits with no pushbuffer-walk progress before forcing GET to PUT (default 500). Forced catch-ups drop commands; they show as `forced_get_catchups` in `--gpu-stats` runs. |
 | `RECOMP_KICK_FORCE_MS=n` | A/B only: restores the old behaviour, forcing GET to PUT after a fixed n ms whether or not the walk is moving. |
-| `RECOMP_XF_THREADS=n` | Overrides the vertex-transform worker count (0 disables workers, max 7). Default by logical CPUs: 4–5 → 1, 6–7 → 2, 8–11 → 3, 12+ → 4 (was at most one). |
+| `RECOMP_XF_THREADS=n` | Overrides the vertex-transform worker count (0 disables workers, max 7). Default: one worker on 4+ logical CPUs; more measured no faster. |
+| `RECOMP_XF_SPIN_US=n` | How long an idle vertex-transform worker spins before sleeping (default 200 µs). |
 
 ## Hard constraints (do not regress)
 
