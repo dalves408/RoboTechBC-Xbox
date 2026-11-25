@@ -305,6 +305,25 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             return EXCEPTION_CONTINUE_EXECUTION;
         }
 
+        /* A fault inside ntdll (its unwinder under a profiler's stack
+         * sampling, for instance) is handled by ntdll's own SEH; printing it
+         * as [CRASH] misled. Faults in the game image or the CRT (a guest
+         * block copy running off its buffer) are still reported, and an
+         * unhandled one of any kind gets the crash dump (crash_filter). */
+        {
+            static uintptr_t nt_lo, nt_hi;
+            uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+            if (!nt_lo) {
+                HMODULE m = GetModuleHandleW(L"ntdll.dll");
+                if (m) {
+                    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((uint8_t *)m + ((PIMAGE_DOS_HEADER)m)->e_lfanew);
+                    nt_hi = (uintptr_t)m + nt->OptionalHeader.SizeOfImage;
+                    nt_lo = (uintptr_t)m;
+                }
+            }
+            if (rip >= nt_lo && rip < nt_hi)
+                return EXCEPTION_CONTINUE_SEARCH;
+        }
         fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
             (unsigned long long)ep->ContextRecord->Rip,
             (unsigned long long)fault_addr,

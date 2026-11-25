@@ -2306,6 +2306,9 @@ static IDXGIKeyedMutex *s_share_mutex;
 static uint32_t s_share_w, s_share_h;
 static int s_share_failed, s_share_on;
 
+/* 1 while the window shows this back end's frame (pb_exec skips most CPU frame copies then). */
+int rbx_gpu_frame_shared(void) { return s_share_on; }
+
 static void share_close(void)
 {
     if (s_share_on) { gpu_present_set_source(NULL, 0, 0); s_share_on = 0; }
