@@ -3898,6 +3898,27 @@ static void gclip_tri(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
         swm5_pace_wake();
     if (s_bidx_n + 3 > NV_BACKEND_MAX_VERTS)
         return;
+    /* Cull here when the whole triangle is in front of the eye (the screen-space
+     * winding is then exact), so the vertices of back faces are not converted
+     * and handed over at all; that conversion was the new hot spot in menus.
+     * Triangles reaching behind the w plane go to the GPU, which culls them
+     * after clipping. RECOMP_GPU_CLIP_CPUCULL=0 leaves all culling to the GPU. */
+    if (a->pos[3] > NV_CLIP_W && b->pos[3] > NV_CLIP_W && c->pos[3] > NV_CLIP_W) {
+        static int cpucull = -1;
+        if (cpucull < 0) {
+            const char *e = getenv("RECOMP_GPU_CLIP_CPUCULL");
+            cpucull = !(e && e[0] == '0');
+        }
+        if (cpucull && s_reg[0x0308 / 4] && xf_cull_on()) {      /* SET_CULL_FACE_ENABLE */
+            const float *pa = a->pos, *pb = b->pos, *pc = c->pos;
+            uint32_t cf = s_reg[0x039C / 4], ff = s_reg[0x03A0 / 4];
+            float ar = (pb[0] - pa[0]) * (pc[1] - pa[1]) - (pb[1] - pa[1]) * (pc[0] - pa[0]);
+            float sa = s_xf_odd ? -ar : ar;
+            int front = ff == 0x901 ? sa < 0.0f : sa > 0.0f;
+            if (ar == 0.0f || (cf == 0x405 && !front) || (cf == 0x404 && front) || cf == 0x408)
+                return;
+        }
+    }
     ia = bidx_vertex(a); ib = bidx_vertex(b); ic = bidx_vertex(c);
     if (ia == ~0u || ib == ~0u || ic == ~0u)
         return;
