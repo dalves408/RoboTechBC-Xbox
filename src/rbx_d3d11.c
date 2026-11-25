@@ -49,7 +49,7 @@ static unsigned st_rb_us, st_rb_n;            /* readback: time writing staging 
 static unsigned st_sh_us, st_sh_n, s_sh_total; /* combiner pixel shaders compiled (time, count, since boot) */
 static unsigned st_pub;                       /* frames handed to the window */
 static unsigned st_rt_new, st_rt_evict, st_rt_alias; /* render targets created, evicted (LRU, MAX_RT), created for a VA that already had one */
-static unsigned st_pub_nort, st_pub_multi, st_rb_defer, st_rb_evict, st_pace_us, st_pace_n;   /* flips whose surface had no GPU target (window fell back to guest memory) / several */
+static unsigned st_pub_nort, st_pub_multi, st_rb_defer, st_rb_evict, st_pace_us, st_pace_n, st_pace_calls, st_pace_late;   /* flips whose surface had no GPU target (window fell back to guest memory) / several */
 static unsigned long long st_ft_sum, st_ft_max, s_ft_last; /* guest flip-to-flip time, QPC ticks */
 static unsigned st_ft_n, st_hitch33, st_hitch50, st_hitch100;  /* flip gaps over 33 / 50 / 100 ms */
 
@@ -2535,7 +2535,11 @@ static void gb_flip_impl(void)
     int i;
     static unsigned long last;
     unsigned long now;
-    if (!s_inited || s_failed) return;
+    if (!s_inited || s_failed) {
+        static unsigned n;
+        if (n++ < 5) fprintf(stderr, "[RBX DX11] flip before the back end is ready (inited=%d failed=%d): no stats, no publish\n", s_inited, s_failed);
+        return;
+    }
     s_frame++; s_tick++; st_flips++;
     {
         LARGE_INTEGER q; unsigned long long d, qf = gb_qf();
@@ -2598,16 +2602,16 @@ static void gb_flip_impl(void)
             fprintf(stderr, "[RBXPERF] ms=%u flips=%u pub=%u ft_avg_us=%u ft_max_us=%u hitch33=%u hitch50=%u hitch100=%u "
                             "rb_n=%u rb_us=%u sh_n=%u sh_us=%u sh_total=%u sh_hits=%u catchup=%ld fence_early=%ld fence_timeout=%ld "
                             "mmio_traps=%ld apu_lock_waits=%u apu_lock_timeouts=%u fence_wait_us=%ld pb_drops=%u pb_midwalk_get=%u "
-                            "rt_new=%u rt_evict=%u rt_alias=%u pub_nort=%u pub_multi=%u clear_partial=%u rb_defer=%u rb_evict=%u cap=%u pace_n=%u pace_us=%u\n",
+                            "rt_new=%u rt_evict=%u rt_alias=%u pub_nort=%u pub_multi=%u clear_partial=%u rb_defer=%u rb_evict=%u cap=%u pace_n=%u pace_us=%u pace_calls=%u pace_late=%u\n",
                     win_ms, st_flips, st_pub,
                     st_ft_n ? (unsigned)(st_ft_sum * 1000000ULL / qf / st_ft_n) : 0u, (unsigned)(st_ft_max * 1000000ULL / qf),
                     st_hitch33, st_hitch50, st_hitch100, st_rb_n, st_rb_us, st_sh_n, st_sh_us, s_sh_total, st_sh_hits,
                     (long)(fc - l_fc), (long)(fs - l_fs), (long)(ft - l_ft), (long)(mm - l_mm), lw - l_lw, lt - l_lt,
                     (long)(fw - l_fw), pd - l_pd, pm - l_pm,
-                    st_rt_new, st_rt_evict, st_rt_alias, st_pub_nort, st_pub_multi, st_clear_partial, st_rb_defer, st_rb_evict, s_fps_limit, st_pace_n, st_pace_us);
+                    st_rt_new, st_rt_evict, st_rt_alias, st_pub_nort, st_pub_multi, st_clear_partial, st_rb_defer, st_rb_evict, s_fps_limit, st_pace_n, st_pace_us, st_pace_calls, st_pace_late);
             l_fc = fc; l_fs = fs; l_ft = ft; l_mm = mm; l_lw = lw; l_lt = lt; l_fw = fw; l_pd = pd; l_pm = pm;
             st_rb_us = st_rb_n = st_sh_us = st_sh_n = st_sh_hits = st_pub = 0;
-            st_rt_new = st_rt_evict = st_rt_alias = st_pub_nort = st_pub_multi = st_clear_partial = st_rb_defer = st_rb_evict = st_pace_n = st_pace_us = 0;
+            st_rt_new = st_rt_evict = st_rt_alias = st_pub_nort = st_pub_multi = st_clear_partial = st_rb_defer = st_rb_evict = st_pace_n = st_pace_us = st_pace_calls = st_pace_late = 0;
             st_ft_sum = st_ft_max = 0; st_ft_n = st_hitch33 = st_hitch50 = st_hitch100 = 0;
         }
         g_pb_scan_ticks = 0; g_pb_scan_segs = 0;
@@ -2647,6 +2651,7 @@ static void pace_flip(void)
                 s_cap_drop ? "RECOMP_FPS_CAP_DROP: frames dropped, game not held" : "game held to it at each flip");
         next = 0; last_cap = cap;
     }
+    st_pace_calls++;
     if (!cap || s_cap_drop) return;
     if (!timer_init) {
         timer_init = 1;
@@ -2655,7 +2660,7 @@ static void pace_flip(void)
     }
     interval = qf / cap;
     QueryPerformanceCounter(&q); now = (unsigned long long)q.QuadPart;
-    if (!next || now > next + interval) { next = now + interval; return; }
+    if (!next || now > next + interval) { next = now + interval; st_pace_late++; return; }
     if (now < next) { st_pace_n++; st_pace_us += (unsigned)((next - now) * 1000000ULL / qf); }
     while (now < next) {
         unsigned long long left_us = (next - now) * 1000000ULL / qf;

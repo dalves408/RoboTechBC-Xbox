@@ -182,7 +182,7 @@ PERF_FIELDS = ["ms", "flips", "pub", "ft_avg_us", "ft_max_us", "hitch33", "hitch
                "rb_n", "rb_us", "sh_n", "sh_us", "sh_total", "catchup", "fence_early", "fence_timeout",
                "mmio_traps", "apu_lock_waits", "apu_lock_timeouts", "sh_hits", "fence_wait_us",
                "pb_drops", "pb_midwalk_get", "rt_new", "rt_evict", "rt_alias", "pub_nort", "pub_multi",
-               "clear_partial", "rb_defer", "rb_evict", "cap", "pace_n", "pace_us"]
+               "clear_partial", "rb_defer", "rb_evict", "cap", "pace_n", "pace_us", "pace_calls", "pace_late"]
 XA2_UNDERRUN = re.compile(r"^\[XA2\] underrun x(\d+)\b")
 AUDIO_HOST_UNDERRUN = re.compile(r"^\[AUDIO-HOST\].*\bunderruns=(\d+)\b")
 FRAME_PRESS = re.compile(r"^\[RBX PAD\] (\w+) observed at f(\d+) \(scheduled f(\d+)\)$", re.M)
