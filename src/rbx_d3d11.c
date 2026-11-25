@@ -2356,6 +2356,9 @@ void rbx_present_abandoned(void)
     InterlockedExchange(&s_share_abandoned, 1);
 }
 
+/* 1 while the window shows this back end's frame (pb_exec skips most CPU frame copies then). */
+int rbx_gpu_frame_shared(void) { return s_share_on; }
+
 static void share_close(void)
 {
     if (s_share_on || s_share_retired)

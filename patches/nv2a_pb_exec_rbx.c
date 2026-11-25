@@ -4911,7 +4911,24 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 }
                 xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                 xbox_FramebufferWindowSetAA(aa_sy);
-                xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
+                {
+                    /* While the window shows the D3D11 frame (shared
+                     * texture), this CPU copy of guest memory only feeds
+                     * the GDI fallback, the overlay and dumps, yet it cost
+                     * ~5% of this thread (bench profile). Copy every Nth
+                     * flip then (RECOMP_FB_COPY_EVERY, default 4; 1 = every
+                     * flip). With no shared frame, every flip as before. */
+                    extern int rbx_gpu_frame_shared(void);
+                    static int every = -1;
+                    static unsigned n;
+                    if (every < 0) {
+                        const char *e = getenv("RECOMP_FB_COPY_EVERY");
+                        every = e ? atoi(e) : 4;
+                        if (every < 1) every = 1;
+                    }
+                    if (every == 1 || !rbx_gpu_frame_shared() || ++n % (unsigned)every == 0)
+                        xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
+                }
             }
         }
         {
