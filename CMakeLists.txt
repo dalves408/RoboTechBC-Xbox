@@ -89,6 +89,25 @@ if(EXISTS "${_RBX_APUVP}" AND TARGET xbox_apu)
     message(STATUS "Robotech: linking pinned APU voice processor (${_RBX_APUVP})")
 endif()
 
+# Project-pinned APU DSP stage (see the header of patches/apu_dsp_rbx.c):
+# folds the mixbins down to stereo by their DirectSound layout instead of
+# summing every bin even/odd, which played reverb/FX sends dry and left
+# speech quiet against positional effects.
+set(_RBX_APUDSP "${CMAKE_CURRENT_SOURCE_DIR}/patches/apu_dsp_rbx.c")
+if(EXISTS "${_RBX_APUDSP}" AND TARGET xbox_apu)
+    get_target_property(_APU_SOURCES xbox_apu SOURCES)
+    set(_APU_FILTERED "")
+    foreach(_s IN LISTS _APU_SOURCES)
+        get_filename_component(_sn "${_s}" NAME)
+        if(NOT _sn STREQUAL "apu_dsp.c")
+            list(APPEND _APU_FILTERED "${_s}")
+        endif()
+    endforeach()
+    set_property(TARGET xbox_apu PROPERTY SOURCES ${_APU_FILTERED})
+    target_sources(xbox_apu PRIVATE "${_RBX_APUDSP}")
+    message(STATUS "Robotech: linking pinned APU DSP stage (${_RBX_APUDSP})")
+endif()
+
 file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 
 set(GAME_SOURCES
