@@ -46,6 +46,8 @@ Measured on the dev PC (6800H / 680M) at 858a0c0, the pushbuffer thread is 100% 
 ## Stages (one commit each, each A/B-able)
 
 0. GPU clipping and culling (`RECOMP_GPU_CLIP=1`): the CPU still transforms, but the indexed hand-off goes over unclipped and unculled. The back end's vertex shaders write the two near planes as `SV_ClipDistance0`, keep w's sign, leave z unclamped (depth clip off, so the rasterizer clamps per pixel), and rasterizer states cull with the NV2A state. This is the part of step 2 the translated shaders need anyway, and it removes the clipper (~17% of the thread) on its own.
+Shipped first instead of the translator (stage 1 below): hand-written HLSL for the 5 known programs (4 shaders; 892C and E031 are the same words) behind `RECOMP_GPU_VSH=1`, sharing `patches/rbx_gvs.h` between the executor and the back end, with `RECOMP_GPU_VSH_VERIFY=N` doing the stream-out comparison from stage 3. The translator is only needed if more programs turn up.
+
 1. Translator plus a host-side test that runs the CPU interpreter and an HLSL-equivalent C rendition of the generated code over recorded programs and inputs. A program dump (`RECOMP_VSH_DUMP`) from the bench supplies the corpus.
 2. Executor gathers raw inputs and constants; back end draws program batches with the generated VS behind `RECOMP_GPU_VSH=1`.
 3. Bench: visual check with per-draw position diffs (`RECOMP_GPU_VSH_VERIFY=1` transforms one vertex per draw on the CPU and compares it with a GPU stream-out readback), then fps and profile.

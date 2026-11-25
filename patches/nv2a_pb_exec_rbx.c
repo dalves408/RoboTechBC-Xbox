@@ -49,6 +49,7 @@
 #include "nv2a_vsh_interp.h"
 #include "nv2a_combiner.h"
 #include "nv2a_backend.h"
+#include "rbx_gvs.h"   /* GPU vertex programs: hand-off to the D3D11 back end */
 #if defined(_WIN32)
 #include <windows.h>
 #define NV_TLS __declspec(thread)
@@ -3365,17 +3366,23 @@ static void raster_xf_clip_slow(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
         raster_xf_triangle(&p0[0], &p0[i], &p0[i + 1]);
 }
 
+/* RECOMP_CLIP_NEAR_Z=0: clip at w = NV_CLIP_W only, not at the c[59].z plane. */
+static int clip_near_z(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_CLIP_NEAR_Z");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
                               const Nv2aVshOutput *c)
 {
-    static int near_z = -1;
     const Nv2aVshOutput *in[3];
-    int i, inside = 1;
+    int i, inside = 1, near_z = clip_near_z();
 
-    if (near_z < 0) {
-        const char *e = getenv("RECOMP_CLIP_NEAR_Z");
-        near_z = !(e && e[0] == '0');
-    }
     in[0] = a; in[1] = b; in[2] = c;
     /* Only W and Z contribute to the near planes. Compute X and Y in
      * clip space only for triangles that need polygon clipping. */
@@ -3895,6 +3902,218 @@ static void xf_set_viewport(void)
     s_xf_o[2] = of[2];
 }
 
+/* RBX: GPU vertex programs (RECOMP_GPU_VSH=1; patches/rbx_gvs.h). A program
+ * batch whose program has a fast path above, drawn through the combiners, is
+ * not transformed here: each unique vertex's raw inputs are gathered, the
+ * primitive becomes triangle indices (odd strip triangles flipped, as with
+ * GPU clipping), and the back end's vertex shader for the program transforms,
+ * clips and culls. The black-V0 skip and the combiner's stage-1 check need
+ * per-batch facts about the outputs; they are worked out from the inputs.
+ * RECOMP_GPU_VSH_VERIFY=N: every Nth such batch also runs the CPU path on its
+ * first vertices, and the back end compares what its shader wrote. */
+RbxGvs g_rbx_gvs;
+static const uint8_t s_gvs_attrs[RBX_GVS_NPROG][RBX_GVS_MAXIN + 1] = {
+    { 0 },
+    { 3, 0, 1, 2 },
+    { 2, 0, 1 },
+    { 7, 0, 3, 4, 9, 10, 11, 12 },
+    { 4, 0, 2, 4, 5 },
+};
+static int gvs_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_VSH");
+        on = e && e[0] == '1';
+        if (on)
+            fprintf(stderr, "[RBX XF] GPU vertex programs on (RECOMP_GPU_VSH=1)\n");
+    }
+    return on;
+}
+static int gvs_prog(void)
+{
+    int fi = vsh_fast_lookup();
+    if (fi < 0)
+        return RBX_GVS_OFF;
+    switch (s_vsh_fast[fi].hash) {
+    case 0x0B25A84A2631EC80ULL: return RBX_GVS_0B25;
+    case 0x9CEE4A21EBB77FF1ULL: return RBX_GVS_9CEE;
+    case 0xBA9E387C24FCECE1ULL: return RBX_GVS_BA9E;
+    case 0x892CED0FDB0FB299ULL:
+    case 0xE0318D6247FFFA7AULL: return RBX_GVS_892C;
+    default: return RBX_GVS_OFF;
+    }
+}
+static int gvs_nonzero3(const float *t) { return fabsf(t[0]) + fabsf(t[1]) + fabsf(t[2]) > 1e-5f; }
+
+/* The CPU path's result for one vertex, as the back end would receive it. */
+static void gvs_ref(uint32_t index, RbxGvsRef *r)
+{
+    Nv2aVshOutput o;
+    Nv2aVertex v;
+    uint32_t d;
+    memset(r, 0, sizeof *r);
+    if (!transform_vertex(index, &o))
+        return;
+    backend_from_xf(&o, &v);
+    memcpy(r->pos, o.pos, sizeof r->pos);
+    d = v.diffuse;
+    r->c[0] = ((d >> 16) & 255u) / 255.0f; r->c[1] = ((d >> 8) & 255u) / 255.0f;
+    r->c[2] = (d & 255u) / 255.0f;         r->c[3] = ((d >> 24) & 255u) / 255.0f;
+    memcpy(r->d1, v.d1, sizeof r->d1);
+    memcpy(r->t, v.tex, sizeof r->t);
+    if (fabsf(r->t[1][0]) + fabsf(r->t[1][1]) + fabsf(r->t[1][2]) < 1e-6f
+        && fabsf(r->t[0][0]) + fabsf(r->t[0][1]) + fabsf(r->t[0][2]) > 1e-6f)
+        memcpy(r->t[1], r->t[0], sizeof r->t[1]);
+    r->fog = v.fog;
+}
+
+/* Draw the current batch through a GPU vertex program; 0 = not this batch. */
+static int gvs_batch(uint32_t n)
+{
+    static float *in;
+    static uint32_t *map;
+    static int verify = -1;
+    static unsigned vtick;
+    uint32_t tag[256], slot[256], nu = 0, i, k, nin;
+    const uint8_t *at;
+    RbxGvs *g = &g_rbx_gvs;
+    int prog, t0z = 1, t1z = 1, black = 1;
+    float nc101[4];
+    unsigned long long t0;
+
+    if (!gvs_on() || n < 3 || s_gpu.prim < NV_PRIM_TRIANGLES || s_gpu.prim > NV_PRIM_POLYGON
+        || !s_gpu.rc_seen || !backend_draws() || !rbx_gpu_vsh_ok())
+        return 0;
+    if ((prog = gvs_prog()) == RBX_GVS_OFF)
+        return 0;
+    {
+        uint32_t bpp = surface_bpp();
+        if (bpp != 4 && bpp != 2)
+            return 0;
+    }
+    if (!in && !(in = (float *)malloc((size_t)NV_MAX_INDICES * RBX_GVS_MAXIN * 4 * sizeof *in)))
+        return 0;
+    if (!map && !(map = (uint32_t *)malloc(NV_MAX_INDICES * sizeof *map)))
+        return 0;
+    bidx_begin();
+    if (!s_bidx_mode)
+        return 0;
+    t0 = pb_ticks();
+    at = s_gvs_attrs[prog];
+    nin = at[0];
+    for (k = 0; k < 4; k++)
+        nc101[k] = -nv2a_vsh_constant(101)[k];
+    memset(tag, 0xFF, sizeof tag);
+    for (i = 0; i < n; i++) {
+        uint32_t ix = s_gpu.idx[i], h = (ix * 2654435761u) >> 24;
+        float *v;
+        if (tag[h] == ix) { map[i] = slot[h]; continue; }
+        v = in + (size_t)nu * nin * 4;
+        for (k = 0; k < nin; k++)
+            vsh_in(at[1 + k], ix, v + 4 * k);
+        /* What the back end needs to know about the outputs (see the shader). */
+        switch (prog) {
+        case RBX_GVS_0B25:
+            if (t0z && gvs_nonzero3(v + 8)) t0z = 0;
+            if (t1z) {
+                float t1[3] = { vsh_dp3(v + 4, nc101), nv2a_vsh_constant(102)[3], 0.0f };
+                if (gvs_nonzero3(t1)) t1z = 0;
+            }
+            break;
+        case RBX_GVS_BA9E:
+            if (black && (pack_color(v + 4) & 0x00FFFFFFu)) black = 0;
+            if (t0z && gvs_nonzero3(v + 12)) t0z = 0;
+            if (t1z && gvs_nonzero3(v + 16)) t1z = 0;
+            break;
+        case RBX_GVS_892C:
+            if (black && (pack_color(v + 8) & 0x00FFFFFFu)) black = 0;
+            if (t0z && gvs_nonzero3(v + 12)) t0z = 0;
+            break;
+        default:
+            break;
+        }
+        tag[h] = ix; slot[h] = nu; map[i] = nu; nu++;
+    }
+    if (prog == RBX_GVS_0B25 || prog == RBX_GVS_9CEE) {
+        float d0[4];
+        vsh_color(d0, nv2a_vsh_constant(100));
+        black = !(pack_color(d0) & 0x00FFFFFFu);
+    }
+#define GVS_TRI(a, b, c) do { if (s_bidx_n + 3 <= NV_BACKEND_MAX_VERTS) { \
+        s_bidx[s_bidx_n] = map[a]; s_bidx[s_bidx_n + 1] = map[b]; s_bidx[s_bidx_n + 2] = map[c]; s_bidx_n += 3; } } while (0)
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3) GVS_TRI(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++) {
+            if (i & 1) GVS_TRI(i, i + 2, i + 1);
+            else GVS_TRI(i, i + 1, i + 2);
+        }
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++) GVS_TRI(0, i, i + 1);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) { GVS_TRI(i, i + 1, i + 2); GVS_TRI(i, i + 2, i + 3); }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) { GVS_TRI(i, i + 1, i + 3); GVS_TRI(i, i + 3, i + 2); }
+        break;
+    default:
+        break;
+    }
+#undef GVS_TRI
+    g->prog = prog;
+    g->nin = nin;
+    g->in = in;
+    g->black = black;
+    g->t0_zero = t0z;
+    g->t1_zero = t1z;
+    g->nref = 0;
+    memcpy(g->k.c0, nv2a_vsh_constant(0), sizeof g->k.c0);
+    memcpy(g->k.c1, nv2a_vsh_constant(1), sizeof g->k.c1);
+    memcpy(g->k.c58, nv2a_vsh_constant(58), sizeof g->k.c58);
+    memcpy(g->k.c59, nv2a_vsh_constant(59), sizeof g->k.c59);
+    for (k = 0; k < 15; k++)
+        memcpy(g->k.cu[k], nv2a_vsh_constant(96 + k), sizeof g->k.cu[k]);
+    g->k.aa[0] = s_gpu.aa_sx; g->k.aa[1] = s_gpu.aa_sy; g->k.aa[2] = g->k.aa[3] = 0.0f;
+    g->k.fogp[0] = s_gpu.fog_param[0]; g->k.fogp[1] = s_gpu.fog_param[1];
+    g->k.fogp[2] = g->k.fogp[3] = 0.0f;
+    g->k.fogm[0] = s_gpu.fog_mode; g->k.fogm[1] = s_gpu.fog_enable ? 1u : 0u;
+    g->k.fogm[2] = g->k.fogm[3] = 0;
+    if (verify < 0) {
+        const char *e = getenv("RECOMP_GPU_VSH_VERIFY");
+        verify = e ? atoi(e) : 0;
+    }
+    if (verify > 0 && ++vtick % (unsigned)verify == 0) {
+        /* The unique vertices in gather order: the first one to land in each output slot. */
+        uint32_t want = nu < RBX_GVS_VERIFY_N ? nu : RBX_GVS_VERIFY_N;
+        for (i = 0; i < n && g->nref < want; i++)
+            if (map[i] == g->nref)
+                gvs_ref(s_gpu.idx[i], &g->ref[g->nref++]);
+    }
+    g_pb_t_xf += pb_ticks() - t0;
+    g_pb_n_xfverts += n;
+    s_gpu.batches_program++;
+    s_gpu.verts_program += n;
+    if (s_gpu.texs[0].valid)
+        note_texture_use();
+    s_bcount = nu;
+    g_rbx_precull = 1;
+    g_rbx_gpuclip = clip_near_z() ? 3 : 1;
+    g_rbx_clip_z = nv2a_vsh_constant(59)[2];
+    t0 = pb_ticks();
+    backend_flush(1);
+    g_pb_t_flush += pb_ticks() - t0;
+    g_rbx_precull = 0;
+    g_rbx_gpuclip = 0;
+    g->prog = RBX_GVS_OFF;
+    return 1;
+}
+
 static void raster_batch_program(void)
 {
     /* Keep each cached transform in its original slot. Assemble primitives
@@ -3905,8 +4124,11 @@ static void raster_batch_program(void)
 
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
-    if (batch_uses_program())
+    if (batch_uses_program()) {
         (void)vp_hash();          /* settle the program identity before workers read it */
+        if (gvs_batch(n))
+            return;
+    }
     t0 = pb_ticks();
     {   /* Post-transform cache, as the hardware has: an indexed batch names
          * most vertices several times, and the state is fixed for the batch. */
@@ -4137,13 +4359,8 @@ xf_done:
     t0 = pb_ticks();
     g_pb_t_clip += t0 - t1;
     if (backend_draws()) {
-        static int near_z = -1;
-        if (near_z < 0) {
-            const char *e = getenv("RECOMP_CLIP_NEAR_Z");
-            near_z = !(e && e[0] == '0');
-        }
         g_rbx_precull = 1;
-        g_rbx_gpuclip = s_gclip ? (near_z ? 3 : 1) : 0;
+        g_rbx_gpuclip = s_gclip ? (clip_near_z() ? 3 : 1) : 0;
         g_rbx_clip_z = s_xf_o[2];
         backend_flush(!s_xf_no_tex);
         g_rbx_precull = 0;
