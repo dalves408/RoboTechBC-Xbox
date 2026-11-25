@@ -62,7 +62,7 @@ Keys work even when the console keeps focus (raw INPUTSINK + async). Enter/Space
 
 Versus supports two players. Connect two SDL3 gamepads for separate controls. If Player 2 disconnects, their controls go neutral and resume when SDL3 reconnects the pad. Keyboard and mouse control Player 1. Controller 1 can hold Back and press Start to open Video settings. Use the D-pad or left stick and A to adjust settings, and B or Start to close the overlay.
 
-Video settings include 1×–5× internal resolution, borderless fullscreen, 4:3 or stretched output, VSync, 30–360 FPS presentation limits or uncapped presentation, 2×/4×/8× MSAA where supported, 2×–16× anisotropic filtering, and hi-res texture replacements. The presentation limit leaves the Xbox game clock unchanged. Settings are saved to `settings.ini`.
+Video settings include 1×–5× internal resolution, borderless fullscreen, aspect-correct or stretched output, native widescreen (Off, Auto from the window, 16:9, 16:10, 21:9; see [docs/widescreen.md](docs/widescreen.md)), VSync, 30–360 FPS presentation limits or uncapped presentation, 2×/4×/8× MSAA where supported, 2×–16× anisotropic filtering, and hi-res texture replacements. The presentation limit leaves the Xbox game clock unchanged. Settings are saved to `settings.ini`.
 
 ### Short Ch1 cinematic overlay (obsolete)
 

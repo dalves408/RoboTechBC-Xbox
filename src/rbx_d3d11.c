@@ -64,8 +64,11 @@ typedef struct { uint32_t va, w, h, bpp, pitch, dirty, used, aa_sx, aa_sy;
                  /* deferred readback: the copy queued at the last flip (pstage, one of stage/stage2) and where it goes */
                  ID3D11Texture2D *stage2, *pstage; int pend; uint32_t pva, pw, ph, ppitch, pbpp;
                  /* down is the guest-sized copy written back to guest memory when the render scale is above 1 */
-                 ID3D11Texture2D *down; ID3D11RenderTargetView *down_rtv; uint32_t shown_dirty; } Rt;
-typedef struct { uint32_t va, w, h;
+                 ID3D11Texture2D *down; ID3D11RenderTargetView *down_rtv; uint32_t shown_dirty;
+                 /* widescreen: guest pixels added on each side of a full-screen target (0 = 4:3). The texture is
+                  * (w + 2 ex) x h at the render scale; w, h and guest memory stay the game's size. */
+                 uint32_t ex; } Rt;
+typedef struct { uint32_t va, w, h, ex;
                  ID3D11Texture2D *tex; ID3D11DepthStencilView *dsv; } Ds;
 typedef struct { uint32_t offset, w, h, color, pitch; uint64_t hash; uint32_t used;
                  uint64_t thash, sig; uint32_t vframe, redecodes, from_pack; /* texture-bytes hash, sample signature, s_frame+1 of the last full verify (get_tex fast path) */
@@ -73,12 +76,12 @@ typedef struct { uint32_t offset, w, h, color, pitch; uint64_t hash; uint32_t us
 typedef struct { uint32_t key[12]; void *obj; } StateEnt;
 
 typedef struct { float sw, sh, tw, th; uint32_t textured, afunc; float aref; uint32_t pad;
-                 float unused[2], clipz, nearz; /* GPU clipping (s_clip_hlsl): offsets 40/44 as in RcDrawCb */ } Cb;
+                 float wsq, uofs, clipz, nearz; /* wsq/uofs: widescreen (wide_wsq, wide_uv); clipz/nearz: GPU clipping (s_clip_hlsl), offsets 40/44 as in RcDrawCb */ } Cb;
 /* Matches rbx_rc_hlsl.h cbuffer C (b0) for combiner draws. */
 typedef struct {
     float surf[2], zscale, aref;
     uint32_t atest, afunc, textured, dbg; /* dbg: 1=V0, 2=solid, 3=T0 */
-    float isz[2], clipz, nearz; /* clipz/nearz: GPU clipping only (s_clip_hlsl) */
+    float wsq, isz1, clipz, nearz; /* wsq: widescreen squeeze (wide_wsq); clipz/nearz: GPU clipping only (s_clip_hlsl) */
 } RcDrawCb;
 typedef struct {
     uint32_t hdr[4], hdr2[4];
@@ -168,6 +171,80 @@ static ID3D11Buffer *s_bl_cb;
 static ID3D11SamplerState *s_bl_smp;
 static Rt s_rt[MAX_RT];
 static Ds s_ds[4];
+
+/* ---- widescreen ---------------------------------------------------------------
+ * F1 "Widescreen" (RECOMP_RBX_WIDESCREEN): the game's full-screen surfaces (640x480 logical) become wider render
+ * targets, (w + 2 ex) x h, while the game keeps drawing in its own 640x480 coordinates. Every vertex shader scales
+ * clip-space x by (1 - wsq):
+ *  - 3D draws are squeezed into the middle 4:3 at their own shape, and what lies left and right of the 4:3 view
+ *    (geometry the game sends past the screen edge) lands in the new side areas: Hor+, the vertical view unchanged;
+ *  - 2D (HUD, menus, movies, text) is squeezed the same way, so it keeps its shape in a centred 4:3 area;
+ *  - a flat full-width quad that is untextured or samples a render target (fades, flashes, cinematic bars, full-
+ *    screen copies and post passes) is stretched over the whole target instead (wsq = 0).
+ * Squeezed draws that sample a wide target have their u remapped to the same middle area (wide_uv), so screen-
+ * space effects line up. Guest memory keeps the game's size: readback squeezes the wide frame into it, and seeding
+ * a target from guest memory stretches it back. The window gets the wide frame and its aspect.
+ * s_wide = target aspect / (4:3); 1 = off. Changed only between frames (video_apply), which rebuilds the targets. */
+static float s_wide = 1.0f;
+
+/* Guest pixels to add each side of a surface: only the game's full-screen size gets wider. */
+static uint32_t wide_extra(uint32_t w, uint32_t h, uint32_t ax, uint32_t ay)
+{
+    uint32_t e;
+    if (s_wide <= 1.001f) return 0;
+    if (!ax) ax = 1;
+    if (!ay) ay = 1;
+    if (w != 640u * ax || h != 480u * ay) return 0;
+    /* whole logical pixels, so the centred 4:3 starts on a pixel edge */
+    e = (uint32_t)(640.0f * (s_wide - 1.0f) * 0.5f + 0.5f);
+    return e * ax;
+}
+static uint32_t rt_full_w(const Rt *rt) { return rt->w + 2u * rt->ex; }
+/* The clip-space x factor's complement for a draw into rt (0 = no squeeze). */
+static float wide_wsq(const Rt *rt, int stretch)
+{
+    if (!rt || !rt->ex || stretch) return 0.0f;
+    return 1.0f - (float)rt->w / (float)rt_full_w(rt);
+}
+static Rt *rt_of_srv(ID3D11ShaderResourceView *v)
+{
+    int i;
+    if (!v) return NULL;
+    for (i = 0; i < MAX_RT; i++)
+        if (s_rt[i].tex && s_rt[i].srv == v) return &s_rt[i];
+    return NULL;
+}
+/* A squeezed draw that samples a wide target: normalised u -> u * *k + *o, the middle 4:3 of that target. */
+static void wide_uv(ID3D11ShaderResourceView *v, float wsq, float *k, float *o)
+{
+    Rt *src = wsq > 0.0f ? rt_of_srv(v) : NULL;
+    *k = 1.0f; *o = 0.0f;
+    if (!src || !src->ex) return;
+    *k = (float)src->w / (float)rt_full_w(src);
+    *o = (float)src->ex / (float)rt_full_w(src);
+}
+/* Screen-flat (one w for every vertex) and spanning the surface's full width: a full-screen pass, not 3D. */
+static int flat_full_width(const Nv2aVertex *v, uint32_t n, uint32_t w)
+{
+    uint32_t i;
+    float lo, hi, r0;
+    if (!n) return 0;
+    lo = hi = v[0].x; r0 = v[0].rhw;
+    for (i = 1; i < n; i++) {
+        if (fabsf(v[i].rhw - r0) > 1e-6f * fabsf(r0) + 1e-12f) return 0;
+        if (v[i].x < lo) lo = v[i].x;
+        if (v[i].x > hi) hi = v[i].x;
+    }
+    return lo <= 1.0f && hi >= (float)w - 1.0f;
+}
+/* Every bound texture is absent or a render target (the frame itself): a full-width pass of it may stretch. */
+static int only_rt_textures(ID3D11ShaderResourceView *const *v, unsigned n)
+{
+    unsigned i;
+    for (i = 0; i < n; i++)
+        if (v[i] && v[i] != s_white_srv && !rt_of_srv(v[i])) return 0;
+    return 1;
+}
 static TexEnt s_tx[MAX_TEX];
 static StateEnt s_bs[96], s_dss[96], s_ss[48];
 static int s_nbs, s_ndss, s_nss;
@@ -204,7 +281,7 @@ static const char s_bl_hlsl[] =
 "  return sum / (nx * ny); }\n";
 
 static const char s_hlsl[] =
-"cbuffer C : register(b0) { float2 surf; float2 tdim; uint textured; uint afunc; float aref; uint pad; };\n"
+"cbuffer C : register(b0) { float2 surf; float2 tdim; uint textured; uint afunc; float aref; uint pad; float wsq; float uofs; };\n"
 "Texture2D t0 : register(t0); SamplerState s0 : register(s0);\n"
 "struct VI { float4 p : POSITION; float4 c : COLOR0; float2 uv : TEXCOORD0; };\n"
 "struct VO { float4 pos : SV_Position; float4 c : COLOR0; float2 uv : TEXCOORD0; };\n"
@@ -212,10 +289,10 @@ static const char s_hlsl[] =
 "  VO o; float w = 1.0 / max(i.p.w, 1e-20);\n"
 "  float nx = i.p.x / surf.x * 2.0 - 1.0; float ny = 1.0 - i.p.y / surf.y * 2.0;\n"
 "  float nz = saturate(i.p.z / 16777215.0);\n"
-"  o.pos = float4(nx * w, ny * w, nz * w, w); o.c = i.c; o.uv = i.uv; return o; }\n"
+"  o.pos = float4(nx * (1.0 - wsq) * w, ny * w, nz * w, w); o.c = i.c; o.uv = i.uv; return o; }\n"
 "float4 ps(VO i) : SV_Target {\n"
 "  float4 c = i.c;\n"
-"  if (textured != 0) { float4 t = t0.Sample(s0, i.uv / tdim); if ((pad & 5) != 0) t.a = 1.0; if ((pad & 2) != 0) t.rgb = float3(1.0, 1.0, 1.0); c *= t; }\n"
+"  if (textured != 0) { float4 t = t0.Sample(s0, i.uv / tdim + float2(uofs, 0.0)); if ((pad & 5) != 0) t.a = 1.0; if ((pad & 2) != 0) t.rgb = float3(1.0, 1.0, 1.0); c *= t; }\n"
 "  float a = c.a * 255.0; float r = aref;\n"
 "  bool ok = true;\n"
 "  if (afunc == 0x200) ok = false; else if (afunc == 0x201) ok = a < r - 0.5;\n"
@@ -230,11 +307,11 @@ static const char s_hlsl[] =
  * depth clip off), and the CPU clipper's two planes become clip distances: w >= 1e-3, and z >= clipz in screen z.
  * The inputs match s_il / s_rc_il; each output adds the clip distances after the fields its pixel shader reads. */
 static const char s_clip_hlsl[] =
-"cbuffer C : register(b0) { float2 surf; float zs_rc; float pad0; uint4 pad1; float2 pad2; float clipz; float nearz; };\n"
+"cbuffer C : register(b0) { float2 surf; float zs_rc; float pad0; uint4 pad1; float wsq; float pad2; float clipz; float nearz; };\n"
 "float4 clip_pos(float3 p, float rhw, float zs, out float2 cd) {\n"
 "  float w = 1.0 / rhw;\n"
 "  cd = float2(w - 1e-3, nearz > 0.5 ? (p.z - clipz) * w : 1.0);\n"
-"  return float4((p.x / surf.x * 2.0 - 1.0) * w, (1.0 - p.y / surf.y * 2.0) * w, p.z * zs * w, w); }\n"
+"  return float4((p.x / surf.x * 2.0 - 1.0) * (1.0 - wsq) * w, (1.0 - p.y / surf.y * 2.0) * w, p.z * zs * w, w); }\n"
 "struct VI { float4 p : POSITION; float4 c : COLOR0; float2 uv : TEXCOORD0; };\n"
 "struct VO { float4 pos : SV_Position; float4 c : COLOR0; float2 uv : TEXCOORD0; float2 cd : SV_ClipDistance0; };\n"
 "VO vs_clip(VI i) { VO o; o.pos = clip_pos(i.p.xyz, i.p.w, 1.0 / 16777215.0, o.cd); o.c = i.c; o.uv = i.uv; return o; }\n"
@@ -255,7 +332,7 @@ static const char s_clip_hlsl[] =
  * rc_vert_fix (t1 <- t0) and vs_clip_rc (clip-space mapping, near planes as clip distances). Keep in step with the
  * vsh_fast_* functions in the executor. Outputs match ps_rc's input. */
 static const char s_gvs_hlsl[] =
-"cbuffer C : register(b0) { float2 surf; float zs_rc; float pad0; uint4 pad1; float2 pad2; float clipz; float nearz; };\n"
+"cbuffer C : register(b0) { float2 surf; float zs_rc; float pad0; uint4 pad1; float wsq; float pad2; float clipz; float nearz; };\n"
 "cbuffer V : register(b2) { float4 c0; float4 c1; float4 c58; float4 c59; float4 cu[15]; float4 aa; float4 fogp; uint4 fogm; };\n"
 "#define C(n) cu[(n) - 96]\n"
 "struct VOR { float4 pos : SV_Position; float4 c : COLOR; float4 d1 : TEXCOORD1;\n"
@@ -283,7 +360,7 @@ static const char s_gvs_hlsl[] =
 "  if (asuint(x.pos.w) == 0u) x.pos.w = 1.0;\n"
 "  x.pos.xy *= aa.xy; w = x.pos.w;\n"
 "  o.cd = float2(w - 1e-3, nearz > 0.5 ? (x.pos.z - clipz) * w : 1.0);\n"
-"  o.pos = float4((x.pos.x / surf.x * 2.0 - 1.0) * w, (1.0 - x.pos.y / surf.y * 2.0) * w, x.pos.z * zs_rc * w, w);\n"
+"  o.pos = float4((x.pos.x / surf.x * 2.0 - 1.0) * (1.0 - wsq) * w, (1.0 - x.pos.y / surf.y * 2.0) * w, x.pos.z * zs_rc * w, w);\n"
 "  o.c = floor(saturate(x.d0) * 255.0 + 0.5) / 255.0;\n"
 "  o.d1 = x.d1;\n"
 "  if (abs(x.t1.x) + abs(x.t1.y) + abs(x.t1.z) < 1e-6 && abs(x.t0.x) + abs(x.t0.y) + abs(x.t0.z) > 1e-6) x.t1 = x.t0;\n"
@@ -757,7 +834,7 @@ static ID3D11Resource *rt_guest_image(Rt *rt)
 {
     rt_resolve(rt);
     if (!rt->down) return (ID3D11Resource *)rt->tex;
-    blit(rt->srv, rt->down_rtv, rt->w, rt->h, rt->w * (uint32_t)s_scale, rt->h * (uint32_t)s_scale);
+    blit(rt->srv, rt->down_rtv, rt->w, rt->h, rt_full_w(rt) * (uint32_t)s_scale, rt->h * (uint32_t)s_scale);
     return (ID3D11Resource *)rt->down;
 }
 
@@ -799,7 +876,7 @@ static void rt_seed_from_guest(Rt *rt, const Nv2aSurface *s)
     sd.pSysMem = px; sd.SysMemPitch = s->width * 4; sd.SysMemSlicePitch = 0;
     if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &t)) &&
         SUCCEEDED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t, NULL, &v))) {
-        blit(v, rt->rtv, s->width * (uint32_t)s_scale, s->height * (uint32_t)s_scale, s->width, s->height);
+        blit(v, rt->rtv, rt_full_w(rt) * (uint32_t)s_scale, s->height * (uint32_t)s_scale, s->width, s->height);
         rt->resolve_pending = rt->msaa != NULL;
     }
     SAFE_REL(v); SAFE_REL(t);
@@ -871,7 +948,7 @@ static int clear_partial_draw(Rt *rt, unsigned wmask, const float c[4], const D3
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
     ID3D11DeviceContext_RSSetState(s_ctx, s_cl_rs);
     vp.TopLeftX = vp.TopLeftY = 0; vp.MinDepth = 0; vp.MaxDepth = 1;
-    vp.Width = (float)(rt->w * (uint32_t)s_scale); vp.Height = (float)(rt->h * (uint32_t)s_scale);
+    vp.Width = (float)(rt_full_w(rt) * (uint32_t)s_scale); vp.Height = (float)(rt->h * (uint32_t)s_scale);
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, r);
     ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
@@ -889,7 +966,7 @@ static Rt *get_rt(const Nv2aSurface *s)
 {
     int i, free_i = -1, lru = 0;
     D3D11_TEXTURE2D_DESC td;
-    uint32_t w = s->width, h = s->height;
+    uint32_t w = s->width, h = s->height, ex = wide_extra(s->width, s->height, s->aa_sx, s->aa_sy);
 
     for (i = 0; i < MAX_RT; i++) {
         if (s_rt[i].tex && s_rt[i].va == s->color_va && s_rt[i].w == w && s_rt[i].h == h) {
@@ -915,8 +992,9 @@ static Rt *get_rt(const Nv2aSurface *s)
     }
     s_rt[free_i].pend = 0; s_rt[free_i].pstage = NULL;
     memset(&td, 0, sizeof td);
-    td.Width = w * (uint32_t)s_scale; td.Height = h * (uint32_t)s_scale; td.MipLevels = td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.Width = (w + 2u * ex) * (uint32_t)s_scale; td.Height = h * (uint32_t)s_scale; td.MipLevels = td.ArraySize = 1; td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    s_rt[free_i].ex = ex;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_rt[free_i].tex))) { rt_release(&s_rt[free_i]); return NULL; }
     ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_rt[free_i].tex, NULL, &s_rt[free_i].srv);
     if (s_msaa > 1) {
@@ -935,7 +1013,7 @@ static Rt *get_rt(const Nv2aSurface *s)
         return NULL;
     }
     td.Width = w; td.Height = h;
-    if (s_scale > 1) {
+    if (s_scale > 1 || ex) {   /* the guest-sized copy for readback: smaller, or a wide target squeezed to the game's size */
         td.BindFlags = D3D11_BIND_RENDER_TARGET;
         if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_rt[free_i].down))) { rt_release(&s_rt[free_i]); return NULL; }
         ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_rt[free_i].down, NULL, &s_rt[free_i].down_rtv);
@@ -964,12 +1042,12 @@ static Rt *get_rt(const Nv2aSurface *s)
             if (s_evicted[j] == s->color_va) was_evicted = 1;
         if (alias >= 0) st_rt_alias++;
         if (s_resets) rt_seed_from_guest(&s_rt[free_i], s);
-        else if (seed && alias >= 0 && !s_rt[free_i].msaa) {
+        else if (seed && alias >= 0 && !s_rt[free_i].msaa && s_rt[alias].ex == ex) {
             /* Same pixels, 1:1, over the overlap (both are at the current render scale). */
             D3D11_BOX box;
             rt_resolve(&s_rt[alias]);
             box.left = box.top = box.front = 0; box.back = 1;
-            box.right = (s_rt[alias].w < w ? s_rt[alias].w : w) * (uint32_t)s_scale;
+            box.right = (rt_full_w(&s_rt[alias]) < w + 2u * ex ? rt_full_w(&s_rt[alias]) : w + 2u * ex) * (uint32_t)s_scale;
             box.bottom = (s_rt[alias].h < h ? s_rt[alias].h : h) * (uint32_t)s_scale;
             ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)s_rt[free_i].tex, 0, 0, 0, 0,
                                                       (ID3D11Resource *)s_rt[alias].tex, 0, &box);
@@ -977,8 +1055,8 @@ static Rt *get_rt(const Nv2aSurface *s)
             rt_seed_from_guest(&s_rt[free_i], s);
     }
     if (s_verbose || getenv("RECOMP_GPU_LOGRT"))
-        fprintf(stderr, "[RBX DX11] render target va=%08X %ux%u bpp=%u pitch=%u aa=%ux%u\n", s->color_va, w, h,
-                s->bytes_per_pixel, s->pitch, s->aa_sx, s->aa_sy);
+        fprintf(stderr, "[RBX DX11] render target va=%08X %ux%u bpp=%u pitch=%u aa=%ux%u wide+%u\n", s->color_va, w, h,
+                s->bytes_per_pixel, s->pitch, s->aa_sx, s->aa_sy, ex);
     return &s_rt[free_i];
 }
 
@@ -986,18 +1064,19 @@ static Ds *get_ds(const Nv2aSurface *s, uint32_t zva)
 {
     int i, slot = -1;
     D3D11_TEXTURE2D_DESC td;
+    uint32_t ex = wide_extra(s->width, s->height, s->aa_sx, s->aa_sy);
     if (!zva) return NULL;
     for (i = 0; i < 4; i++)
-        if (s_ds[i].tex && s_ds[i].va == zva && s_ds[i].w == s->width && s_ds[i].h == s->height) return &s_ds[i];
+        if (s_ds[i].tex && s_ds[i].va == zva && s_ds[i].w == s->width && s_ds[i].h == s->height && s_ds[i].ex == ex) return &s_ds[i];
     for (i = 0; i < 4; i++) if (!s_ds[i].tex) { slot = i; break; }
     if (slot < 0) { slot = (int)(s_tick & 3); SAFE_REL(s_ds[slot].dsv); SAFE_REL(s_ds[slot].tex); }
     memset(&td, 0, sizeof td);
-    td.Width = s->width * (uint32_t)s_scale; td.Height = s->height * (uint32_t)s_scale; td.MipLevels = td.ArraySize = 1;
+    td.Width = (s->width + 2u * ex) * (uint32_t)s_scale; td.Height = s->height * (uint32_t)s_scale; td.MipLevels = td.ArraySize = 1;
     td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; td.SampleDesc.Count = s_msaa; td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ds[slot].tex))) return NULL;
     ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)s_ds[slot].tex, NULL, &s_ds[slot].dsv);
-    s_ds[slot].va = zva; s_ds[slot].w = s->width; s_ds[slot].h = s->height;
+    s_ds[slot].va = zva; s_ds[slot].w = s->width; s_ds[slot].h = s->height; s_ds[slot].ex = ex;
     return &s_ds[slot];
 }
 
@@ -1069,7 +1148,7 @@ static void sf_flush(void)
     if (!s_sf_dirty) return;
     s_sf_dirty = 0;
     if (s_sf_rt && s_sf_rt->tex)
-        sprite_filter_run(s_sf_srv, s_sf_w, s_sf_h, s_sf_rt->rtv, s_sf_rt->w * (uint32_t)s_scale, s_sf_rt->h * (uint32_t)s_scale, s_sf, s_smooth, s_sharpen);
+        sprite_filter_run(s_sf_srv, s_sf_w, s_sf_h, s_sf_rt->rtv, rt_full_w(s_sf_rt) * (uint32_t)s_scale, s_sf_rt->h * (uint32_t)s_scale, s_sf, s_smooth, s_sharpen);
 }
 
 /* ---- state objects ------------------------------------------------------ */
@@ -1813,7 +1892,7 @@ static void gb_clear_impl(const Nv2aSurface *s, const Nv2aRenderState *rs, uint3
         {
             static int full = -1;
             unsigned wmask = (flags >> 4) & 15u;   /* R 1, G 2, B 4, A 8: the D3D11 write-mask bits */
-            uint32_t sw = rt->w * (uint32_t)s_scale, sh = rt->h * (uint32_t)s_scale;
+            uint32_t sw = rt_full_w(rt) * (uint32_t)s_scale, sh = rt->h * (uint32_t)s_scale;
             D3D11_RECT r;
             r.left = 0; r.top = 0; r.right = (LONG)sw; r.bottom = (LONG)sh;
             if (full < 0) full = getenv("RECOMP_GPU_CLEARFULL") != NULL;
@@ -1826,6 +1905,10 @@ static void gb_clear_impl(const Nv2aSurface *s, const Nv2aRenderState *rs, uint3
                 if (x1 > rt->w) x1 = rt->w;
                 if (y1 > rt->h) y1 = rt->h;
                 if (x0 < x1 && y0 < y1) {
+                    /* Widescreen: a clear of the full width covers the side areas too; a smaller one is in the
+                     * centred 4:3 like the draws. */
+                    if (x0 == 0 && x1 >= rt->w) x1 = rt_full_w(rt);
+                    else { x0 += rt->ex; x1 += rt->ex; }
                     r.left = (LONG)(x0 * (uint32_t)s_scale); r.right = (LONG)(x1 * (uint32_t)s_scale);
                     r.top = (LONG)(y0 * (uint32_t)s_scale); r.bottom = (LONG)(y1 * (uint32_t)s_scale);
                 }
@@ -1962,8 +2045,9 @@ static void rc_vert_fix(Nv2aVertex *dv, RcVertExt *xe)
  * combiners cannot draw it; the caller then uses the simple path. */
 static int rc_setup(const Nv2aSurface *s, const Nv2aBatch *b, uint32_t kept, int t0_zero, int t1_zero, int packed_ext,
                     int gclip, float clipz, float nearz, ID3D11ShaderResourceView *bound_srv[4],
-                    ID3D11SamplerState *bound_smp[4], ID3D11Buffer **cbufp)
+                    ID3D11SamplerState *bound_smp[4], ID3D11Buffer **cbufp, const Rt *rt, int flat_full)
 {
+    float wsq = 0.0f;
     const Nv2aRenderState *r = b->state;
     D3D11_MAPPED_SUBRESOURCE m;
     ID3D11Buffer *cbuf;
@@ -2027,6 +2111,15 @@ static int rc_setup(const Nv2aSurface *s, const Nv2aBatch *b, uint32_t kept, int
                 rc.uvs[stage][2] = whitetex ? 0.0f : 1.0f;
             }
         }
+        /* Widescreen: squeeze into the centred 4:3 unless this is a full-width pass of the frame; sampled wide
+         * targets map to their own centred 4:3 (see wide_wsq). */
+        wsq = wide_wsq(rt, flat_full && only_rt_textures(bound_srv, 4));
+        for (stage = 0; stage < 4; stage++) {
+            float k, o;
+            wide_uv(bound_srv[stage], wsq, &k, &o);
+            rc.uvs[stage][0] *= k;
+            rc.uvs[stage][3] = o;
+        }
         for (stage = 0; stage < 8; stage++) {
             rc.stages[2 * stage][0] = c->color_icw[stage];
             rc.stages[2 * stage][1] = c->alpha_icw[stage];
@@ -2056,6 +2149,7 @@ static int rc_setup(const Nv2aSurface *s, const Nv2aBatch *b, uint32_t kept, int
           if (rcdbg && s_frame >= 450) rcb.dbg = (uint32_t)rcdbg;
         }
         rcb.textured = bound_srv[0] != NULL;
+        rcb.wsq = wsq;
         rcb.clipz = clipz; rcb.nearz = nearz;
         cbuf = s_cbr[s_cb_i++ % CB_RING];
         if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)cbuf, 0,
@@ -2127,6 +2221,24 @@ static void gvs_verify(const Nv2aSurface *s, const Nv2aRenderState *r, int prog)
                 ok[1], bad[1], ok[2], bad[2], ok[3], bad[3], ok[4], bad[4]);
 }
 
+/* Widescreen: the pass-through program's batch (screen positions r1 * c0 + c1, then the AA scale) is screen-flat and
+ * spans the full width. The transforming programs are 3D and always squeeze. */
+static int gvs_flat_full(const Nv2aSurface *s, const Nv2aBatch *b, const RbxGvs *g)
+{
+    uint32_t i, n = b->count;
+    float lo = 0, hi = 0, w0 = 0;
+    if (g->prog != RBX_GVS_BA9E || !g->in || !g->nin) return 0;
+    for (i = 0; i < n; i++) {
+        const float *v0 = g->in + (size_t)i * g->nin * 4u;
+        float x = (v0[0] * g->k.c0[0] + g->k.c1[0]) * g->k.aa[0];
+        if (!i) { lo = hi = x; w0 = v0[3]; continue; }
+        if (v0[3] != w0) return 0;
+        if (x < lo) lo = x;
+        if (x > hi) hi = x;
+    }
+    return n && lo <= 1.0f && hi >= (float)s->width - 1.0f;
+}
+
 /* A batch the executor handed over raw (g_rbx_gvs.prog set): the program's vertex shader transforms, clips and
  * culls; the combiners draw it. b->count is the number of unique vertices, g_rbx_gvs.in their inputs. */
 static void gb_draw_gvs(const Nv2aSurface *s, const Nv2aBatch *b)
@@ -2161,7 +2273,8 @@ static void gb_draw_gvs(const Nv2aSurface *s, const Nv2aBatch *b)
     rt = get_rt(s);
     if (!rt) return;
     ds = get_ds(s, r->zeta_va);
-    if (!rc_setup(s, b, b->count, g->t0_zero, g->t1_zero, 1, 1, g_rbx_clip_z, nearz, bound_srv, bound_smp, &cbuf) || !cbuf) {
+    if (!rc_setup(s, b, b->count, g->t0_zero, g->t1_zero, 1, 1, g_rbx_clip_z, nearz, bound_srv, bound_smp, &cbuf,
+                  rt, rt->ex && gvs_flat_full(s, b, g)) || !cbuf) {
         static unsigned nf;
         if (nf++ < 8) fprintf(stderr, "[RBX DX11] GPU vertex program batch dropped: combiners unavailable\n");
         return;
@@ -2196,14 +2309,14 @@ static void gb_draw_gvs(const Nv2aSurface *s, const Nv2aBatch *b)
     {   /* Versus split screen: keep this camera's draws on its half (see rbx_d3d11_clear_rect). */
         int split = s_rs_split && s_split_va && s_split_va == s->color_va;
         if (split) {
-            D3D11_RECT rect = { 0, s_split_top * s_scale, s->width * s_scale, s_split_bottom * s_scale };
+            D3D11_RECT rect = { 0, s_split_top * s_scale, rt_full_w(rt) * s_scale, s_split_bottom * s_scale };
             ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &rect);
         }
         ID3D11DeviceContext_RSSetState(s_ctx, clip_rs(r, split));
     }
     { static float po = -1.0f; if (po < 0) { const char *e = getenv("RECOMP_GPU_PIXOFS"); po = e ? (float)atof(e) : 0.5f; if (po < 0) po = 0; }
       vp.TopLeftX = vp.TopLeftY = po * (float)s_scale; }
-    vp.Width = (float)(s->width * (uint32_t)s_scale); vp.Height = (float)(s->height * (uint32_t)s_scale);
+    vp.Width = (float)(rt_full_w(rt) * (uint32_t)s_scale); vp.Height = (float)(s->height * (uint32_t)s_scale);
     vp.MinDepth = 0; vp.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_IASetInputLayout(s_ctx, s_gvs_il[prog]);
@@ -2438,7 +2551,8 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
                 if (fabsf(t1[0]) + fabsf(t1[1]) + fabsf(t1[2]) > 1e-5f) t1_zero = 0;
                 if (fabsf(t0[0]) + fabsf(t0[1]) + fabsf(t0[2]) > 1e-5f) t0_zero = 0;
             }
-            use_rc = rc_setup(s, b, kept, t0_zero, t1_zero, packed_ext, gclip, clipz, nearz, bound_srv, bound_smp, &cbuf);
+            use_rc = rc_setup(s, b, kept, t0_zero, t1_zero, packed_ext, gclip, clipz, nearz, bound_srv, bound_smp, &cbuf,
+                              rt, rt->ex && flat_full_width(b->vertices, b->count, s->width));
             if (use_rc) {
                 srv = bound_srv[0] ? bound_srv[0] : s_white_srv;
                 smp = bound_smp[0];
@@ -2536,6 +2650,7 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
             memset(&cb, 0, sizeof cb);
             cb.sw = (float)s->width; cb.sh = (float)s->height;
             cb.textured = 0; cb.afunc = 0x208; cb.aref = 0;
+            cb.wsq = wide_wsq(rt, 0);
             cb.clipz = clipz; cb.nearz = nearz;
             srv = s_white_srv;
             { Nv2aTexture dflt; memset(&dflt, 0, sizeof dflt); dflt.addr_u = dflt.addr_v = 3; smp = get_sampler(&dflt); }
@@ -2568,6 +2683,13 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
                 cb.tw = (float)b->texture->width; cb.th = (float)b->texture->height;
             }
             if (!smp) { Nv2aTexture dflt; memset(&dflt, 0, sizeof dflt); dflt.addr_u = dflt.addr_v = 3; smp = get_sampler(&dflt); }
+            if (rt->ex) {   /* widescreen: see wide_wsq */
+                float k, o;
+                int plain = !cb.textured || srv == s_white_srv || rt_of_srv(srv);
+                cb.wsq = wide_wsq(rt, plain && flat_full_width(b->vertices, b->count, s->width));
+                wide_uv(cb.textured ? srv : NULL, cb.wsq, &k, &o);
+                if (k != 1.0f) { cb.tw /= k; cb.uofs = o; }
+            }
             { static int tdm = -1; static unsigned tdn, tdf, tdo;   /* RECOMP_GPU_TEXTDRAW=N: dump the first N draws that sample a P8 texture (glyph quads) */
               if (tdm < 0) { const char *e = getenv("RECOMP_GPU_TEXTDRAW"); tdm = e ? atoi(e) : 0; { const char *ef = getenv("RECOMP_GPU_TEXTDRAW_FROM"); tdf = ef ? (unsigned)atoi(ef) : 0; ef = getenv("RECOMP_GPU_TEXTDRAW_OFF"); tdo = ef ? (unsigned)strtoul(ef, NULL, 16) : 0; } }
               if (tdn < (unsigned)tdm && b->texture && b->texture->color == 0x0B && b->texture->width == 512 && s_frame >= tdf && (!tdo || tdo == b->texture->offset)) { uint32_t k, nv = b->count < 12 ? b->count : 12; tdn++; td_probe = 1;
@@ -2620,7 +2742,7 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
         ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
         ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss, r->stencil_ref & 0xFF);
         if (!layer_draw && s_rs_split && s_split_va && s_split_va == s->color_va) {
-            D3D11_RECT rect = { 0, s_split_top * s_scale, s->width * s_scale, s_split_bottom * s_scale };
+            D3D11_RECT rect = { 0, s_split_top * s_scale, rt_full_w(rt) * s_scale, s_split_bottom * s_scale };
             ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &rect);
             ID3D11DeviceContext_RSSetState(s_ctx, gclip ? clip_rs(r, 1) : s_rs_split);
         } else {
@@ -2630,7 +2752,7 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
         { static float po = -1.0f; if (po < 0) { const char *e = getenv("RECOMP_GPU_PIXOFS"); po = e ? (float)atof(e) : 0.5f; if (po < 0) po = 0; }
           if (layer_draw) { vp.TopLeftX = po * (float)SF_W / (float)s->width; vp.TopLeftY = po * (float)SF_H / (float)s->height; }
           else vp.TopLeftX = vp.TopLeftY = po * (float)s_scale; }
-        vp.Width = layer_draw ? (float)SF_W : (float)(s->width * (uint32_t)s_scale); vp.Height = layer_draw ? (float)SF_H : (float)(s->height * (uint32_t)s_scale); vp.MinDepth = 0; vp.MaxDepth = 1;
+        vp.Width = layer_draw ? (float)SF_W : (float)(rt_full_w(rt) * (uint32_t)s_scale); vp.Height = layer_draw ? (float)SF_H : (float)(s->height * (uint32_t)s_scale); vp.MinDepth = 0; vp.MaxDepth = 1;
         ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
         ID3D11DeviceContext_IASetInputLayout(s_ctx, use_rc ? s_rc_il : s_il);
         ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -2898,7 +3020,7 @@ static void publish_frame(void)
         if ((unsigned long long)now.QuadPart < next_frame) return;
     }
     {
-        uint32_t w = rt->w * (uint32_t)s_scale, h = rt->h * (uint32_t)s_scale;
+        uint32_t w = rt_full_w(rt) * (uint32_t)s_scale, h = rt->h * (uint32_t)s_scale;
         if (w != s_share_w || h != s_share_h || !s_share) {
             D3D11_TEXTURE2D_DESC td;
             IDXGIResource *res = NULL;
@@ -2929,10 +3051,11 @@ static void publish_frame(void)
             s_share_w = w; s_share_h = h;
             s_share_handle = handle;
         }
-        /* Always refresh logical aspect: AA 1280×480 must letterbox as 640×480 (4:3). */
+        /* Always refresh logical aspect: AA 1280×480 must letterbox as 640×480 (4:3), and a widescreen target as its
+         * own wider shape. */
         {
             uint32_t ax = rt->aa_sx ? rt->aa_sx : 1, ay = rt->aa_sy ? rt->aa_sy : 1;
-            uint32_t dw = (rt->w / ax) * (uint32_t)s_scale, dh = (rt->h / ay) * (uint32_t)s_scale;
+            uint32_t dw = (rt_full_w(rt) / ax) * (uint32_t)s_scale, dh = (rt->h / ay) * (uint32_t)s_scale;
             if (!dw) dw = 640;
             if (!dh) dh = 480;
             gpu_present_set_display_size(dw, dh);
@@ -2976,6 +3099,42 @@ static void publish_frame(void)
     }
 }
 
+/* Widescreen factor for the F1 choice (0 Off, 1 Auto, 2 16:9, 3 16:10, 4 21:9). RECOMP_RBX_WIDESCREEN=<w>:<h> (or a
+ * plain ratio such as 2.4) with a shape the menu does not list overrides it; the listed names are read by settings. */
+static float wide_target(unsigned mode)
+{
+    extern HWND xbox_fb_window(void);
+    static const float shapes[] = { 4.0f / 3.0f, 0.0f, 16.0f / 9.0f, 16.0f / 10.0f, 64.0f / 27.0f };
+    static float custom = -1.0f, pending;
+    static DWORD since;
+    float a;
+    if (custom < 0.0f) {
+        const char *e = getenv("RECOMP_RBX_WIDESCREEN");
+        float x = 0, y = 0;
+        custom = 0.0f;
+        if (e && sscanf(e, "%f:%f", &x, &y) == 2 && x > 0 && y > 0) custom = x / y;
+        else if (e && sscanf(e, "%f", &x) == 1 && x > 1.34f && x <= 4.0f) custom = x;
+        if (custom == 16.0f / 9.0f || custom == 16.0f / 10.0f || (custom > 2.33f && custom < 2.34f)) custom = 0.0f;
+        if (custom > 0.0f) fprintf(stderr, "[RBX DX11] widescreen: custom aspect %.4f from RECOMP_RBX_WIDESCREEN\n", custom);
+    }
+    if (custom > 0.0f) a = custom;
+    else if (mode == 1) {
+        /* Auto: the window's client shape (the monitor's in fullscreen), once a resize has settled for 300 ms so a
+         * drag does not rebuild the targets every frame. */
+        HWND w = xbox_fb_window();
+        RECT r;
+        if (!w || !GetClientRect(w, &r) || r.right <= 0 || r.bottom <= 0) return s_wide;
+        a = (float)r.right / (float)r.bottom;
+        if (fabsf(a - pending) > 0.002f) { pending = a; since = GetTickCount(); }
+        if (GetTickCount() - since < 300) return s_wide;
+    } else if (mode < sizeof shapes / sizeof shapes[0]) a = shapes[mode];
+    else a = shapes[0];
+    a /= 4.0f / 3.0f;
+    if (a < 1.0f) a = 1.0f;
+    if (a > 2.7f) a = 2.7f;   /* 32:9 */
+    return floorf(a * 256.0f + 0.5f) / 256.0f;
+}
+
 /* Between frames, on the pushbuffer thread. */
 static void video_apply(void)
 {
@@ -2994,15 +3153,18 @@ static void video_apply(void)
         s_nss = 0;
         s_aniso = aniso;
     }
-    if (scale != s_scale || samples != s_msaa) {
+    float wide = wide_target((options >> 12) & 7);
+    if (scale != s_scale || samples != s_msaa || wide != s_wide) {
         ID3D11RenderTargetView *none = NULL;
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &none, NULL);
         for (i = 0; i < MAX_RT; i++) { rt_release(&s_rt[i]); s_rt[i].va = 0; }
         for (i = 0; i < 4; i++) { SAFE_REL(s_ds[i].dsv); SAFE_REL(s_ds[i].tex); s_ds[i].va = 0; }
         s_scale = scale;
         s_msaa = samples;
+        s_wide = wide;
         s_resets++;
-        fprintf(stderr, "[RBX DX11] video: render scale %dx, MSAA %ux\n", s_scale, s_msaa);
+        fprintf(stderr, "[RBX DX11] video: render scale %dx, MSAA %ux, widescreen %.3f (aspect %.3f)\n", s_scale, s_msaa,
+                s_wide, s_wide * 4.0f / 3.0f);
     }
 }
 

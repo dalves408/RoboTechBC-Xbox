@@ -20,7 +20,7 @@ extern int rbx_pad_peek(DWORD port, XBOX_INPUT_STATE *state);
 extern int (*rbx_input_block_hook)(void);
 extern int rbx_sdl_window_tick(HWND, int (*)(unsigned, long, int), int (*)(void));
 
-enum { SCALE, FULLSCREEN, STRETCH, VSYNC, RATE, AA, ANISO, HIRES, CLOSE, QUIT, ROWS };
+enum { SCALE, FULLSCREEN, STRETCH, WIDE, VSYNC, RATE, AA, ANISO, HIRES, CLOSE, QUIT, ROWS };
 enum { CLOSED, SETTINGS, CONFIRM };
 static const struct {
     const char *label, *key;
@@ -29,7 +29,9 @@ static const struct {
 } options[ROWS] = {
     {"Render scale", "scale", 5, 0, {"1x / 640 x 480", "2x / 1280 x 960", "3x / 1920 x 1440", "4x / 2560 x 1920", "5x / 3200 x 2400"}},
     {"Fullscreen", "fullscreen", 2, 0, {"Off", "On"}},
-    {"Stretch image", "stretch", 2, 0, {"Off / 4:3", "On / Fill window"}},
+    {"Stretch image", "stretch", 2, 0, {"Off / Keep shape", "On / Fill window"}},
+    /* Widescreen renders more of the scene left and right (Hor+) and keeps the HUD and menus at 4:3 in the middle. */
+    {"Widescreen", "widescreen", 5, 0, {"Off / 4:3", "Auto / Match window", "16:9", "16:10", "21:9"}},
     {"VSync", "vsync", 2, 0, {"Off", "On"}},
     {"FPS limit", "rate", 7, 6, {"30 FPS", "60 FPS", "120 FPS", "144 FPS", "240 FPS", "360 FPS", "Uncapped"}},
     {"Anti-aliasing", "msaa", 4, 0, {"Off", "2x MSAA", "4x MSAA", "8x MSAA"}},
@@ -68,7 +70,7 @@ static void apply_choice(int row)
 {
     /* One word gives the render thread a consistent settings snapshot. */
     LONG render = (LONG)(choice[SCALE] | choice[AA] << 3 | choice[ANISO] << 5 |
-                         choice[HIRES] << 8 | choice[RATE] << 9);
+                         choice[HIRES] << 8 | choice[RATE] << 9 | choice[WIDE] << 12);
     InterlockedExchange(&video, render);
     if (row == FULLSCREEN && xbox_fb_window() &&
         (int)choice[FULLSCREEN] != xbox_fb_is_fullscreen())
@@ -144,7 +146,7 @@ static void position_overlay(void)
     HWND parent = xbox_fb_window();
     RECT client, current;
     POINT origin = {0, 0};
-    int width = 444, height = mode == SETTINGS ? 334 : 105;
+    int width = 444, height = mode == SETTINGS ? 358 : 105;
     if (!overlay || !parent || !GetClientRect(parent, &client)) return;
     ClientToScreen(parent, &origin);
     int x = origin.x + (client.right - width) / 2;
@@ -341,6 +343,15 @@ void rbx_settings_install(void)
     if (fullscreen) choice[FULLSCREEN] = *fullscreen && *fullscreen != '0';
     if (vsync) choice[VSYNC] = *vsync && *vsync != '0';
     if (stretch) choice[STRETCH] = *stretch && *stretch != '0';
+    const char *wide = getenv("RECOMP_RBX_WIDESCREEN");
+    if (wide && *wide) {
+        /* off (0), auto (1), 16:9, 16:10, 21:9; any other w:h is a custom shape the renderer reads itself */
+        static const char *const names[] = {"off", "auto", "16:9", "16:10", "21:9"};
+        for (unsigned i = 0; i < 5; i++)
+            if (!_stricmp(wide, names[i])) choice[WIDE] = i;
+        if (!strcmp(wide, "0")) choice[WIDE] = 0;
+        if (!strcmp(wide, "1")) choice[WIDE] = 1;
+    }
     apply_choice(-1);
     xbox_fb_key_hook = window_key;
     xbox_fb_tick_hook = rbx_settings_tick;
