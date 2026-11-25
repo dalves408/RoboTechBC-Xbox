@@ -584,8 +584,102 @@ void sub_0012B670(void)
     MEMF(sp + 20) = x1;
 }
 
+/* RBX pause menu at high frame rates (one press skipped several entries).
+ *
+ * The mission loop (0x10FC80) runs the game in 33 ms ticks (0x11080) and,
+ * every pass, draws (0x11300) and then runs a per-frame callback (0x11370).
+ * START pauses through 0x245D0, which sets 0x1E628C. While it is set the tick
+ * skips the game, and the per-frame callback reads the pads (0x111410: copy
+ * current to previous, sample, set the pressed/released edges) and drives the
+ * pause menu. On the Xbox that was once per displayed frame, 30 a second at
+ * most. Uncapped here it is 200-400 a second, so the menu's input is sampled
+ * and acted on ten times as often as the title was built for, and one press
+ * walks down several entries.
+ *
+ * While paused, run that callback only on passes where a tick advanced the
+ * game clock (0x23A48C, +33 per tick, one tick per pass at most while paused:
+ * 0x10FC50), which is the Xbox's cadence. On the passes in between, clear the
+ * edge flags it set last time, so the draw callback, which runs before it on
+ * the next pass, also sees each press once. Nothing changes while the game is
+ * running. RECOMP_RBX_PAUSE_TICK=0 turns it off; RECOMP_RBX_PAUSE_LOG=1 logs
+ * pause changes and each menu up/down press with the pass count. */
+#define RBX_PAUSED_VA       0x001E628Cu
+#define RBX_GAME_CLOCK_VA   0x0023A48Cu
+#define RBX_INPUT_VA        0x002BE140u   /* per player, 0x210 apart */
+#define RBX_INPUT_PLAYERS   8u            /* 0x111410 updates eight */
+#define RBX_INPUT_PLAYER    0x210u
+#define RBX_INPUT_EDGES     0x60u         /* pressed[24], released[24], double[24] */
+#define RBX_INPUT_EDGE_DW   72u
+extern void sub_00011370(void);
+
+static void rbx_clear_input_edges(void)
+{
+    uint32_t p, i;
+    for (p = 0; p < RBX_INPUT_PLAYERS; p++) {
+        uint32_t edges = RBX_INPUT_VA + p * RBX_INPUT_PLAYER + RBX_INPUT_EDGES;
+        for (i = 0; i < RBX_INPUT_EDGE_DW; i++)
+            MEM32(edges + 4 * i) = 0;
+    }
+}
+
+static void rbx_pause_frame(void)
+{
+    static int on = -1, log;
+    static int was_paused, have_clock;
+    static uint32_t last_clock;
+    static unsigned long passes, skipped;
+    uint32_t paused;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_RBX_PAUSE_TICK");
+        const char *l = getenv("RECOMP_RBX_PAUSE_LOG");
+        on = !(e && e[0] == '0');
+        log = l && l[0] == '1';
+    }
+    paused = MEM32(RBX_PAUSED_VA);
+    passes++;
+    if (log && (paused != 0) != was_paused) {
+        fprintf(stderr, "[RBX PAUSE] %s (clock %u, pass %lu, %lu passes skipped so far)\n",
+                paused ? "paused" : "resumed", MEM32(RBX_GAME_CLOCK_VA), passes, skipped);
+        fflush(stderr);
+    }
+    was_paused = paused != 0;
+    if (!on || !paused) {
+        have_clock = 0;
+        sub_00011370();
+        return;
+    }
+    {
+        uint32_t clock = MEM32(RBX_GAME_CLOCK_VA);
+        if (have_clock && clock == last_clock) {
+            /* No tick since the menu last ran: what the guest call would do,
+             * minus the call. It pops its return address and leaves eax
+             * alone (the loop ignores it). */
+            rbx_clear_input_edges();
+            skipped++;
+            g_esp += 4;
+            return;
+        }
+        have_clock = 1;
+        last_clock = clock;
+    }
+    sub_00011370();
+    if (log) {
+        /* Player 1's d-pad up/down edges (index 6 and 7), as the menu saw them. */
+        uint32_t up = MEM32(RBX_INPUT_VA + RBX_INPUT_EDGES + 4 * 6);
+        uint32_t down = MEM32(RBX_INPUT_VA + RBX_INPUT_EDGES + 4 * 7);
+        if (up || down) {
+            fprintf(stderr, "[RBX PAUSE] menu %s (clock %u, pass %lu)\n",
+                    up ? "up" : "down", MEM32(RBX_GAME_CLOCK_VA), passes);
+            fflush(stderr);
+        }
+    }
+}
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
+    if (xbox_va == 0x00011370u)
+        return rbx_pause_frame;
     if (xbox_va == 0x00155730u) {
         static LONG s_look;
         LONG n = InterlockedIncrement(&s_look);
