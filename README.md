@@ -157,6 +157,7 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 | `RECOMP_XF_SPIN_US=n` | How long an idle vertex-transform worker spins before sleeping (default 200 µs). |
 | `RECOMP_XF_CONVCACHE=0` | A/B only: convert every triangle's vertices again instead of once per vertex per batch. |
 | `RECOMP_GPU_INDEXED=0` | A/B only: hand program batches to D3D11 as three full vertices per triangle instead of unique vertices plus an index buffer. |
+| `RECOMP_GPU_FLUSH=N` | Fallback for GPU drivers that show corrupted or flickering draws: flush the D3D11 queue after draws. `1` after glyph (text) draws, `2` after every textured draw, `3` after every draw. Default `0`. `3` used to be the default on Intel, but it cost about 3.5x in fps on the test laptop's UHD and fixed nothing there; try it only if an Intel GPU shows corruption. |
 | `RECOMP_GPU_CLIP=1` | Test: transformed (program and fixed-function) batches are clipped at the near plane and back-face culled by the GPU instead of the CPU. Needs the indexed hand-off. |
 | `RECOMP_GPU_CLIP_CPUCULL=0` | A/B only, with `RECOMP_GPU_CLIP=1`: leave back-face culling of triangles wholly in front of the eye to the GPU too (by default the CPU drops them before their vertices are converted). |
 | `RECOMP_GPU_VSH=1` | Test: batches that run one of the title's known vertex programs are transformed by a GPU vertex shader instead of on the CPU (they are also clipped and culled on the GPU). Other batches are unchanged. |
