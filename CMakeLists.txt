@@ -127,6 +127,16 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${RBX_SDL3_ROOT}/lib/x64/SDL3.dll"
             "$<TARGET_FILE_DIR:${PROJECT_NAME}>")
 
+# -DRBX_DEBUG_UNLOCK_ALL_LEVELS=ON (build.ps1 -UnlockAllLevels): debug/test
+# builds only. Every story mission can be picked without the cheat code or a
+# save; nothing is written to the profile. RECOMP_UNLOCK_LEVELS=0 turns it off
+# for one run. package_release.py refuses to package such a build.
+option(RBX_DEBUG_UNLOCK_ALL_LEVELS "Debug only: unlock every level in mission select" OFF)
+if(RBX_DEBUG_UNLOCK_ALL_LEVELS)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE RBX_DEBUG_UNLOCK_ALL_LEVELS)
+    message(WARNING "Robotech: RBX_DEBUG_UNLOCK_ALL_LEVELS is ON (debug build, do not ship)")
+endif()
+
 # -DRBX_ABI_CHECK=ON (use a separate build dir): every lifted direct call checks
 # that ebx/esi/edi survive it; src/recomp_manual.c logs offenders as [ABI].
 option(RBX_ABI_CHECK "Check callee-saved registers across lifted calls" OFF)

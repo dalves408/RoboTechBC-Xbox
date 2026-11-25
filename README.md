@@ -171,6 +171,7 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 | `RECOMP_FPS_CAP_DROP=1` | A/B only: the F1 FPS limit drops frames on their way to the window instead of holding the game to the cap. |
 | `RECOMP_MINIDUMP=0` / `full` | A crash writes `crashes\RoboTechBC_<date>_<time>.dmp` beside the exe (open with the matching .pdb). `0` turns it off; `full` includes all memory. |
 | `RECOMP_FB_COPY_EVERY=N` | While the window shows the GPU frame, copy guest memory into the GDI fallback buffer every Nth flip (default 8; 1 = every flip). |
+| `RECOMP_UNLOCK_LEVELS=0` | Only in a debug build made with `scripts\build.ps1 -UnlockAllLevels` (CMake `-DRBX_DEBUG_UNLOCK_ALL_LEVELS=ON`): turns the debug level unlock off for one run. That build lets you pick every story mission without the cheat code or a save, and writes nothing to the profile. It answers the game's level-select cheat check (`isCheat(2)`, 0x2F350) with yes. `package_release.py` refuses to package it. |
 
 ## Hard constraints (do not regress)
 
