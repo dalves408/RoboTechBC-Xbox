@@ -116,7 +116,9 @@ Add `--gpu-stats` to any `rbx_diag.py` run. Every 2 s the game prints an `[RBXPE
 | `guest_fps`, `presented_fps` | Game flips per second, and frames handed to the window |
 | `frame_ms_avg`, `frame_ms_worst`, `hitches_over_33/50/100ms` | Flip-to-flip time on the pushbuffer thread |
 | `readback_ms_per_s` | Time spent copying render targets back into Xbox memory |
-| `shader_compiles`, `shader_compile_ms` | Combiner pixel shaders compiled during the run (each one is a hitch) |
+| `shader_compiles`, `shader_compile_ms`, `shader_cache_hits` | Shaders compiled during the run (each one is a hitch), and shaders loaded from the disk cache instead |
+| `fence_rewait_ms_per_s` | Time BlockOnFence spends waiting again after an early wake |
+| `pb_dropped_walks`, `pb_midwalk_get_moves` | Pushbuffer walks abandoned at PUT (commands skipped), and GET moved under the walk |
 | `forced_get_catchups` | KickOff gave up waiting and marked unread pushbuffer commands as consumed |
 | `fence_early_wakes`, `fence_timeouts` | BlockOnFence woke before its fence; the 2 s recheck gave up |
 | `mmio_traps_per_s` | APU/USB register accesses handled by an exception trap |
@@ -139,6 +141,7 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 | `-DRBX_ABI_CHECK=ON` (CMake) | Diagnostic build that reports lifted functions which fail to restore ebx/esi/edi/esp. |
 | `RECOMP_STUB_LOG=1` | Logs when an unresolved lifter stub is reached. |
 | `RECOMP_PROF=lo-hi` | Samples the busiest thread between those seconds and prints hot source lines. |
+| `RECOMP_SHADER_CACHE=<dir>` | Where compiled shaders are kept between runs (default `shader_cache\` beside the game; `0` turns the cache off). A first run fills it; later runs load instead of compiling, which removes ~30 ms hitches per new combiner variant. `shader_cache_hits` in `--gpu-stats` runs counts loads. |
 | `RECOMP_KICK_STALL_MS=n` | How long KickOff waits with no pushbuffer-walk progress before forcing GET to PUT (default 500). Forced catch-ups drop commands; they show as `forced_get_catchups` in `--gpu-stats` runs. |
 | `RECOMP_KICK_FORCE_MS=n` | A/B only: restores the old behaviour, forcing GET to PUT after a fixed n ms whether or not the walk is moving. |
 | `RECOMP_XF_THREADS=n` | Overrides the vertex-transform worker count (0 disables workers, max 7). Default: one worker on hosts with at least four logical CPUs. |

@@ -188,6 +188,103 @@ static uint32_t s_frame_for_grave;
 static void gb_defer_rel(void *o) { if (!o) return; if (s_defer_n >= sizeof(s_grave)/sizeof(s_grave[0])) { IUnknown_Release(s_grave[0].o); memmove(&s_grave[0], &s_grave[1], (s_defer_n - 1) * sizeof(s_grave[0])); s_defer_n--; } s_grave[s_defer_n].o = (IUnknown *)o; s_grave[s_defer_n].f = s_frame_for_grave; s_defer_n++; }
 #define DEFER_REL(p) do { if (p) { gb_defer_rel(p); (p) = NULL; } } while (0)
 
+/* ---- shader bytecode cache ----------------------------------------------
+ * Compiling a combiner variant takes ~30 ms on the pushbuffer thread (9 per
+ * Story mission run on the test bench: ~260 ms of hitches). Compiled DXBC is
+ * vendor-neutral, so it is kept on disk keyed by a hash of the exact source,
+ * entry point, target and flags, and later runs load it instead of compiling.
+ * RECOMP_SHADER_CACHE=<dir> moves the cache (default shader_cache\ beside the
+ * game); RECOMP_SHADER_CACHE=0 turns it off. A stale or damaged file is just a
+ * miss: the key covers the source, and the header and DXBC tag are checked. */
+static unsigned st_sh_hits;
+static const char *shader_cache_dir(void)
+{
+    static char dir[260];
+    static int state = -1;   /* -1 unknown, 0 off, 1 on */
+    if (state < 0) {
+        const char *e = getenv("RECOMP_SHADER_CACHE");
+        state = 0;
+        if (!(e && e[0] == '0' && !e[1]) &&
+            snprintf(dir, sizeof dir, "%s", (e && *e) ? e : "shader_cache") < (int)sizeof dir) {
+            CreateDirectoryA(dir, NULL);
+            state = 1;
+        }
+    }
+    return state ? dir : NULL;
+}
+
+static uint64_t shader_key(const void *src, SIZE_T n, LPCSTR entry, LPCSTR target, UINT f1, UINT f2)
+{
+    uint64_t h = 1469598103934665603ULL;
+    const unsigned char *p;
+    UINT fl[2]; SIZE_T i;
+#define SK_MIX(b) (h = (h ^ (unsigned char)(b)) * 1099511628211ULL)
+    for (p = (const unsigned char *)"rbxs1|"; *p; p++) SK_MIX(*p);
+    for (p = (const unsigned char *)entry; *p; p++) SK_MIX(*p);
+    SK_MIX('|');
+    for (p = (const unsigned char *)target; *p; p++) SK_MIX(*p);
+    SK_MIX('|');
+    fl[0] = f1; fl[1] = f2;
+    for (i = 0; i < sizeof fl; i++) SK_MIX(((const unsigned char *)fl)[i]);
+    for (p = (const unsigned char *)src, i = 0; i < n; i++) SK_MIX(p[i]);
+#undef SK_MIX
+    return h;
+}
+
+typedef struct { char magic[4]; uint32_t version; uint64_t key; uint32_t size; uint32_t pad; } ShaderCacheHdr;
+
+/* D3DCompile with the cache in front (no macros or includes are cached). */
+static HRESULT rbx_compile(const void *src, SIZE_T n, LPCSTR name, const D3D_SHADER_MACRO *defs, ID3DInclude *inc,
+                           LPCSTR entry, LPCSTR target, UINT f1, UINT f2, ID3DBlob **code, ID3DBlob **err)
+{
+    const char *dir = (defs || inc) ? NULL : shader_cache_dir();
+    char path[400];
+    uint64_t key = 0;
+    HRESULT hr;
+    FILE *f;
+    if (dir) {
+        key = shader_key(src, n, entry, target, f1, f2);
+        snprintf(path, sizeof path, "%s\\%016llx.dxbc", dir, (unsigned long long)key);
+        if ((f = fopen(path, "rb")) != NULL) {
+            ShaderCacheHdr h;
+            ID3DBlob *b = NULL;
+            if (fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, "RBXS", 4) && h.version == 1 && h.key == key &&
+                h.size >= 4 && h.size < (1u << 22) && SUCCEEDED(D3DCreateBlob(h.size, &b))) {
+                unsigned char *d = (unsigned char *)ID3D10Blob_GetBufferPointer(b);
+                if (fread(d, 1, h.size, f) == h.size && !memcmp(d, "DXBC", 4)) {
+                    fclose(f);
+                    *code = b;
+                    if (err) *err = NULL;
+                    st_sh_hits++;
+                    return S_OK;
+                }
+                SAFE_REL(b);
+            }
+            fclose(f);
+        }
+    }
+    {
+        unsigned t0 = qpc_us();
+        hr = D3DCompile(src, n, name, defs, inc, entry, target, f1, f2, code, err);
+        st_sh_us += qpc_us() - t0; st_sh_n++; s_sh_total++;
+    }
+    if (dir && SUCCEEDED(hr) && *code) {
+        char tmp[420];
+        ShaderCacheHdr h;
+        memset(&h, 0, sizeof h);
+        memcpy(h.magic, "RBXS", 4); h.version = 1; h.key = key;
+        h.size = (uint32_t)ID3D10Blob_GetBufferSize(*code);
+        snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, (unsigned long)GetCurrentProcessId());
+        if ((f = fopen(tmp, "wb")) != NULL) {
+            int ok = fwrite(&h, sizeof h, 1, f) == 1 &&
+                     fwrite(ID3D10Blob_GetBufferPointer(*code), 1, h.size, f) == h.size;
+            ok = (fclose(f) == 0) && ok;
+            if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) DeleteFileA(tmp);
+        }
+    }
+    return hr;
+}
+
 static int gb_init(void)
 {
     D3D_FEATURE_LEVEL fl;
@@ -221,9 +318,9 @@ static int gb_init(void)
             s_msaa_mask |= 1u << i;
     }
     rbx_settings_msaa_supported(s_msaa_mask);
-    hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "gb", NULL, NULL, "vs", "vs_4_0", 0, 0, &vsb, &err);
+    hr = rbx_compile(s_hlsl, sizeof s_hlsl - 1, "gb", NULL, NULL, "vs", "vs_4_0", 0, 0, &vsb, &err);
     if (FAILED(hr)) { fprintf(stderr, "[RBX DX11] vs: %s\n", err ? (char *)ID3D10Blob_GetBufferPointer(err) : "?"); return 0; }
-    hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "gb", NULL, NULL, "ps", "ps_4_0", 0, 0, &psb, &err);
+    hr = rbx_compile(s_hlsl, sizeof s_hlsl - 1, "gb", NULL, NULL, "ps", "ps_4_0", 0, 0, &psb, &err);
     if (FAILED(hr)) { fprintf(stderr, "[RBX DX11] ps: %s\n", err ? (char *)ID3D10Blob_GetBufferPointer(err) : "?"); return 0; }
     ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(vsb), ID3D10Blob_GetBufferSize(vsb), NULL, &s_vs);
     ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(psb), ID3D10Blob_GetBufferSize(psb), NULL, &s_ps);
@@ -251,8 +348,8 @@ static int gb_init(void)
     ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_white, NULL, &s_white_srv);
     SAFE_REL(vsb); SAFE_REL(psb);
     if (!s_vs || !s_ps || !s_il || !s_vb || !s_cb || !s_rs || !s_white_srv) return 0;
-    if (SUCCEEDED(D3DCompile(s_bl_hlsl, sizeof s_bl_hlsl - 1, "bl", NULL, NULL, "vs", "vs_4_0", 0, 0, &vsb, &err))
-        && SUCCEEDED(D3DCompile(s_bl_hlsl, sizeof s_bl_hlsl - 1, "bl", NULL, NULL, "ps", "ps_4_0", 0, 0, &psb, &err))) {
+    if (SUCCEEDED(rbx_compile(s_bl_hlsl, sizeof s_bl_hlsl - 1, "bl", NULL, NULL, "vs", "vs_4_0", 0, 0, &vsb, &err))
+        && SUCCEEDED(rbx_compile(s_bl_hlsl, sizeof s_bl_hlsl - 1, "bl", NULL, NULL, "ps", "ps_4_0", 0, 0, &psb, &err))) {
         D3D11_SAMPLER_DESC sm;
         ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(vsb), ID3D10Blob_GetBufferSize(vsb), NULL, &s_bl_vs);
         ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(psb), ID3D10Blob_GetBufferSize(psb), NULL, &s_bl_ps);
@@ -314,7 +411,7 @@ static int initialize_combiners(void)
     HRESULT hr;
     unsigned vi;
     if (s_rc_vs) return 1;
-    hr = D3DCompile(k_hlsl_rc, sizeof(k_hlsl_rc) - 1, "rbx_rc", NULL, NULL, "vs_rc", "vs_5_0",
+    hr = rbx_compile(k_hlsl_rc, sizeof(k_hlsl_rc) - 1, "rbx_rc", NULL, NULL, "vs_rc", "vs_5_0",
                     D3DCOMPILE_ENABLE_STRICTNESS, 0, &v, &err);
     if (FAILED(hr)) {
         fprintf(stderr, "[RBX DX11] rc vs: %s\n", err ? (char *)ID3D10Blob_GetBufferPointer(err) : "?");
@@ -384,12 +481,8 @@ static ID3D11PixelShader *combiner_shader(const Nv2aCombiner *c)
     if (!source) return NULL;
     memcpy(source, prefix, used);
     memcpy(source + used, k_hlsl_rc, sizeof k_hlsl_rc);
-    {
-        unsigned sh0 = qpc_us();
-        hr = D3DCompile(source, used + sizeof(k_hlsl_rc) - 1, "rbx_rc", NULL, NULL, "ps_rc", "ps_5_0",
-                        D3DCOMPILE_ENABLE_STRICTNESS, 0, &blob, &err);
-        st_sh_us += qpc_us() - sh0; st_sh_n++; s_sh_total++;
-    }
+    hr = rbx_compile(source, used + sizeof(k_hlsl_rc) - 1, "rbx_rc", NULL, NULL, "ps_rc", "ps_5_0",
+                     D3DCOMPILE_ENABLE_STRICTNESS, 0, &blob, &err);
     free(source);
     if (FAILED(hr)) {
         fprintf(stderr, "[RBX DX11] rc ps: %s\n", err ? (char *)ID3D10Blob_GetBufferPointer(err) : "?");
@@ -2269,15 +2362,15 @@ static void gb_flip_impl(void)
             unsigned long long qf = gb_qf();
             unsigned win_ms = (unsigned)(now - last);
             fprintf(stderr, "[RBXPERF] ms=%u flips=%u pub=%u ft_avg_us=%u ft_max_us=%u hitch33=%u hitch50=%u hitch100=%u "
-                            "rb_n=%u rb_us=%u sh_n=%u sh_us=%u sh_total=%u catchup=%ld fence_early=%ld fence_timeout=%ld "
+                            "rb_n=%u rb_us=%u sh_n=%u sh_us=%u sh_total=%u sh_hits=%u catchup=%ld fence_early=%ld fence_timeout=%ld "
                             "mmio_traps=%ld apu_lock_waits=%u apu_lock_timeouts=%u fence_wait_us=%ld pb_drops=%u pb_midwalk_get=%u\n",
                     win_ms, st_flips, st_pub,
                     st_ft_n ? (unsigned)(st_ft_sum * 1000000ULL / qf / st_ft_n) : 0u, (unsigned)(st_ft_max * 1000000ULL / qf),
-                    st_hitch33, st_hitch50, st_hitch100, st_rb_n, st_rb_us, st_sh_n, st_sh_us, s_sh_total,
+                    st_hitch33, st_hitch50, st_hitch100, st_rb_n, st_rb_us, st_sh_n, st_sh_us, s_sh_total, st_sh_hits,
                     (long)(fc - l_fc), (long)(fs - l_fs), (long)(ft - l_ft), (long)(mm - l_mm), lw - l_lw, lt - l_lt,
                     (long)(fw - l_fw), pd - l_pd, pm - l_pm);
             l_fc = fc; l_fs = fs; l_ft = ft; l_mm = mm; l_lw = lw; l_lt = lt; l_fw = fw; l_pd = pd; l_pm = pm;
-            st_rb_us = st_rb_n = st_sh_us = st_sh_n = st_pub = 0;
+            st_rb_us = st_rb_n = st_sh_us = st_sh_n = st_sh_hits = st_pub = 0;
             st_ft_sum = st_ft_max = 0; st_ft_n = st_hitch33 = st_hitch50 = st_hitch100 = 0;
         }
         g_pb_scan_ticks = 0; g_pb_scan_segs = 0;

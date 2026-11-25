@@ -75,6 +75,7 @@ analysis/vsh*/
 xbox_kernel.log
 *.log
 /SaveData/
+/shader_cache/
 /settings.ini
 /texture_pack/
 
