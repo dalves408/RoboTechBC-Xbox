@@ -23,6 +23,8 @@ METRICS = [
     ("mmio_traps_per_s", -1), ("apu_lock_waits", -1), ("apu_lock_timeouts", -1),
     ("shader_cache_hits", +1), ("fence_rewait_ms_per_s", -1), ("pb_dropped_walks", -1),
     ("pb_midwalk_get_moves", -1),
+    ("rt_created", -1), ("rt_evicted", -1), ("rt_alias_created", -1),
+    ("flips_without_gpu_target", -1), ("flips_with_several_targets", -1),
 ]
 
 

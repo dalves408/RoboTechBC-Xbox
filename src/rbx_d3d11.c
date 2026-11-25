@@ -48,6 +48,8 @@ static unsigned rbx_apu_lock_wait_timeouts(void) { return 0; }
 static unsigned st_rb_us, st_rb_n;            /* readback: time writing staging copies into guest memory, and count */
 static unsigned st_sh_us, st_sh_n, s_sh_total; /* combiner pixel shaders compiled (time, count, since boot) */
 static unsigned st_pub;                       /* frames handed to the window */
+static unsigned st_rt_new, st_rt_evict, st_rt_alias; /* render targets created, evicted (LRU, MAX_RT), created for a VA that already had one */
+static unsigned st_pub_nort, st_pub_multi;   /* flips whose surface had no GPU target (window fell back to guest memory) / several */
 static unsigned long long st_ft_sum, st_ft_max, s_ft_last; /* guest flip-to-flip time, QPC ticks */
 static unsigned st_ft_n, st_hitch33, st_hitch50, st_hitch100;  /* flip gaps over 33 / 50 / 100 ms */
 
@@ -597,6 +599,9 @@ static void rt_seed_from_guest(Rt *rt, const Nv2aSurface *s)
     free(px);
 }
 
+static void readback_finish(Rt *rt);
+static uint32_t s_evicted[8]; static int s_evicted_n;   /* VAs of recently evicted targets */
+
 static Rt *get_rt(const Nv2aSurface *s)
 {
     int i, free_i = -1, lru = 0;
@@ -614,7 +619,13 @@ static Rt *get_rt(const Nv2aSurface *s)
     }
     if (free_i < 0) {
         free_i = lru;
+        /* Write its last queued copy to guest memory first: dropping it left guest memory a frame stale, and a
+         * target re-created from it (or the window's guest-memory fallback) then showed an older frame. */
+        if (s_rt[free_i].pend) readback_finish(&s_rt[free_i]);
+        if (s_evicted_n < 8) s_evicted[s_evicted_n++] = s_rt[free_i].va;
+        else { memmove(s_evicted, s_evicted + 1, 7 * sizeof s_evicted[0]); s_evicted[7] = s_rt[free_i].va; }
         rt_release(&s_rt[free_i]);
+        st_rt_evict++;
     }
     s_rt[free_i].pend = 0; s_rt[free_i].pstage = NULL;
     memset(&td, 0, sizeof td);
@@ -651,7 +662,34 @@ static Rt *get_rt(const Nv2aSurface *s)
     s_rt[free_i].pitch = s->pitch; s_rt[free_i].bpp = s->bytes_per_pixel; s_rt[free_i].used = s_tick; s_rt[free_i].dirty = 0;
     s_rt[free_i].aa_sx = s->aa_sx ? s->aa_sx : 1; s_rt[free_i].aa_sy = s->aa_sy ? s->aa_sy : 1;
     s_rt[free_i].shown_dirty = 0;
-    if (s_resets) rt_seed_from_guest(&s_rt[free_i], s);
+    st_rt_new++;
+    {
+        /* A new target must not start black when the game already has an image there (menus and loading screens
+         * change the clip on the same buffer, which is a new target here; a target evicted from the 8 slots comes
+         * back). Black for one frame is a flash. RECOMP_GPU_RTSEED=0 = old behaviour (seed only after a reset). */
+        static int seed = -1;
+        int j, alias = -1, was_evicted = 0;
+        if (seed < 0) { const char *e = getenv("RECOMP_GPU_RTSEED"); seed = !(e && e[0] == '0'); }
+        for (j = 0; j < MAX_RT; j++)
+            if (j != free_i && s_rt[j].tex && s_rt[j].va == s->color_va && s_rt[j].bpp == s->bytes_per_pixel &&
+                (alias < 0 || s_rt[j].used > s_rt[alias].used))
+                alias = j;
+        for (j = 0; j < s_evicted_n; j++)
+            if (s_evicted[j] == s->color_va) was_evicted = 1;
+        if (alias >= 0) st_rt_alias++;
+        if (s_resets) rt_seed_from_guest(&s_rt[free_i], s);
+        else if (seed && alias >= 0 && !s_rt[free_i].msaa) {
+            /* Same pixels, 1:1, over the overlap (both are at the current render scale). */
+            D3D11_BOX box;
+            rt_resolve(&s_rt[alias]);
+            box.left = box.top = box.front = 0; box.back = 1;
+            box.right = (s_rt[alias].w < w ? s_rt[alias].w : w) * (uint32_t)s_scale;
+            box.bottom = (s_rt[alias].h < h ? s_rt[alias].h : h) * (uint32_t)s_scale;
+            ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)s_rt[free_i].tex, 0, 0, 0, 0,
+                                                      (ID3D11Resource *)s_rt[alias].tex, 0, &box);
+        } else if (seed && (alias >= 0 || was_evicted))
+            rt_seed_from_guest(&s_rt[free_i], s);
+    }
     if (s_verbose || getenv("RECOMP_GPU_LOGRT"))
         fprintf(stderr, "[RBX DX11] render target va=%08X %ux%u bpp=%u pitch=%u aa=%ux%u\n", s->color_va, w, h,
                 s->bytes_per_pixel, s->pitch, s->aa_sx, s->aa_sy);
@@ -2211,9 +2249,21 @@ static void publish_frame(void)
     int i;
     Rt *rt = NULL;
     if (s_share_failed) return;
-    for (i = 0; i < MAX_RT; i++)
-        if (s_rt[i].tex && s_rt[i].va == va) { rt = &s_rt[i]; break; }
-    if (!rt) { if (s_share_on) { gpu_present_set_source(NULL, 0, 0); s_share_on = 0; } return; }
+    {   /* Several targets can share the flip VA (the game changed the clip on that buffer). Showing whichever came
+         * first in the table made the window alternate between them. Show the biggest; among equals, the one
+         * drawn most recently. RECOMP_GPU_PUBFIRST=1 = old behaviour. */
+        static int first = -1; int n = 0;
+        if (first < 0) first = getenv("RECOMP_GPU_PUBFIRST") != NULL;
+        for (i = 0; i < MAX_RT; i++) {
+            Rt *c = &s_rt[i];
+            if (!c->tex || c->va != va) continue;
+            n++;
+            if (!rt) { rt = c; if (first) break; continue; }
+            if (c->w * c->h > rt->w * rt->h || (c->w * c->h == rt->w * rt->h && c->used > rt->used)) rt = c;
+        }
+        if (n > 1) st_pub_multi++;
+    }
+    if (!rt) { st_pub_nort++; if (s_share_on) { gpu_present_set_source(NULL, 0, 0); s_share_on = 0; } return; }
     if (!rt->shown_dirty && s_share_on) return;
     if (s_fps_limit != last_limit) { next_frame = 0; last_limit = s_fps_limit; }
     if (s_fps_limit) {
@@ -2363,14 +2413,17 @@ static void gb_flip_impl(void)
             unsigned win_ms = (unsigned)(now - last);
             fprintf(stderr, "[RBXPERF] ms=%u flips=%u pub=%u ft_avg_us=%u ft_max_us=%u hitch33=%u hitch50=%u hitch100=%u "
                             "rb_n=%u rb_us=%u sh_n=%u sh_us=%u sh_total=%u sh_hits=%u catchup=%ld fence_early=%ld fence_timeout=%ld "
-                            "mmio_traps=%ld apu_lock_waits=%u apu_lock_timeouts=%u fence_wait_us=%ld pb_drops=%u pb_midwalk_get=%u\n",
+                            "mmio_traps=%ld apu_lock_waits=%u apu_lock_timeouts=%u fence_wait_us=%ld pb_drops=%u pb_midwalk_get=%u "
+                            "rt_new=%u rt_evict=%u rt_alias=%u pub_nort=%u pub_multi=%u\n",
                     win_ms, st_flips, st_pub,
                     st_ft_n ? (unsigned)(st_ft_sum * 1000000ULL / qf / st_ft_n) : 0u, (unsigned)(st_ft_max * 1000000ULL / qf),
                     st_hitch33, st_hitch50, st_hitch100, st_rb_n, st_rb_us, st_sh_n, st_sh_us, s_sh_total, st_sh_hits,
                     (long)(fc - l_fc), (long)(fs - l_fs), (long)(ft - l_ft), (long)(mm - l_mm), lw - l_lw, lt - l_lt,
-                    (long)(fw - l_fw), pd - l_pd, pm - l_pm);
+                    (long)(fw - l_fw), pd - l_pd, pm - l_pm,
+                    st_rt_new, st_rt_evict, st_rt_alias, st_pub_nort, st_pub_multi);
             l_fc = fc; l_fs = fs; l_ft = ft; l_mm = mm; l_lw = lw; l_lt = lt; l_fw = fw; l_pd = pd; l_pm = pm;
             st_rb_us = st_rb_n = st_sh_us = st_sh_n = st_sh_hits = st_pub = 0;
+            st_rt_new = st_rt_evict = st_rt_alias = st_pub_nort = st_pub_multi = 0;
             st_ft_sum = st_ft_max = 0; st_ft_n = st_hitch33 = st_hitch50 = st_hitch100 = 0;
         }
         g_pb_scan_ticks = 0; g_pb_scan_segs = 0;
