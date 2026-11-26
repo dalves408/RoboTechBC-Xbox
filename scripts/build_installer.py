@@ -4,7 +4,10 @@ build_installer.py).
     python scripts/build_installer.py --version 1.0.0 [--skip-build] [--iscc <ISCC.exe>]
     python scripts/build_installer.py --images-only        (only redraw the wizard pictures and the icon)
 
-Output in installer/Output: RobotechBC-Recomp-Setup-<version>.exe and its .sha256. Setup holds the programs only:
+Output in installer/Output, each with a .sha256 (the names follow RecompLauncher's release standard):
+  RobotechBC-Recomp-v<version>-Windows-x64.zip        the game folder, recomplauncher.json on top (RecompLauncher's pick)
+  RobotechBC-Recomp-v<version>-Windows-x64-Setup.exe  the same programs with the disc import wizard
+Neither holds game data:
 the player's own disc image supplies the game files (installer/rbx_import.c, checked against installer/manifest.h).
 The programs' .pdb files (RelWithDebInfo) are kept in out/symbols/<version> for reading crash dumps and never shipped.
 
@@ -13,6 +16,8 @@ or newer, Python with Pillow, and installer/manifest.h (python installer/gen_man
 """
 import argparse
 import hashlib
+import json
+import zipfile
 import os
 import re
 import shutil
@@ -278,6 +283,25 @@ def write_sha256(path):
     return digest
 
 
+# The release folder, as Setup installs it (installer/robotech.iss [Files]); rbx_import.exe is Setup's alone.
+RELEASE_FILES = ('robotech_bc_recomp.exe', 'Config.exe', 'SDL3.dll', 'SDL3-LICENSE.txt', 'vcruntime140.dll')
+
+
+def release_zip(version):
+    """RecompLauncher installs from this zip: the programs, the readme and recomplauncher.json at the top."""
+    json.loads((ROOT / 'recomplauncher.json').read_text(encoding='utf-8'))   # a file the launcher can't read is skipped
+    out = OUTPUT / f'RobotechBC-Recomp-v{version}-Windows-x64.zip'
+    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        for name in RELEASE_FILES:
+            if (BUILD / name).is_file():
+                z.write(BUILD / name, name)
+            elif name != 'SDL3-LICENSE.txt':
+                sys.exit(f'{BUILD / name} is missing')
+        z.write(INSTALLER / 'README.txt', 'README.txt')
+        z.write(ROOT / 'recomplauncher.json', 'recomplauncher.json')
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--version')
@@ -314,8 +338,10 @@ def main():
     wizard_images()
     OUTPUT.mkdir(exist_ok=True)
     run(iscc, f'/DAppVersion={args.version}', f'/DBuildDir={BUILD}', INSTALLER / 'robotech.iss')
-    setup = OUTPUT / f'RobotechBC-Recomp-Setup-{args.version}.exe'
+    setup = OUTPUT / f'RobotechBC-Recomp-v{args.version}-Windows-x64-Setup.exe'
     print(f'Setup: {setup}\nSHA-256: {write_sha256(setup)}')
+    package = release_zip(args.version)
+    print(f'Zip: {package}\nSHA-256: {write_sha256(package)}')
 
 
 if __name__ == '__main__':

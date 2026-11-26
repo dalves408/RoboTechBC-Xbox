@@ -1,0 +1,152 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "Robotech: Battlecry Recomp",
+  "repo": "dalves408/RoboTechBC-Xbox",
+  "inputs": [
+    {
+      "id": "game",
+      "role": "game",
+      "label": "Your copy of Robotech: Battlecry for the original Xbox (USA): its disc image (.iso, a full Redump image or an XISO), or a folder of the disc's files with default.xbe.",
+      "formats": [{ "type": "file", "extensions": ["iso", "xiso"] }, { "type": "folder" }],
+      "check": { "file": "default.xbe", "xdvdfs": "default.xbe" }
+    }
+  ],
+  "start": { "program": ["robotech_bc_recomp.exe"] },
+  "prepare": {
+    "program": ["robotech_bc_recomp.exe"],
+    "args": ["--prepare", "--game={input:game}"],
+    "label": "Game files from your disc, each one checked",
+    "done": ["{install}/game_files/.rbx-imported"],
+    "keeps_copy": true
+  },
+  "system": {
+    "windows": { "version": "10", "graphics": { "d3d11": "11_0" } }
+  },
+  "saves": ["{install}/SaveData"],
+  "folders": {
+    "game": [{ "path": "{install}/game_files" }],
+    "saves": [{ "path": "{install}/SaveData" }],
+    "logs": [{ "path": "{install}/logs" }],
+    "screenshots": [{ "path": "{install}/screenshots" }],
+    "textures": [{ "path": "{install}/texture_pack" }]
+  },
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [{ "path": "{install}/settings.ini" }]
+    }
+  ],
+  "groups": [
+    { "id": "Display" },
+    { "id": "Graphics" }
+  ],
+  "settings": [
+    {
+      "id": "scale", "label": "Render scale", "group": "Display",
+      "help": "What the game draws at. 1x is the console's own 640 x 480; higher is sharper and costs more GPU time.",
+      "choices": [
+        { "label": "1x (640 x 480)", "set": { "video/scale": "0" } },
+        { "label": "2x (1280 x 960)", "set": { "video/scale": "1" } },
+        { "label": "3x (1920 x 1440)", "set": { "video/scale": "2" } },
+        { "label": "4x (2560 x 1920)", "set": { "video/scale": "3" } },
+        { "label": "5x (3200 x 2400)", "set": { "video/scale": "4" } }
+      ],
+      "defaults": { "video/scale": "0" }
+    },
+    {
+      "id": "fullscreen", "label": "Fullscreen", "group": "Display",
+      "help": "Borderless fullscreen on the current monitor. F11 or Alt+Enter also switches in the game.",
+      "choices": [
+        { "label": "Off", "set": { "video/fullscreen": "0" } },
+        { "label": "On", "set": { "video/fullscreen": "1" } }
+      ],
+      "defaults": { "video/fullscreen": "0" }
+    },
+    {
+      "id": "stretch", "label": "Stretch image", "group": "Display",
+      "help": "Off keeps the picture's shape with bars; On fills the whole window.",
+      "choices": [
+        { "label": "Off (keep shape)", "set": { "video/stretch": "0" } },
+        { "label": "On (fill window)", "set": { "video/stretch": "1" } }
+      ],
+      "defaults": { "video/stretch": "0" }
+    },
+    {
+      "id": "widescreen", "label": "Widescreen", "group": "Display",
+      "help": "Shows more of the battlefield left and right. The HUD and menus stay 4:3.",
+      "choices": [
+        { "label": "Off (4:3)", "set": { "video/widescreen": "0" } },
+        { "label": "Auto (match window)", "set": { "video/widescreen": "1" } },
+        { "label": "16:9", "set": { "video/widescreen": "2" } },
+        { "label": "16:10", "set": { "video/widescreen": "3" } },
+        { "label": "21:9", "set": { "video/widescreen": "4" } }
+      ],
+      "defaults": { "video/widescreen": "1" }
+    },
+    {
+      "id": "vsync", "label": "VSync", "group": "Graphics",
+      "help": "Waits for the monitor's refresh: no tearing, slightly more input delay.",
+      "choices": [
+        { "label": "Off", "set": { "video/vsync": "0" } },
+        { "label": "On", "set": { "video/vsync": "1" } }
+      ],
+      "defaults": { "video/vsync": "0" }
+    },
+    {
+      "id": "rate", "label": "FPS limit", "group": "Graphics",
+      "help": "Caps how often frames are shown. The game's own clock is unchanged, so gameplay speed stays as on the console.",
+      "choices": [
+        { "label": "30 FPS", "set": { "video/rate": "0" } },
+        { "label": "60 FPS", "set": { "video/rate": "1" } },
+        { "label": "120 FPS", "set": { "video/rate": "2" } },
+        { "label": "144 FPS", "set": { "video/rate": "3" } },
+        { "label": "240 FPS", "set": { "video/rate": "4" } },
+        { "label": "360 FPS", "set": { "video/rate": "5" } },
+        { "label": "Uncapped", "set": { "video/rate": "6" } }
+      ],
+      "defaults": { "video/rate": "6" }
+    },
+    {
+      "id": "msaa", "label": "Anti-aliasing", "group": "Graphics",
+      "help": "Smooths jagged edges. Levels your graphics card can't do are skipped.",
+      "choices": [
+        { "label": "Off", "set": { "video/msaa": "0" } },
+        { "label": "2x MSAA", "set": { "video/msaa": "1" } },
+        { "label": "4x MSAA", "set": { "video/msaa": "2" } },
+        { "label": "8x MSAA", "set": { "video/msaa": "3" } }
+      ],
+      "defaults": { "video/msaa": "0" }
+    },
+    {
+      "id": "anisotropy", "label": "Anisotropic filtering", "group": "Graphics",
+      "help": "Keeps ground and walls sharp at steep angles. Cheap on modern graphics cards.",
+      "choices": [
+        { "label": "Off", "set": { "video/anisotropy": "0" } },
+        { "label": "2x", "set": { "video/anisotropy": "1" } },
+        { "label": "4x", "set": { "video/anisotropy": "2" } },
+        { "label": "8x", "set": { "video/anisotropy": "3" } },
+        { "label": "16x", "set": { "video/anisotropy": "4" } }
+      ],
+      "defaults": { "video/anisotropy": "0" }
+    },
+    {
+      "id": "hires", "label": "Hi-res textures", "group": "Graphics",
+      "help": "Uses the replacement textures in the texture_pack folder when they're installed.",
+      "choices": [
+        { "label": "Off", "set": { "video/hires": "0" } },
+        { "label": "On", "set": { "video/hires": "1" } }
+      ],
+      "defaults": { "video/hires": "1" }
+    }
+  ],
+  "actions": [
+    { "id": "saves", "label": "Saves", "help": "Your profile and campaign saves.", "open": "saves" },
+    { "id": "logs", "label": "Logs", "help": "A log of each of the last 20 runs, for bug reports.", "open": "logs" },
+    { "id": "screenshots", "label": "Screenshots", "help": "Screenshots taken in the game.", "open": "screenshots" }
+  ],
+  "exit_codes": {
+    "1": "The game couldn't start: its game files are missing, or its folder can't be written to. Press Set Up Again on the game's page and pick your Robotech: Battlecry disc image."
+  }
+}

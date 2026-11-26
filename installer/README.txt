@@ -6,6 +6,9 @@ PLAY
   "Robotech: Battlecry Recomp Settings" (Config.exe) changes the video settings and
   controls outside the game; F1 in the game opens the same settings.
   Intros can be skipped with Enter / Space once the pad is live.
+  From the release zip instead of Setup: RecompLauncher sets the game up from your
+  disc image by itself. By hand, run once in this folder:
+    robotech_bc_recomp.exe --prepare --game="<your disc image, drive or folder>"
 
 REQUIREMENTS
   - Windows 10/11 x64 and a DirectX 11 GPU.

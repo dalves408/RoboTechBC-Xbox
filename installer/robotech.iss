@@ -2,7 +2,7 @@
 ; halo2.iss.
 ; Built by:
 ;   python scripts/build_installer.py --version <version> (it runs the steps below)
-; Output: installer\Output\RobotechBC-Recomp-Setup-<version>.exe
+; Output: installer\Output\RobotechBC-Recomp-v<version>-Windows-x64-Setup.exe
 ; The install is portable: the game, its game files (game_files) and its data (SaveData, settings.ini, shader_cache,
 ; logs, crashes, screenshots) are all in the install folder. There is no uninstaller, no Programs and Features entry
 ; and nothing in the registry; deleting the folder (and the shortcuts) removes the game. If the folder chosen on the
@@ -48,7 +48,7 @@ WizardBackImageFile=wizard_back.png
 WizardImageFile=wizard_image.png
 WizardSmallImageFile=wizard_small_55.png,wizard_small_64.png,wizard_small_80.png,wizard_small_96.png,wizard_small_128.png
 DefaultDialogFontName=Bahnschrift
-OutputBaseFilename=RobotechBC-Recomp-Setup-{#AppVersion}
+OutputBaseFilename=RobotechBC-Recomp-v{#AppVersion}-Windows-x64-Setup
 Compression=lzma2/max
 SolidCompression=yes
 ExtraDiskSpaceRequired=4700000000
@@ -67,6 +67,8 @@ Source: "{#BuildDir}\SDL3-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion s
 ; the Visual C++ runtime the game links against (an app-local copy, as the test releases had; build_installer.py puts it beside the programs)
 Source: "{#BuildDir}\vcruntime140.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README.txt"; DestDir: "{app}"; Flags: ignoreversion isreadme
+; RecompLauncher reads it from the game folder (Bring Your Recomps): how to set up and start the game
+Source: "..\recomplauncher.json"; DestDir: "{app}"; Flags: ignoreversion
 ; the import tool only runs during setup; it is not installed
 Source: "{#BuildDir}\rbx_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
 
