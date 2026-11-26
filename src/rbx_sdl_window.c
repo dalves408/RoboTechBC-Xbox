@@ -83,6 +83,10 @@ int rbx_sdl_window_tick(HWND hwnd, int (*handle_key)(unsigned, long, int),
         if (props) {
             SDL_SetPointerProperty(props, SDL_PROP_WINDOW_CREATE_WIN32_HWND_POINTER, hwnd);
             SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, true);
+            /* The window can be resized (it is WS_OVERLAPPEDWINDOW). Without this SDL treats it as fixed-size and,
+             * on WM_WINDOWPOSCHANGING, holds it at the last size it saw: after fullscreen, the monitor's, so
+             * leaving fullscreen gave a screen-sized window with its title bar off the top. */
+            SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
             input_window = SDL_CreateWindowWithProperties(props);
             SDL_DestroyProperties(props);
         }
