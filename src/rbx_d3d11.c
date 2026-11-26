@@ -2369,7 +2369,7 @@ static int gvs_flat_full(const Nv2aSurface *s, const Nv2aBatch *b, const RbxGvs 
 #define IP_LIVE_TICKS_3D 240         /* ...a 3D one (it changed on a flip too few 3D draws changed to be a tick) */
 typedef struct { uint64_t key, ch; int next, prev_i, a_i; uint8_t tick_src, live, pending, changed; uint32_t voff, vn, used; RbxGvsConst k; } IpDraw;
 typedef struct {
-    IpDraw d[IP_MAXD]; unsigned n, matched;
+    IpDraw d[IP_MAXD]; unsigned n, matched, matched_t;
     unsigned nt, nt_changed;              /* 3D draws this flip, and how many changed from the last flip */
     float v[IP_MAXV * 4]; uint32_t vused;
     uint64_t hkey[IP_HT]; int head[IP_HT], tail[IP_HT]; unsigned cnt[IP_HT], hgen[IP_HT], gen;
@@ -2510,7 +2510,7 @@ static int ip_on(void)
     }
     return s_ip;
 }
-static void ip_list_reset(IpList *l) { l->nt = l->nt_changed = 0; l->n = 0; l->matched = 0; l->vused = 0; l->gen++; if (!l->gen) { memset(l->hgen, 0, sizeof l->hgen); l->gen = 1; } }
+static void ip_list_reset(IpList *l) { l->nt = l->nt_changed = 0; l->n = 0; l->matched = l->matched_t = 0; l->vused = 0; l->gen++; if (!l->gen) { memset(l->hgen, 0, sizeof l->hgen); l->gen = 1; } }
 static unsigned ip_slot(IpList *l, uint64_t key, int add)
 {
     unsigned i = (unsigned)(key ^ (key >> 29)) & (IP_HT - 1), probes;
@@ -2682,7 +2682,7 @@ static const IpDraw *ip_record(uint64_t key, uint64_t ch, const RbxGvsConst *k, 
             m = &s_ip_synth; st_ip_cam++;
         }
         if (j < IP_MAXD) C->d[j].a_i = m && m != &s_ip_synth ? (int)(m - s_ipA->d) : -1;
-        if (m) C->matched++; else st_ip_nomatch++;
+        if (m) { C->matched++; if (tick_src) C->matched_t++; } else st_ip_nomatch++;
     }
     return m;
 }
@@ -2707,7 +2707,9 @@ static void ip_flip(void)
             IpDraw *d = &s_ipC->d[i];
             if (d->pending) { d->live = d->prev_i >= 0 && s_ipA->d[d->prev_i].live ? s_ipA->d[d->prev_i].live - 1 : 0; d->pending = 0; }
         }
-        if (s_ipC->n >= 8 && s_ipC->matched * 2 < s_ipC->n) { s_ip_valid = 0; st_ip_cut++; s_ip_D_ok[1] = s_ip_D_ok[2] = 0; }
+        /* A scene change is judged on the 3D draws: the HUD's screen-space draws come and go (text, gauges) and would
+         * otherwise count as a change on every tick. */
+        if (s_ipC->nt >= 8 && s_ipC->matched_t * 2 < s_ipC->nt) { s_ip_valid = 0; st_ip_cut++; s_ip_D_ok[1] = s_ip_D_ok[2] = 0; }
         else ip_estimate_camera();
     }
     t = s_ipB; s_ipB = s_ipC; s_ipC = t;
@@ -2782,8 +2784,21 @@ static int ip_screen_rigid(const float *pos, uint32_t pstride, const float *cur,
         if (c[1] < miny) miny = c[1];
         if (c[1] > maxy) maxy = c[1];
     }
-    tol = 1.5f + 0.04f * ((maxx - minx) > (maxy - miny) ? (maxx - minx) : (maxy - miny));
-    if (fabsf(dx0) + fabsf(dy0) < 0.25f) return 0;   /* did not move: nothing to blend */
+    /* The target marker is drawn in pieces (arcs, ticks, the lock reticle) that also turn and pulse as they follow
+     * the target, so a piece moves as one piece only loosely: allow each vertex a third of the piece's size off the
+     * common move. Under the old 4% only some pieces were blended and the rest stepped at 30 Hz, so the marker's
+     * pieces drifted apart and back every tick. Text and gauges that change shape by more stay as drawn. */
+    tol = 1.5f + 0.35f * ((maxx - minx) > (maxy - miny) ? (maxx - minx) : (maxy - miny));
+    {
+        float moved = 0.0f;
+        for (i = 0; i < nv && moved < 0.25f; i++) {
+            const float *a = (const float *)((const uint8_t *)pos + (size_t)i * pstride);
+            const float *c = (const float *)((const uint8_t *)cur + (size_t)i * cstride);
+            float d = fabsf(c[0] - a[0]) + fabsf(c[1] - a[1]);
+            if (d > moved) moved = d;
+        }
+        if (moved < 0.25f) return 0;   /* no vertex moved (a turning piece can keep its first one): nothing to blend */
+    }
     for (i = 1; i < nv; i++) {
         const float *a = (const float *)((const uint8_t *)pos + (size_t)i * pstride);
         const float *c = (const float *)((const uint8_t *)cur + (size_t)i * cstride);
