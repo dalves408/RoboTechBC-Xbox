@@ -236,8 +236,11 @@ def wizard_images():
 
 
 def make_icon():
-    """res/robotech.ico for the game, Config.exe and Setup."""
+    """res/robotech.ico for the game, Config.exe and Setup. The committed icon (the dusk skyline) is kept; the chevron
+    emblem is drawn only when there is none."""
     path = ROOT / 'res' / 'robotech.ico'
+    if path.is_file():
+        return path
     path.parent.mkdir(exist_ok=True)
     big = emblem(256)
     big.save(path, sizes=[(16, 16), (20, 20), (24, 24), (32, 32), (40, 40), (48, 48), (64, 64), (128, 128), (256, 256)])
