@@ -123,6 +123,7 @@ set(GAME_SOURCES
 add_executable(${PROJECT_NAME} WIN32
     ${GAME_SOURCES}
     ${RECOMP_GEN_SOURCES}
+    src/robotech_bc.rc
 )
 if(_RBX_HAVE_APUVP)
     # rbx_d3d11.c reads the pinned voice processor's lock-wait counters.
@@ -194,6 +195,26 @@ target_compile_definitions(rbx_config PRIVATE WIN32_LEAN_AND_MEAN _CRT_SECURE_NO
 set_target_properties(rbx_config PROPERTIES OUTPUT_NAME "Config")
 target_link_libraries(rbx_config PRIVATE user32 gdi32 shell32)
 add_dependencies(${PROJECT_NAME} rbx_config)
+
+# rbx_import.exe: Setup's disc importer (installer/robotech.iss runs it from its temp folder, so the C runtime is
+# linked in). Built once installer/manifest.h exists (python installer/gen_manifest.py <your disc image>).
+# rbx_texture_download.exe: the hi-res texture pack's resumable downloader. Both Setups run it from their temp folder
+# (installer/texture_download_code.iss), so the C runtime is linked in.
+add_executable(rbx_texture_download installer/texture_download.c installer/rbx_tools.rc)
+target_compile_definitions(rbx_texture_download PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(rbx_texture_download PRIVATE winhttp bcrypt shell32)
+set_target_properties(rbx_texture_download PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/installer/manifest.h")
+    add_executable(rbx_import installer/rbx_import.c installer/rbx_tools.rc)
+    target_compile_definitions(rbx_import PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(rbx_import PRIVATE bcrypt shell32)
+    set_target_properties(rbx_import PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    # The same importer is the game's own --prepare step for RecompLauncher (recomplauncher.json).
+    target_sources(${PROJECT_NAME} PRIVATE src/rbx_prepare_import.c)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE RBX_HAVE_IMPORT)
+    target_link_libraries(${PROJECT_NAME} PRIVATE bcrypt shell32)
+endif()
 
 if(MSVC)
     target_link_options(${PROJECT_NAME} PRIVATE /LARGEADDRESSAWARE)

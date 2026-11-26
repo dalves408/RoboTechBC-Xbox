@@ -99,3 +99,6 @@ build_abi/
 # Packaged test releases (contain disc data - never commit)
 dist/
 /crashes/
+
+# Installer output (Setup.exe, .sha256)
+installer/Output/

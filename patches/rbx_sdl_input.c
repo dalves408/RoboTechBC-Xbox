@@ -131,6 +131,69 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
 static CRITICAL_SECTION g_lock;
 static volatile LONG g_state;       /* 0 = not started, 1 = starting, 2 = ready */
 
+/* Pad discovery runs on its own thread (RECOMP_PAD_SCAN_THREAD=0 puts it back
+ * on whichever thread polls the pad). Opening a pad (HIDAPI, Bluetooth) can
+ * take tens of milliseconds and SDL holds its joystick lock meanwhile, so the
+ * game thread must not touch SDL during a scan: while g_scanning is set (only
+ * changed under g_lock) the readers answer from the last state they read, and
+ * a rumble request waits for the scan to end. All under g_lock. */
+static int  g_scan_thread;
+static LONG g_scanning;
+static XBOX_INPUT_STATE g_last[XBOX_MAX_CONTROLLERS];
+static int  g_last_ok[XBOX_MAX_CONTROLLERS], g_last_conn[XBOX_MAX_CONTROLLERS];
+static int  g_rumble_pending[XBOX_MAX_CONTROLLERS];
+static XBOX_VIBRATION g_rumble_val[XBOX_MAX_CONTROLLERS];
+
+/* sdlpad_get with the scan guard; caller holds g_lock. */
+static int pad_read(DWORD port, XBOX_INPUT_STATE *state)
+{
+    if (g_scanning) {
+        if (g_last_ok[port]) *state = g_last[port];
+        return g_last_ok[port];
+    }
+    g_last_ok[port] = sdlpad_get(port, state);
+    if (g_last_ok[port]) g_last[port] = *state;
+    return g_last_ok[port];
+}
+
+/* Rescan inline only when there is no scan thread; caller holds g_lock. */
+static void pad_rescan_inline(int force)
+{
+    if (!g_scan_thread)
+        sdlpad_rescan(force);
+}
+
+static DWORD WINAPI pad_scan_main(LPVOID arg)
+{
+    unsigned logged = 0;
+    (void)arg;
+    for (;;) {
+        Uint64 t0, dt;
+        int s;
+        Sleep(1000);
+        EnterCriticalSection(&g_lock);
+        g_scanning = 1;
+        LeaveCriticalSection(&g_lock);
+        t0 = SDL_GetTicksNS();
+        sdlpad_rescan_now();
+        dt = (SDL_GetTicksNS() - t0) / 1000000;
+        EnterCriticalSection(&g_lock);
+        g_scanning = 0;
+        for (s = 0; s < XBOX_MAX_CONTROLLERS; s++) {
+            g_last_conn[s] = sdlpad_slot_used(s) && SDL_GamepadConnected(sp_pads[s]);
+            if (!g_last_conn[s]) g_last_ok[s] = 0;
+            if (g_rumble_pending[s]) {
+                g_rumble_pending[s] = 0;
+                if (sdlpad_slot_used(s)) sdlpad_rumble((DWORD)s, &g_rumble_val[s]);
+            }
+        }
+        LeaveCriticalSection(&g_lock);
+        if (dt >= 4 && logged++ < 20)
+            fprintf(stderr, "[PAD] rescan took %u ms on the pad thread (the game kept the last pad state)\n", (unsigned)dt);
+    }
+    /* not reached: the loop never ends */
+}
+
 static void ensure_init(void)
 {
     if (g_state == 2)
@@ -141,6 +204,16 @@ static void ensure_init(void)
         sdlpad_init();
         if (sp_log_on() && !sdlpad_any_open())
             fprintf(stderr, "[PAD] SDL started; no gamepad found yet (one plugged in later is picked up)\n");
+        {
+            const char *e = getenv("RECOMP_PAD_SCAN_THREAD");
+            int s;
+            for (s = 0; s < XBOX_MAX_CONTROLLERS; s++)
+                g_last_conn[s] = sdlpad_slot_used(s) && SDL_GamepadConnected(sp_pads[s]);
+            if (!(e && e[0] == '0')) {
+                HANDLE th = CreateThread(NULL, 0, pad_scan_main, NULL, 0, NULL);
+                if (th) { g_scan_thread = 1; CloseHandle(th); }
+            }
+        }
         InterlockedExchange(&g_state, 2);
         return;
     }
@@ -157,7 +230,7 @@ void xbox_InputInit(void)
 static void pads_scan(int force)
 {
     EnterCriticalSection(&g_lock);
-    sdlpad_rescan(force);
+    pad_rescan_inline(force);
     LeaveCriticalSection(&g_lock);
 }
 
@@ -178,8 +251,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         return ERROR_SUCCESS;
     }
     EnterCriticalSection(&g_lock);
-    sdlpad_rescan(0);
-    ok = sdlpad_get(dwPort, pState);
+    pad_rescan_inline(0);
+    ok = pad_read(dwPort, pState);
     LeaveCriticalSection(&g_lock);
 
     if (!ok) {
@@ -230,7 +303,10 @@ int rbx_pad_connected(DWORD port)
     ensure_init();
     pads_scan(0);
     EnterCriticalSection(&g_lock);
-    connected = sdlpad_slot_used((int)port) && SDL_GamepadConnected(sp_pads[port]);
+    if (g_scanning)
+        connected = g_last_conn[port];
+    else
+        connected = g_last_conn[port] = sdlpad_slot_used((int)port) && SDL_GamepadConnected(sp_pads[port]);
     LeaveCriticalSection(&g_lock);
     return connected;
 }
@@ -247,8 +323,8 @@ int rbx_pad_peek(DWORD port, XBOX_INPUT_STATE *state)
     if (port >= XBOX_MAX_CONTROLLERS || !state) return 0;
     ensure_init();
     EnterCriticalSection(&g_lock);
-    sdlpad_rescan(0);
-    ok = sdlpad_get(port, state);
+    pad_rescan_inline(0);
+    ok = pad_read(port, state);
     LeaveCriticalSection(&g_lock);
     if (ok) swap_face_buttons(state);
     return ok;
@@ -263,7 +339,14 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 
     ensure_init();
     EnterCriticalSection(&g_lock);
-    if (sdlpad_slot_used((int)dwPort))
+    if (g_scanning) {
+        /* Applied when the scan ends (the motors keep the last value). */
+        if (g_last_conn[dwPort]) {
+            g_rumble_val[dwPort] = *pVibration;
+            g_rumble_pending[dwPort] = 1;
+            rc = 0;
+        }
+    } else if (sdlpad_slot_used((int)dwPort))
         rc = sdlpad_rumble(dwPort, pVibration);     /* includes the minimum pulse (RECOMP_RUMBLE_MIN_MS) */
     LeaveCriticalSection(&g_lock);
     return rc < 0 ? ERROR_DEVICE_NOT_CONNECTED : ERROR_SUCCESS;

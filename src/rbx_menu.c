@@ -8,6 +8,7 @@
 #define BASE_W 960
 #define BASE_H 640
 #define ROW_H 32
+#define VIDEO_ROW_H 30   /* ten video rows, two section headers and the buttons above the note */
 #define KEY_H 22
 
 const char *const rbx_page_names[RBX_PAGE_COUNT] = { "VIDEO", "CONTROLS" };
@@ -56,10 +57,10 @@ static void video_page(HDC dc, const RbxFonts *f, const RbxMenuState *s, int x0,
             rbx_section(dc, f, &sec, i ? 2 : 1, i ? "GRAPHICS" : "DISPLAY");
             y += rbx_px(f, 32);
         }
-        SetRect(&row, x0, y, x1, y + rbx_px(f, ROW_H - 2));
+        SetRect(&row, x0, y, x1, y + rbx_px(f, VIDEO_ROW_H - 2));
         rbx_option(dc, f, &row, rbx_options[i].label, rbx_options[i].values[s->choice[i]],
                    s->choice[i], rbx_options[i].count, i == s->row, 0, NULL, NULL);
-        y += rbx_px(f, ROW_H);
+        y += rbx_px(f, VIDEO_ROW_H);
     }
     y += rbx_px(f, 10);
     SetRect(&b0, x0, y, (x0 + x1) / 2 - rbx_px(f, 8), y + rbx_px(f, 38));

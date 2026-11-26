@@ -33,6 +33,7 @@
 #include <dbghelp.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <io.h>
 #include <stdbool.h>
 #include <string.h>
 #include <wchar.h>
@@ -350,9 +351,18 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 
         /* Print native stack return addresses for debugging */
         {
+            /* The handler runs on the faulting thread, so clamp the scan to
+             * this thread's stack: a fault near the top of the stack (or a
+             * corrupt Rsp) must not fault again in here and lose the log. */
             uintptr_t *sp = (uintptr_t *)ep->ContextRecord->Rsp;
-            fprintf(stderr, "  Native stack (first 8 return addrs):\n");
-            for (int i = 0; i < 64 && sp[i]; i++) {
+            ULONG_PTR lo = 0, hi = 0;
+            int n = 0;
+            GetCurrentThreadStackLimits(&lo, &hi);
+            if ((uintptr_t)sp >= lo && (uintptr_t)sp < hi && !((uintptr_t)sp & 7))
+                n = (int)(((uintptr_t)hi - (uintptr_t)sp) / sizeof *sp);
+            if (n > 64) n = 64;
+            fprintf(stderr, "  Native stack (return addrs in the first %d slots):\n", n);
+            for (int i = 0; i < n && sp[i]; i++) {
                 if (sp[i] >= 0x140000000ULL && sp[i] < 0x150000000ULL) {
                     fprintf(stderr, "    [%d] 0x%llX\n", i, (unsigned long long)sp[i]);
                 }
@@ -431,6 +441,50 @@ static LONG WINAPI crash_filter(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* Started from a shortcut (Setup's Start menu entry) nothing catches stderr, so
+ * the log goes to logs\run_<date>_<time>.log beside the exe, as Play.bat did.
+ * A launcher or console that already redirects stderr keeps it. The newest 20
+ * logs are kept. RECOMP_LOG_FILE=0 turns this off. */
+static void log_to_file(void)
+{
+    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    const char *e = getenv("RECOMP_LOG_FILE");
+    char path[MAX_PATH];
+    SYSTEMTIME t;
+    if (e && e[0] == '0') return;
+    if (h && h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_UNKNOWN) return;
+    CreateDirectoryA("logs", NULL);
+    {   /* prune: keep the 19 newest, so 20 with this one */
+        WIN32_FIND_DATAA fd;
+        HANDLE f = FindFirstFileA("logs\\run_*.log", &fd);
+        char names[256][64];
+        int n = 0, i, j;
+        if (f != INVALID_HANDLE_VALUE) {
+            do { if (n < 256 && strlen(fd.cFileName) < 64) strcpy(names[n++], fd.cFileName); } while (FindNextFileA(f, &fd));
+            FindClose(f);
+        }
+        for (i = 1; i < n; i++)          /* names sort by time: run_YYYYMMDD_HHMMSS.log */
+            for (j = i; j > 0 && strcmp(names[j - 1], names[j]) > 0; j--) {
+                char tmp[64]; strcpy(tmp, names[j]); strcpy(names[j], names[j - 1]); strcpy(names[j - 1], tmp);
+            }
+        for (i = 0; i + 19 < n; i++) {
+            snprintf(path, sizeof path, "logs\\%s", names[i]);
+            DeleteFileA(path);
+        }
+    }
+    GetLocalTime(&t);
+    snprintf(path, sizeof path, "logs\\run_%04u%02u%02u_%02u%02u%02u.log",
+             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    if (freopen(path, "w", stderr)) {
+        setvbuf(stderr, NULL, _IONBF, 0);
+        SetStdHandle(STD_ERROR_HANDLE, (HANDLE)_get_osfhandle(_fileno(stderr)));
+    }
+}
+
+#ifdef RBX_HAVE_IMPORT
+int rbx_prepare_main(void);   /* src/rbx_prepare_import.c: --prepare, RecompLauncher's setup step */
+#endif
+
 /* ── WinMain ───────────────────────────────────────────────── */
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
@@ -448,8 +502,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
+#ifdef RBX_HAVE_IMPORT
+    {   /* --prepare: RecompLauncher's setup step; the game does not start */
+        int prepared = rbx_prepare_main();
+        if (prepared >= 0) return prepared;
+    }
+#endif
+
     if (!portable_paths()) {
         fprintf(stderr, "Could not initialize portable game paths. Check the installation and save folder paths.\n");
+        return 1;
+    }
+    log_to_file();
+    if (GetFileAttributesA(YOUR_GAME_XBE_PATH) == INVALID_FILE_ATTRIBUTES) {
+        fprintf(stderr, "game_files\\default.xbe is missing beside the exe.\n");
+        MessageBoxA(NULL, "The game files are missing (game_files\\default.xbe).\n\n"
+                    "Run Setup again with this folder (or Set Up Again in RecompLauncher) and select your\n"
+                    "Robotech: Battlecry disc image or folder.",
+                    "Robotech: Battlecry Recomp", MB_OK | MB_ICONERROR);
         return 1;
     }
 
@@ -533,6 +603,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         for (i = 0; i < sizeof(defs) / sizeof(defs[0]); i++) {
             if (!getenv(defs[i].name))
                 _putenv_s(defs[i].name, defs[i].value);
+        }
+        /* RecompLauncher's Big Picture mode (RECOMPLAUNCHER_MODE=bigpicture): start fullscreen for this run, as players
+         * on a controller expect. settings.ini is left as it is; RECOMP_FULLSCREEN set by hand still wins. */
+        {
+            const char *mode = getenv("RECOMPLAUNCHER_MODE");
+            if (mode && !_stricmp(mode, "bigpicture") && !getenv("RECOMP_FULLSCREEN"))
+                _putenv_s("RECOMP_FULLSCREEN", "1");
         }
         /* The toolkit reads RECOMP_IRQL_UNSTICK as present/absent. */
         {

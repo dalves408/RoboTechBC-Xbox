@@ -304,8 +304,16 @@ static int only_rt_textures(ID3D11ShaderResourceView *const *v, unsigned n)
     return 1;
 }
 static TexEnt s_tx[MAX_TEX];
-static StateEnt s_bs[96], s_dss[96], s_ss[48];
-static int s_nbs, s_ndss, s_nss;
+/* Blend, depth-stencil and sampler state caches: open-addressed hash tables.
+ * The old 96/48-entry arrays were searched linearly and, once full, created a
+ * state on every call without storing it, so each draw with an uncached state
+ * took a new D3D reference that was never released. A full table now keeps
+ * only the most recent extra object (the previous one goes to the deferred
+ * release queue), and the [RBXPERF] line counts these as state_spill. */
+#define STATE_CAP 1024u /* power of two; filled to 3/4 at most */
+typedef struct { StateEnt e[STATE_CAP]; unsigned n; void *spill; } StateTab;
+static StateTab s_bst, s_dsst, s_sst;
+static volatile LONG st_state_spill;
 static int s_failed, s_inited, s_noalpha;
 static uint32_t s_frame, s_tick;
 static uint32_t st_th_fast, st_th_full, st_th_stale;
@@ -1272,19 +1280,44 @@ static D3D11_STENCIL_OP sten_op(uint32_t o)
     return D3D11_STENCIL_OP_KEEP;
 }
 
-static void *find_state(StateEnt *tab, int *n, int max, const uint32_t *key, int nk)
+static unsigned state_slot(const StateTab *t, const uint32_t *key)
 {
-    int i;
-    for (i = 0; i < *n; i++)
-        if (!memcmp(tab[i].key, key, nk * 4)) return tab[i].obj;
-    (void)max;
-    return NULL;
+    uint32_t h = 2166136261u;
+    unsigned i, j;
+    for (i = 0; i < 12; i++) { h ^= key[i]; h *= 16777619u; h ^= h >> 15; }
+    for (j = h & (STATE_CAP - 1); ; j = (j + 1) & (STATE_CAP - 1))
+        if (!t->e[j].obj || !memcmp(t->e[j].key, key, 12 * 4)) return j;
+}
+static void *find_state(StateTab *t, const uint32_t *key)
+{
+    return t->e[state_slot(t, key)].obj;
+}
+static void store_state(StateTab *t, const uint32_t *key, void *obj)
+{
+    if (t->n < STATE_CAP / 4 * 3) {
+        StateEnt *e = &t->e[state_slot(t, key)];
+        memcpy(e->key, key, 12 * 4);
+        e->obj = obj;
+        t->n++;
+        return;
+    }
+    if (InterlockedIncrement(&st_state_spill) == 1)
+        fprintf(stderr, "[RBX DX11] state cache full (%u entries); extra states are no longer cached\n", t->n);
+    if (t->spill) gb_defer_rel(t->spill);
+    t->spill = obj;
+}
+static void clear_states(StateTab *t)
+{
+    unsigned i;
+    for (i = 0; i < STATE_CAP; i++) if (t->e[i].obj) gb_defer_rel(t->e[i].obj);
+    if (t->spill) gb_defer_rel(t->spill);
+    memset(t, 0, sizeof *t);
 }
 
 static ID3D11BlendState *get_blend(const Nv2aRenderState *r)
 {
     uint32_t key[12] = { r->blend_enable ? 1 : 0, r->blend_src, r->blend_dst, r->blend_eq, r->color_mask };
-    ID3D11BlendState *b = (ID3D11BlendState *)find_state(s_bs, &s_nbs, 96, key, 12);
+    ID3D11BlendState *b = (ID3D11BlendState *)find_state(&s_bst, key);
     D3D11_BLEND_DESC d;
     if (b) return b;
     memset(&d, 0, sizeof d);
@@ -1302,7 +1335,7 @@ static ID3D11BlendState *get_blend(const Nv2aRenderState *r)
         (uint8_t)(((r->color_mask & 0x00010000) ? 1 : 0) | ((r->color_mask & 0x100) ? 2 : 0) |
                   ((r->color_mask & 1) ? 4 : 0) | ((r->color_mask & 0x01000000) ? 8 : 0));
     if (FAILED(ID3D11Device_CreateBlendState(s_dev, &d, &b))) return NULL;
-    if (s_nbs < 96) { memcpy(s_bs[s_nbs].key, key, sizeof key); s_bs[s_nbs].obj = b; s_nbs++; }
+    store_state(&s_bst, key, b);
     return b;
 }
 
@@ -1312,7 +1345,7 @@ static ID3D11DepthStencilState *get_dss(const Nv2aRenderState *r, int have_ds)
                          r->stencil_enable ? 1 : 0, r->stencil_func, r->stencil_func_mask & 0xFF,
                          r->stencil_write_mask & 0xFF, r->stencil_fail, r->stencil_zfail, r->stencil_zpass,
                          (r->blend_enable && r->blend_src == 0x302 && r->blend_dst == 0x303) ? 1u : 0u };
-    ID3D11DepthStencilState *d = (ID3D11DepthStencilState *)find_state(s_dss, &s_ndss, 96, key, 12);
+    ID3D11DepthStencilState *d = (ID3D11DepthStencilState *)find_state(&s_dsst, key);
     D3D11_DEPTH_STENCIL_DESC dd;
     D3D11_DEPTH_STENCILOP_DESC op;
     if (d) return d;
@@ -1335,7 +1368,7 @@ static ID3D11DepthStencilState *get_dss(const Nv2aRenderState *r, int have_ds)
     op.StencilFunc = cmp_func(r->stencil_func);
     dd.FrontFace = op; dd.BackFace = op;
     if (FAILED(ID3D11Device_CreateDepthStencilState(s_dev, &dd, &d))) return NULL;
-    if (s_ndss < 96) { memcpy(s_dss[s_ndss].key, key, sizeof key); s_dss[s_ndss].obj = d; s_ndss++; }
+    store_state(&s_dsst, key, d);
     return d;
 }
 
@@ -1354,7 +1387,7 @@ static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
 {
     uint32_t minf = (t->filter >> 16) & 0xFF, magf = (t->filter >> 24) & 0xF;
     uint32_t key[12] = { minf == 1 ? 1u : 0u, magf == 1 ? 1u : 0u, t->addr_u, t->addr_v, s_aniso };
-    ID3D11SamplerState *s = (ID3D11SamplerState *)find_state(s_ss, &s_nss, 48, key, 12);
+    ID3D11SamplerState *s = (ID3D11SamplerState *)find_state(&s_sst, key);
     D3D11_SAMPLER_DESC d;
     if (s) return s;
     memset(&d, 0, sizeof d);
@@ -1368,7 +1401,7 @@ static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
     d.MaxAnisotropy = d.Filter == D3D11_FILTER_ANISOTROPIC ? s_aniso : 1;
     d.ComparisonFunc = D3D11_COMPARISON_NEVER;
     if (FAILED(ID3D11Device_CreateSamplerState(s_dev, &d, &s))) return NULL;
-    if (s_nss < 48) { memcpy(s_ss[s_nss].key, key, sizeof key); s_ss[s_nss].obj = s; s_nss++; }
+    store_state(&s_sst, key, s);
     return s;
 }
 
@@ -2297,7 +2330,7 @@ static int gvs_flat_full(const Nv2aSurface *s, const Nv2aBatch *b, const RbxGvs 
     return n && lo <= 1.0f && hi >= (float)s->width - 1.0f;
 }
 
-/* ---- frame interpolation (prototype; RECOMP_RBX_INTERP, off by default) -------------------------------------------
+/* ---- frame interpolation (on by default at level 1; F1 / Config.exe "Frame interpolation"; RECOMP_RBX_INTERP) ------
  * The game's world steps at a fixed ~30 Hz while it flips 200-800 times a second: the extra flips resubmit the same
  * draws (RECOMP_RBX_SIMRATE measured ~12 identical flips per step). This draws those repeats at in-between positions.
  *
@@ -2321,6 +2354,9 @@ static int gvs_flat_full(const Nv2aSurface *s, const Nv2aBatch *b, const RbxGvs 
  *                        particles, HUD, fixed-function geometry) get their vertex positions blended when the matched
  *                        draw has the same vertex count. Text that changes can slide; that is why it is a second level.
  *
+ * Without RECOMP_RBX_INTERP the "Frame interpolation" setting picks the level: On is 1, Off is 0. It can change while
+ * the game runs (between frames). RECOMP_RBX_INTERP=0/1/2 overrides the setting for the whole run.
+ *
  * RECOMP_RBX_INTERP_DEBUG=1 swings every blended draw +-3 steps back and forth once a second, to show what is covered.
  *
  * A draw with no match, or whose values jump too far (a camera cut, a respawn), is drawn as the game gave it. A tick
@@ -2340,6 +2376,8 @@ typedef struct {
 } IpList;
 static IpList *s_ipA, *s_ipB, *s_ipC;
 static int s_ip = -1, s_ip_new, s_ip_valid, s_ip_began;
+static int s_ip_env = -1;    /* RECOMP_RBX_INTERP's level when it is set: it overrides the setting */
+static int s_ip_menu = 1;    /* the "Frame interpolation" setting (video_apply), On by default */
 static float s_ip_lead = 1.0f;   /* 0 = interpolate (one tick behind), 1 = extrapolate (no added latency) */
 static unsigned long long s_ip_tick_t, s_ip_T, s_ip_flip_t;   /* tick_t: the current tick's start on a smoothed clock */
 static unsigned long long s_ip_arrive_t;                        /* when the current tick's draws actually arrived */
@@ -2425,24 +2463,50 @@ static unsigned st_ip_cam, st_ip_false, st_ip_ticks, st_ip_blend, st_ip_nomatch,
 static unsigned s_tr_gvs, s_tr_cpu, s_tr_blend, s_tr_tick, s_tr_ffp; static uint32_t s_tr_gvs_va, s_tr_cpu_va;
 static int s_ip_debug;   /* RECOMP_RBX_INTERP_DEBUG=1: swing blended draws back and forth, to see what is covered */
 
+static void ip_list_reset(IpList *l);
+/* Switch to level want (0 off). Nothing carries over from before: the next tick starts blending afresh. */
+static void ip_set_level(int want)
+{
+    if (want == s_ip) return;
+    if (want && !s_ipA) {
+        s_ipA = (IpList *)calloc(1, sizeof *s_ipA); s_ipB = (IpList *)calloc(1, sizeof *s_ipB); s_ipC = (IpList *)calloc(1, sizeof *s_ipC);
+        if (!s_ipA || !s_ipB || !s_ipC) {
+            free(s_ipA); free(s_ipB); free(s_ipC); s_ipA = s_ipB = s_ipC = NULL;
+            fprintf(stderr, "[RBX INTERP] out of memory: off\n");
+            want = 0;
+            if (want == s_ip) return;
+        }
+    }
+    if (s_ipA) { ip_list_reset(s_ipA); ip_list_reset(s_ipB); ip_list_reset(s_ipC); }
+    s_ip_valid = s_ip_new = s_ip_began = 0;
+    s_ip_D_ok[1] = s_ip_D_ok[2] = 0;
+    s_ip = want;
+    if (s_ip)
+        fprintf(stderr, "[RBX INTERP] on: level %d (%s), lead %.2f (added latency ~%.0f%% of a tick)%s\n", s_ip,
+                s_ip == 1 ? "3D world" : "3D world + screen-space draws", s_ip_lead, (1.0f - s_ip_lead) * 100.0f,
+                s_ip_env >= 0 ? ", from RECOMP_RBX_INTERP" : "");
+    else
+        fprintf(stderr, "[RBX INTERP] off%s\n", s_ip_env >= 0 ? " (RECOMP_RBX_INTERP)" : "");
+}
+
 static int ip_on(void)
 {
     if (s_ip < 0) {
         const char *e = getenv("RECOMP_RBX_INTERP"), *x = getenv("RECOMP_RBX_INTERP_EXTRAP"), *l = getenv("RECOMP_RBX_INTERP_LEAD");
-        s_ip = e ? atoi(e) : 0;
-        if (s_ip < 0) s_ip = 0;
-        if (s_ip > 2) s_ip = 2;
+        if (e && e[0]) {
+            s_ip_env = atoi(e);
+            if (s_ip_env < 0) s_ip_env = 0;
+            if (s_ip_env > 2) s_ip_env = 2;
+        }
         if (x && x[0]) s_ip_lead = x[0] != '0' ? 1.0f : 0.0f;
         if (l && l[0]) s_ip_lead = (float)atof(l);
         if (s_ip_lead < 0) s_ip_lead = 0;
         if (s_ip_lead > 1) s_ip_lead = 1;
         { const char *d = getenv("RECOMP_RBX_INTERP_DEBUG"); s_ip_debug = d && d[0] && d[0] != '0'; }
-        if (s_ip) {
-            s_ipA = (IpList *)calloc(1, sizeof *s_ipA); s_ipB = (IpList *)calloc(1, sizeof *s_ipB); s_ipC = (IpList *)calloc(1, sizeof *s_ipC);
-            if (!s_ipA || !s_ipB || !s_ipC) { fprintf(stderr, "[RBX INTERP] out of memory: off\n"); s_ip = 0; }
-            else fprintf(stderr, "[RBX INTERP] on: level %d (%s), lead %.2f (added latency ~%.0f%% of a tick)\n", s_ip,
-                         s_ip == 1 ? "3D world" : "3D world + screen-space draws", s_ip_lead, (1.0f - s_ip_lead) * 100.0f);
-        }
+        s_ip = 0;
+        ip_set_level(s_ip_env >= 0 ? s_ip_env : s_ip_menu);
+        if (!s_ip)   /* starting off is not a change, so ip_set_level said nothing */
+            fprintf(stderr, "[RBX INTERP] off%s\n", s_ip_env >= 0 ? " (RECOMP_RBX_INTERP)" : " (Frame interpolation setting)");
     }
     return s_ip;
 }
@@ -3734,13 +3798,14 @@ static void video_apply(void)
     unsigned aa = (options >> 3) & 3, aniso = 1u << ((options >> 5) & 7);
     unsigned samples = s_msaa_mask & (1u << aa) ? 1u << aa : 1;
     s_fps_limit = limits[(options >> 9) & 7];
+    s_ip_menu = (options >> 15) & 1;
+    if (s_ip >= 0 && s_ip_env < 0) ip_set_level(s_ip_menu);
     if (hires != s_hires || (aniso > 1) != (s_aniso > 1)) {
         for (i = 0; i < MAX_TEX; i++) { DEFER_REL(s_tx[i].srv); DEFER_REL(s_tx[i].tex); s_tx[i].used = 0; }
         s_hires = hires;
     }
     if (aniso != s_aniso) {
-        for (i = 0; i < s_nss; i++) DEFER_REL(s_ss[i].obj);
-        s_nss = 0;
+        clear_states(&s_sst);
         s_aniso = aniso;
     }
     float wide = wide_target((options >> 12) & 7);
@@ -3830,8 +3895,8 @@ static void gb_flip_impl(void)
     if (s_fh > 0) { fprintf(stderr, "[FH] f=%u nd=%u exb=%u fl0=%u xff=%u sh=%u tr=%u bg=%u ilf=%u dpn=%u dp=%u dh=%016llX rth=%016llX\n", s_frame, fh_nd, g_dbg_batches, g_dbg_flush0, g_dbg_xffail, g_dbg_short, g_dbg_trunc, g_dbg_begin, g_dbg_ilf, g_dbg_dpn, g_dbg_dp, (unsigned long long)fh_dh, (unsigned long long)fh_rth); fh_dh = 0; fh_rth = 0; fh_nd = 0; g_dbg_batches = g_dbg_flush0 = g_dbg_xffail = g_dbg_short = g_dbg_begin = g_dbg_ilf = g_dbg_dpn = g_dbg_dp = 0; }
     now = GetTickCount();
     if (s_verbose && now - last >= 2000) {
-        fprintf(stderr, "[RBX DX11] frame=%u flips=%u draws=%u tris=%u culled=%u clears=%u texdecodes=%u texhash_us=%u dec_us=%u crt_us=%u rtsamples=%u us_draw=%u us_clear=%u us_flip=%u scan_ms=%u segs=%u thfast=%u thfull=%u thstale=%u\n",
-                s_frame, st_flips, st_draws, st_tris, st_culled, st_clears, st_decodes, st_hash_ns_us, st_dec_us, st_crt_us, st_rtsamples, st_us_draw, st_us_clear, st_us_flip, (unsigned)(g_pb_scan_ticks * 1000ULL / gb_qf()), g_pb_scan_segs, st_th_fast, st_th_full, st_th_stale);
+        fprintf(stderr, "[RBX DX11] frame=%u flips=%u draws=%u tris=%u culled=%u clears=%u texdecodes=%u texhash_us=%u dec_us=%u crt_us=%u rtsamples=%u us_draw=%u us_clear=%u us_flip=%u scan_ms=%u segs=%u thfast=%u thfull=%u thstale=%u states=%u/%u/%u state_spill=%ld\n",
+                s_frame, st_flips, st_draws, st_tris, st_culled, st_clears, st_decodes, st_hash_ns_us, st_dec_us, st_crt_us, st_rtsamples, st_us_draw, st_us_clear, st_us_flip, (unsigned)(g_pb_scan_ticks * 1000ULL / gb_qf()), g_pb_scan_segs, st_th_fast, st_th_full, st_th_stale, s_bst.n, s_dsst.n, s_sst.n, (long)st_state_spill);
         /* Executor split, ms per window: batch = all of raster_batch; xf = vertex loop (fetch + vsh), vsh = interpreter alone;
          * clip = clip + triangle assembly; flush = hand-off incl. draw() (us_draw above). */
         fprintf(stderr, "[GPUSPLIT] scan_ms=%u batch_ms=%u xf_ms=%u vsh_ms=%u fetch_ms=%u clip_ms=%u flush_ms=%u xfverts=%u\n",
