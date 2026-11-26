@@ -2589,6 +2589,7 @@ static void ip_new_tick(void)
  * change on every flip, so scenes with no 3D draws (menus) are not blended. A "live" draw, one that changed between two flips of the same tick, already moves per flip and is never
  * blended. A screen-space draw that changes before the flip's tick is noticed is drawn as given and sorted out at the
  * end of the flip. */
+extern volatile long g_rbx_frontend_fps;   /* src/recomp_manual.c */
 static const IpDraw *ip_record(uint64_t key, uint64_t ch, const RbxGvsConst *k, const float *pos, uint32_t pstride,
                                uint32_t vn, int tick_src)
 {
@@ -2598,6 +2599,11 @@ static const IpDraw *ip_record(uint64_t key, uint64_t ch, const RbxGvsConst *k, 
     int pi, live = 0, pending = 0;
     s_ip_prechecked = 0;
     int changed = 0;
+    /* The front end (title menus, Story Mode, the Veritech choice, the results; src/recomp_manual.c) is not blended:
+     * its screens slide in and out with models that jump between them, and blending a model on the first flip of a
+     * new screen against where it was offscreen on the last one stretched it into a slab. Those screens are held to
+     * 60 flips a second anyway. Nothing is recorded, so the first tick of a mission starts afresh. */
+    if (g_rbx_frontend_fps) return NULL;
     ip_begin();
     sl = ip_slot(C, key, 1);
     if (sl != ~0u) o = C->cnt[sl]++;
