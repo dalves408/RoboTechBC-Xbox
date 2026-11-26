@@ -16,6 +16,12 @@
 #define BuildDir "..\build\RelWithDebInfo"
 #endif
 #define AppTitle "Robotech: Battlecry Recomp"
+; The hi-res texture pack (scripts/build_texture_pack.py writes texture_payload.iss): an optional task that downloads
+; its .bin parts from the textures-<n> release, or uses the ones beside Setup, and extracts them into texture_pack.
+#if FileExists(AddBackslash(SourcePath) + "texture_payload.iss")
+#define HasTextures
+#include "texture_payload.iss"
+#endif
 
 [Setup]
 AppId={{3B8E5C21-7A4D-4E9F-9C62-1D5A8F0B7E34}
@@ -71,6 +77,10 @@ Source: "README.txt"; DestDir: "{app}"; Flags: ignoreversion isreadme
 Source: "..\recomplauncher.json"; DestDir: "{app}"; Flags: ignoreversion
 ; the import tool only runs during setup; it is not installed
 Source: "{#BuildDir}\rbx_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
+#ifdef HasTextures
+; the hi-res texture pack's download helper, run from Setup's temp folder when the texture task is chosen
+Source: "{#BuildDir}\rbx_texture_download.exe"; Flags: dontcopy
+#endif
 
 [Dirs]
 Name: "{app}\SaveData"
@@ -82,6 +92,9 @@ Name: "{autodesktop}\{#AppTitle}"; Filename: "{app}\robotech_bc_recomp.exe"; Wor
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
+#ifdef HasTextures
+Name: "hires"; Description: "Install the hi-res texture pack (4x textures, about {#TextureDownloadBytes / 1000000} MB download)"; Flags: unchecked; Check: TexturePackNeedsInstall
+#endif
 
 [Run]
 Filename: "{app}\robotech_bc_recomp.exe"; Description: "Play Robotech: Battlecry now"; Flags: nowait postinstall skipifsilent unchecked; Check: GameFilesPresent(ExpandConstant('{app}'))
@@ -96,6 +109,14 @@ var
   RepairRadio, QuitRadio: TNewRadioButton;
   QuitNow: Boolean;
   ImportError: String;
+
+#ifdef HasTextures
+#define TextureOptional
+#include "texture_download_code.iss"
+#else
+function WantTexturePack: Boolean; begin Result := False; end;
+function TexturePackInstalled: Boolean; begin Result := False; end;
+#endif
 
 { The game files are in place: default.xbe and the folder the importer finished, so an install that was interrupted
   halfway is not mistaken for a finished one (rbx_import writes .rbx-imported last). }
@@ -335,6 +356,9 @@ begin
     WizardForm.FinishedLabel.Caption := '{#AppTitle} ' + NewVer + ' is installed.' + #13#10#13#10 +
       'Settings and controls: the {#AppTitle} Settings shortcut, or F1 in the game. ' +
       'Controllers work as soon as they are plugged in; the keyboard and mouse control player 1.';
+  if (CurPageID = wpFinished) and WantTexturePack and TexturePackInstalled then
+    WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +
+      'The hi-res texture pack is installed in the texture_pack folder and loads when the game starts.';
 end;
 
 { The "Ready to install" page says what is about to happen. }
@@ -356,6 +380,10 @@ begin
     S := S + NewLine + Space + WizardDirValue + NewLine + NewLine +
          'Only the program files are replaced. Your game files, saves and settings are kept.';
     if MemoTasksInfo <> '' then S := S + NewLine + NewLine + MemoTasksInfo;
+#ifdef HasTextures
+    if WantTexturePack and TexturePackNeedsInstall then
+      S := S + NewLine + NewLine + 'Hi-res texture pack: ' + TextureDownloadPlanText;
+#endif
     Result := S;
   end else
   begin
@@ -363,6 +391,10 @@ begin
     if MemoDirInfo <> '' then S := S + MemoDirInfo + NewLine + NewLine;
     S := S + 'Game files from:' + NewLine + Space + Trim(SrcEdit.Text) + NewLine;
     if MemoTasksInfo <> '' then S := S + NewLine + MemoTasksInfo + NewLine;
+#ifdef HasTextures
+    if WantTexturePack and TexturePackNeedsInstall then
+      S := S + NewLine + 'Hi-res texture pack: ' + TextureDownloadPlanText;
+#endif
     Result := S;
   end;
 end;
@@ -377,6 +409,9 @@ end;
 procedure CancelButtonClick(CurPageID: Integer; var Cancel, Confirm: Boolean);
 begin
   if QuitNow then Confirm := False;      { Quit on the matching-version page: no "Exit Setup?" question }
+#ifdef HasTextures
+  TextureCancelButtonClick(Cancel, Confirm);
+#endif
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -414,6 +449,18 @@ begin
       Result := False;
     end;
   end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+#ifdef HasTextures
+  { The texture parts are downloaded and checked before anything is installed; new game files need room too. }
+  if GameFilesPresent(RemoveBackslashUnlessRoot(WizardDirValue)) then
+    Result := PrepareTexturePayload(104857600)
+  else
+    Result := PrepareTexturePayload(4800000000);
+#endif
 end;
 
 { The importer's "PROGRESS done total" lines move the progress bar. }
@@ -484,11 +531,22 @@ begin
         'Run Setup again with the same folder and select a correct disc image or folder.', mbError, MB_OK);
     end;
   end;
+#ifdef HasTextures
+  if (CurStep = ssPostInstall) and GameFilesPresent(ExpandConstant('{app}')) then InstallTexturePack;
+  if CurStep = ssDone then TextureFinishCacheChoice;
+#endif
 end;
+
+#ifdef HasTextures
+procedure DeinitializeSetup;
+begin
+  TextureCleanupOnExit;
+end;
+#endif
 
 function GetCustomSetupExitCode: Integer;
 begin
   Result := 0;
-  if not GameFilesPresent(ExpandConstant('{app}')) then
+  if not GameFilesPresent(ExpandConstant('{app}')) or (WantTexturePack and not TexturePackInstalled) then
     Result := 1;
 end;

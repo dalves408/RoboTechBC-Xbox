@@ -35,7 +35,8 @@ FILES (all in this folder: move the folder to move the game, delete it to remove
   SaveData\      Saves
   settings.ini   Settings (F1 or the Settings program edit it)
   shader_cache\  Compiled shaders, so effects don't stutter the second time
-  texture_pack\  Optional high-resolution texture replacements
+  texture_pack\  The optional hi-res texture pack: tick it in Setup, or run the
+                 Hi-Res Textures Setup (F1 > Hi-res textures turns it off)
   logs\          One log per run (the newest 20 are kept)
   crashes\       A crash report if the game ever crashes
   screenshots\   Delete-key screenshots

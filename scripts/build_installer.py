@@ -6,9 +6,12 @@ build_installer.py).
 
 Output in installer/Output, each with a .sha256 (the names follow RecompLauncher's release standard):
   RobotechBC-Recomp-v<version>-Windows-x64.zip        the game folder, recomplauncher.json on top (RecompLauncher's pick)
-  RobotechBC-Recomp-v<version>-Windows-x64-Setup.exe  the same programs with the disc import wizard
-Neither holds game data:
-the player's own disc image supplies the game files (installer/rbx_import.c, checked against installer/manifest.h).
+  RobotechBC-Recomp-v<version>-Windows-x64-Setup.exe  the same programs with the disc import wizard, and the
+                                                      hi-res texture pack as an optional download
+  RobotechBC-Recomp-HiRes-Textures-r<n>-Windows-x64-Setup.exe   the texture pack alone, for an installed game
+The texture pack's pins come from scripts/build_texture_pack.py (installer/texture_payload.iss). Without that file
+Setup has no texture task and the texture Setup isn't built. None of these holds game data: the player's own disc
+image supplies the game files (installer/rbx_import.c, checked against installer/manifest.h).
 The programs' .pdb files (RelWithDebInfo) are kept in out/symbols/<version> for reading crash dumps and never shipped.
 
 Needs: Visual Studio 2022 C++ build tools, CMake, the xboxrecomp toolkit and SDL3 (README, Building), Inno Setup 6.6
@@ -32,7 +35,7 @@ BUILD = ROOT / 'build' / 'RelWithDebInfo'   # the configuration the test release
 INSTALLER = ROOT / 'installer'
 OUTPUT = INSTALLER / 'Output'
 SMALL_SIZES = (55, 64, 80, 96, 128)
-PROGRAMS = ('robotech_bc_recomp', 'Config', 'rbx_import')
+PROGRAMS = ('robotech_bc_recomp', 'Config', 'rbx_import', 'rbx_texture_download')
 
 # The F1 overlay's palette (src/rbx_ui.c): the RDF field manual's tactical display
 BG_TOP, BG_BOT = (16, 30, 54), (4, 9, 20)
@@ -342,6 +345,19 @@ def main():
     print(f'Setup: {setup}\nSHA-256: {write_sha256(setup)}')
     package = release_zip(args.version)
     print(f'Zip: {package}\nSHA-256: {write_sha256(package)}')
+
+    # The hi-res texture addon, once scripts/build_texture_pack.py has written texture_payload.iss. Its .bin parts
+    # (out/texture-release/revision-<n>) go on the textures-<n> release; the game Setup above offers the same pack as
+    # an optional task.
+    payload = INSTALLER / 'texture_payload.iss'
+    if payload.is_file():
+        revision = re.search(r'#define TextureVersion "(\d+)"', payload.read_text(encoding='ascii')).group(1)
+        run(iscc, f'/DBuildDir={BUILD}', INSTALLER / 'robotech_textures.iss')
+        addon = OUTPUT / f'RobotechBC-Recomp-HiRes-Textures-r{revision}-Windows-x64-Setup.exe'
+        print(f'Texture addon: {addon}\nSHA-256: {write_sha256(addon)}')
+    else:
+        print('No texture_payload.iss: the game Setup has no texture task and no addon was built '
+              '(run scripts/build_texture_pack.py first).')
 
 
 if __name__ == '__main__':
