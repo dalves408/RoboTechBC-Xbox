@@ -234,6 +234,29 @@ static void pads_scan(int force)
     LeaveCriticalSection(&g_lock);
 }
 
+/* RECOMP_PAD_LOG=1: log each change of what port 0 reports, stage by stage (the pad itself, then with the keyboard
+ * merged, then with the mouse), with a millisecond time, so a press the player did not make can be traced to its
+ * source. Buttons as hex (digital) plus the analog face buttons/triggers over 32, sticks in 8 steps. */
+static void pad_log_stage(DWORD port, const char *stage, const XBOX_INPUT_STATE *s)
+{
+    static int on = -1;
+    static char last[3][96];
+    static ULONGLONG t0;
+    char line[96];
+    int i, k;
+    if (on < 0) { const char *e = getenv("RECOMP_PAD_LOG"); on = e && *e == '1'; t0 = GetTickCount64(); }
+    if (!on || port != 0) return;
+    k = stage[1] == 'k' ? 1 : stage[1] == 'm' ? 2 : 0;
+    i = snprintf(line, sizeof line, "dig=%04X an=", (unsigned)s->Gamepad.wButtons);
+    for (int b = 0; b < 8 && i < (int)sizeof line - 2; b++) line[i++] = s->Gamepad.bAnalogButtons[b] > 32 ? "ABXYKWLR"[b] : '.';
+    snprintf(line + i, sizeof line - i, " L=%d,%d R=%d,%d", s->Gamepad.sThumbLX / 8192, s->Gamepad.sThumbLY / 8192,
+             s->Gamepad.sThumbRX / 8192, s->Gamepad.sThumbRY / 8192);
+    if (strcmp(line, last[k])) {
+        strcpy(last[k], line);
+        fprintf(stderr, "[PADLOG] %7llu ms %-6s %s\n", (unsigned long long)(GetTickCount64() - t0), stage, line);
+    }
+}
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     int ok;
@@ -276,14 +299,17 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     g_controller_connected[dwPort] = TRUE;
     swap_face_buttons(pState);
+    pad_log_stage(dwPort, "pad", pState);
 
     if (dwPort == 0)
         keyboard_merge(pState);
+    pad_log_stage(dwPort, "+kbd", pState);
 
     /* Mouse+keyboard merges on top of a real pad too: the mouse owns the
      * aim stick while it is moving, WASD owns movement while held. */
     if (dwPort == 0)
         mkb_merge(dwPort, pState);
+    pad_log_stage(dwPort, "+mouse", pState);
 
     /* Back+Start belongs to the host overlay on controller 1. */
     if (dwPort == 0 && (pState->Gamepad.wButtons & (XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START)) ==
