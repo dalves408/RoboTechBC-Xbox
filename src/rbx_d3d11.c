@@ -2666,7 +2666,11 @@ static const IpDraw *ip_record(uint64_t key, uint64_t ch, const RbxGvsConst *k, 
         }
         if (ai >= 0) { m = &s_ipA->d[ai]; s_ipA->d[ai].used = s_ip_flipno; }
         s_ip_prechecked = target == pred;
-        if (target == pred && (!m || (ip_jump(&m->k.cu[0][0], pred, 16, 0.5f, 1e-3f) && ip_jump(&m->k.cu[0][0], &k->cu[0][0], 16, 0.5f, 1e-3f)))) {
+        /* A mesh the last tick did not draw at all is new to the scene (a menu screen that just came in, a model that
+         * just appeared), not scenery that scrolled out of reach of its copies: the camera estimate, made from the
+         * previous screen's draws (a spinning planet behind a menu), says nothing about it. Draw it as given. */
+        if (!m && target == pred && ip_find(s_ipA, key, 0) < 0) target = NULL;
+        if (target && target == pred && (!m || (ip_jump(&m->k.cu[0][0], pred, 16, 0.5f, 1e-3f) && ip_jump(&m->k.cu[0][0], &k->cu[0][0], 16, 0.5f, 1e-3f)))) {
             /* No counterpart, or one far from where the camera's motion puts this object: assume it is static and
              * moved only with the camera, so it stays in step with the buildings around it. Checked against the
              * prediction as well as the current matrix, so a fast turn (a big change for everything) is not a jump, and
