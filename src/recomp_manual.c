@@ -612,7 +612,15 @@ extern void sub_00111410_orig(void);
  * held those flips to 60. While that read is the one being made, the flip
  * pacing in src/rbx_d3d11.c holds flips to g_rbx_frontend_fps (60; the
  * mission's pad read, 0x110AF, or a menu's, 0x12AD6, clears it).
- * RECOMP_RBX_RESULTS_FPS=<n> picks the rate, 0 turns it off. */
+ * RECOMP_RBX_RESULTS_FPS=<n> picks the rate, 0 turns it off.
+ *
+ * The front-end menus (title menus, Story Mode, the Veritech choice; pad read
+ * returning to 0x12AD6) are the same: one pass per flip, and their slides and
+ * fades count flips, so at a 144 FPS limit moving between the Story Mode and
+ * Veritech panels ran two and a half times too fast. They get the same hold.
+ * Only the flips are held (the pad read itself is not paced), and only while
+ * no mission is running: a 0x110AF read within the last half second means
+ * gameplay, which is never held. */
 #define RBX_RESULTS_PAD_RET  0x0001FF78u
 volatile long g_rbx_frontend_fps;
 
@@ -710,8 +718,17 @@ void sub_00111410(void)
         results_fps = e && *e ? atoi(e) : 60;
         if (results_fps < 0) results_fps = 0;
     }
-    if (ret == RBX_RESULTS_PAD_RET) g_rbx_frontend_fps = results_fps;
-    else if (ret == 0x000110AFu || ret == 0x00012AD6u) g_rbx_frontend_fps = 0;
+    {
+        static DWORD last_mission;
+        DWORD now = GetTickCount();
+        if (ret == 0x000110AFu) {
+            last_mission = now;
+            g_rbx_frontend_fps = 0;
+        } else if ((ret == RBX_RESULTS_PAD_RET || ret == 0x00012AD6u) &&
+                   (!last_mission || now - last_mission > 500u)) {
+            g_rbx_frontend_fps = results_fps;
+        }
+    }
     if (on && ret == RBX_PAUSE_PAD_RET && MEM32(RBX_PAUSED_VA))
         held_us = rbx_pace_30hz();
     if (log)
