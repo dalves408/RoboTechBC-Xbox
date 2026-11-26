@@ -98,6 +98,16 @@ int rbx_sdl_window_tick(HWND hwnd, int (*handle_key)(unsigned, long, int),
         fprintf(stderr, "[SDL3] keyboard and mouse attached to the framebuffer window\n");
     }
     if (!input_window) return 0;
+    {
+        /* Leaving fullscreen (F11, Alt+Enter, F1) restores the window's caption style, but SDL saw the
+         * borderless fullscreen style and keeps treating the window as borderless: it answers WM_NCCALCSIZE
+         * with no frame, so the window came back with no title bar. Tell it the window is bordered again. */
+        extern int xbox_fb_is_fullscreen(void);
+        if (!xbox_fb_is_fullscreen() && (SDL_GetWindowFlags(input_window) & SDL_WINDOW_BORDERLESS)) {
+            SDL_SetWindowBordered(input_window, true);
+            fprintf(stderr, "[SDL3] window bordered again after fullscreen\n");
+        }
+    }
     while (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) > 0) {
         if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST && event.window.windowID == input_window_id)
             xbox_InputKeysClear();
