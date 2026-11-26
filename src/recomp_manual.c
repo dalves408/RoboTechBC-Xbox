@@ -599,19 +599,9 @@ void sub_0012B670(void)
  * paused picture is still. Gameplay is unchanged. RECOMP_RBX_MENU_PACE=0
  * turns it off. RECOMP_RBX_PAUSE_LOG=1 logs each new caller of 0x111410, and
  * every second how often each one was called and how long the pause was held.
- * scripts/patch_kickoff_yield.ps1 renames the generated 0x111410 to _orig.
- *
- * The front end (title menus, story select, the Mission Complete results) has
- * the same shape: its loop reads the pads through a call that returns to
- * 0x12AD6, once per pass, and its timers count passes. The Xbox ran it at 30
- * a second (the attract loop, 0x1FF78, still does); here it ran once per flip
- * (144 a second at the 144 FPS limit, hundreds uncapped), so the results
- * screen flipped between its lines several times a second instead of fading
- * from one to the next. That read is held to 30 a second too, by the same
- * switch. */
+ * scripts/patch_kickoff_yield.ps1 renames the generated 0x111410 to _orig. */
 #define RBX_PAUSED_VA        0x001E628Cu
 #define RBX_PAUSE_PAD_RET    0x0001144Fu   /* 0x11370's pad read, paused path */
-#define RBX_FRONTEND_PAD_RET 0x00012AD6u   /* the front end's pad read, once per pass */
 extern void sub_00111410_orig(void);
 
 static int rbx_menu_flag(const char *name, int dflt)
@@ -704,7 +694,7 @@ void sub_00111410(void)
         on = rbx_menu_flag("RECOMP_RBX_MENU_PACE", 1);
         log = rbx_menu_flag("RECOMP_RBX_PAUSE_LOG", 0);
     }
-    if (on && ((ret == RBX_PAUSE_PAD_RET && MEM32(RBX_PAUSED_VA)) || ret == RBX_FRONTEND_PAD_RET))
+    if (on && ret == RBX_PAUSE_PAD_RET && MEM32(RBX_PAUSED_VA))
         held_us = rbx_pace_30hz();
     if (log)
         rbx_log_pad_caller(ret, held_us);
