@@ -604,6 +604,18 @@ void sub_0012B670(void)
 #define RBX_PAUSE_PAD_RET    0x0001144Fu   /* 0x11370's pad read, paused path */
 extern void sub_00111410_orig(void);
 
+/* The Mission Complete results screen. After a mission the game runs a loop
+ * whose pad read returns to 0x1FF78 (the attract loop's too): its logic steps
+ * 30 times a second, but it redraws and flips without waiting, 1000+ flips a
+ * second uncapped, and the results cycle their lines ("shots fired" /
+ * "missiles fired", the unlocked missions) by flip count. The Xbox's vsync
+ * held those flips to 60. While that read is the one being made, the flip
+ * pacing in src/rbx_d3d11.c holds flips to g_rbx_frontend_fps (60; the
+ * mission's pad read, 0x110AF, or a menu's, 0x12AD6, clears it).
+ * RECOMP_RBX_RESULTS_FPS=<n> picks the rate, 0 turns it off. */
+#define RBX_RESULTS_PAD_RET  0x0001FF78u
+volatile long g_rbx_frontend_fps;
+
 static int rbx_menu_flag(const char *name, int dflt)
 {
     const char *e = getenv(name);
@@ -690,10 +702,16 @@ void sub_00111410(void)
     static int on = -1, log;
     uint32_t ret = MEM32(g_esp);
     unsigned long held_us = 0;
+    static int results_fps = -1;
     if (on < 0) {
+        const char *e = getenv("RECOMP_RBX_RESULTS_FPS");
         on = rbx_menu_flag("RECOMP_RBX_MENU_PACE", 1);
         log = rbx_menu_flag("RECOMP_RBX_PAUSE_LOG", 0);
+        results_fps = e && *e ? atoi(e) : 60;
+        if (results_fps < 0) results_fps = 0;
     }
+    if (ret == RBX_RESULTS_PAD_RET) g_rbx_frontend_fps = results_fps;
+    else if (ret == 0x000110AFu || ret == 0x00012AD6u) g_rbx_frontend_fps = 0;
     if (on && ret == RBX_PAUSE_PAD_RET && MEM32(RBX_PAUSED_VA))
         held_us = rbx_pace_30hz();
     if (log)

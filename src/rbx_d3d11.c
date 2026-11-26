@@ -3982,6 +3982,7 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b) { unsigned t0 = qp
  * the game waits on its fences as it would on vsync, and runs at the cap. A run more than one frame late re-anchors
  * instead of bursting to catch up. A high-resolution waitable timer sleeps to ~1 ms before the slot, then a short
  * yield loop lands on it. RECOMP_FPS_CAP_DROP=1 restores the old behaviour. */
+extern volatile long g_rbx_frontend_fps;   /* src/recomp_manual.c */
 static void pace_flip(void)
 {
     static HANDLE timer;
@@ -3994,6 +3995,11 @@ static void pace_flip(void)
      * before the back end is ready (or if it failed), and the cap must hold whatever the renderer is doing. */
     static const unsigned limits[] = {30, 60, 120, 144, 240, 360, 0};
     unsigned rate = (rbx_settings_video() >> 9) & 7u, cap = limits[rate < 7u ? rate : 6u];
+    /* The Mission Complete results screen (and the attract loop) step their logic 30 times a second but redraw and
+     * flip as fast as they can; the results cycle their lines by flip count. The Xbox's vsync held those flips to
+     * 60 a second; uncapped here they ran at 1000+ and the lines changed every 0.1 s. While that loop runs
+     * (src/recomp_manual.c sets g_rbx_frontend_fps) the flips are held to its rate, or to the FPS limit if lower. */
+    if (g_rbx_frontend_fps && (!cap || cap > (unsigned)g_rbx_frontend_fps)) cap = (unsigned)g_rbx_frontend_fps;
     if (cap != last_cap) {
         fprintf(stderr, "[RBX DX11] FPS limit %s%u (%s)\n", cap ? "" : "off ", cap,
                 s_cap_drop ? "RECOMP_FPS_CAP_DROP: frames dropped, game not held" : "game held to it at each flip");
