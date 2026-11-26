@@ -151,7 +151,7 @@ def hazard(img, box, stripe):
 
 
 def emblem(size):
-    """The icon: a VF-1 in fighter mode, head-on from above, on a chamfered RDF panel."""
+    """The icon: an original chevron mark on a chamfered panel, in the overlay's colours."""
     s = size * 4                                  # drawn big, then reduced (antialiasing)
     img = Image.new('RGBA', (s, s), (0, 0, 0, 0))
     c = s // 6
@@ -173,20 +173,16 @@ def emblem(size):
     b = s // 4
     d.line([(s - b, w * 2), (s - w * 2, w * 2), (s - w * 2, b)], fill=AMBER + (255,), width=w * 2)
     d.line([(w * 2, s - b), (w * 2, s - w * 2), (b, s - w * 2)], fill=AMBER + (255,), width=w * 2)
-    # the fighter: fuselage, swept wings, tailplanes and twin fins
+    # an original mark: three stacked amber chevrons over a sky-blue crosshair tick
     cx, u = s / 2, s / 100
-    body = [(cx, 14 * u), (cx + 5 * u, 34 * u), (cx + 6 * u, 72 * u), (cx + 4 * u, 84 * u), (cx - 4 * u, 84 * u),
-            (cx - 6 * u, 72 * u), (cx - 5 * u, 34 * u)]
-    wings = [(cx + 5 * u, 42 * u), (cx + 38 * u, 66 * u), (cx + 38 * u, 71 * u), (cx + 6 * u, 64 * u),
-             (cx - 6 * u, 64 * u), (cx - 38 * u, 71 * u), (cx - 38 * u, 66 * u), (cx - 5 * u, 42 * u)]
-    tail = [(cx + 6 * u, 72 * u), (cx + 19 * u, 84 * u), (cx + 19 * u, 88 * u), (cx + 5 * u, 84 * u),
-            (cx - 5 * u, 84 * u), (cx - 19 * u, 88 * u), (cx - 19 * u, 84 * u), (cx - 6 * u, 72 * u)]
-    d.polygon(wings, fill=WHITE + (255,))
-    d.polygon(tail, fill=TEXT + (255,))
-    d.polygon(body, fill=WHITE + (255,))
-    d.polygon([(cx, 24 * u), (cx + 2.6 * u, 33 * u), (cx - 2.6 * u, 33 * u)], fill=SKY + (255,))   # canopy
-    d.line([(cx + 9 * u, 46 * u), (cx + 9 * u, 60 * u)], fill=AMBER + (255,), width=max(2, int(2.4 * u)))  # fins
-    d.line([(cx - 9 * u, 46 * u), (cx - 9 * u, 60 * u)], fill=AMBER + (255,), width=max(2, int(2.4 * u)))
+    t = 9 * u
+    for i, y in enumerate((30 * u, 47 * u, 64 * u)):
+        col = AMBER if i < 2 else AMBER_DK
+        d.polygon([(cx - 30 * u, y + 20 * u), (cx, y), (cx + 30 * u, y + 20 * u),
+                   (cx + 30 * u, y + 20 * u + t), (cx, y + t), (cx - 30 * u, y + 20 * u + t)], fill=col + (255,))
+    d.line([(cx, 14 * u), (cx, 24 * u)], fill=SKY + (255,), width=max(2, int(3 * u)))
+    d.line([(16 * u, 50 * u), (22 * u, 50 * u)], fill=SKY + (255,), width=max(2, int(3 * u)))
+    d.line([(78 * u, 50 * u), (84 * u, 50 * u)], fill=SKY + (255,), width=max(2, int(3 * u)))
     return img.resize((size, size), Image.LANCZOS)
 
 
