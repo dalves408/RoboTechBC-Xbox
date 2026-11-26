@@ -28,7 +28,7 @@ extern int (*rbx_pad_swaps_hook)(void);
 /* The options themselves are in rbx_options.h (shared with Config.exe). */
 enum { SCALE = RBX_OPT_SCALE, FULLSCREEN = RBX_OPT_FULLSCREEN, STRETCH = RBX_OPT_STRETCH,
        WIDE = RBX_OPT_WIDE, VSYNC = RBX_OPT_VSYNC, RATE = RBX_OPT_RATE, AA = RBX_OPT_AA,
-       ANISO = RBX_OPT_ANISO, HIRES = RBX_OPT_HIRES, CLOSE = RBX_ROW_RESUME, QUIT = RBX_ROW_QUIT,
+       ANISO = RBX_OPT_ANISO, HIRES = RBX_OPT_HIRES, INTERP = RBX_OPT_INTERP, CLOSE = RBX_ROW_RESUME, QUIT = RBX_ROW_QUIT,
        ROWS = RBX_ROW_COUNT };
 enum { CLOSED, SETTINGS, CONFIRM };
 #define options rbx_options
@@ -67,7 +67,8 @@ static void apply_choice(int row)
 {
     /* One word gives the render thread a consistent settings snapshot. */
     LONG render = (LONG)(choice[SCALE] | choice[AA] << 3 | choice[ANISO] << 5 |
-                         choice[HIRES] << 8 | choice[RATE] << 9 | choice[WIDE] << 12);
+                         choice[HIRES] << 8 | choice[RATE] << 9 | choice[WIDE] << 12 |
+                         choice[INTERP] << 15);
     InterlockedExchange(&video, render);
     if (row == FULLSCREEN && xbox_fb_window() &&
         (int)choice[FULLSCREEN] != xbox_fb_is_fullscreen())

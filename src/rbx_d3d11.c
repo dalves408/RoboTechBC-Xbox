@@ -2330,7 +2330,7 @@ static int gvs_flat_full(const Nv2aSurface *s, const Nv2aBatch *b, const RbxGvs 
     return n && lo <= 1.0f && hi >= (float)s->width - 1.0f;
 }
 
-/* ---- frame interpolation (prototype; RECOMP_RBX_INTERP, off by default) -------------------------------------------
+/* ---- frame interpolation (on by default at level 1; F1 / Config.exe "Frame interpolation"; RECOMP_RBX_INTERP) ------
  * The game's world steps at a fixed ~30 Hz while it flips 200-800 times a second: the extra flips resubmit the same
  * draws (RECOMP_RBX_SIMRATE measured ~12 identical flips per step). This draws those repeats at in-between positions.
  *
@@ -2354,6 +2354,9 @@ static int gvs_flat_full(const Nv2aSurface *s, const Nv2aBatch *b, const RbxGvs 
  *                        particles, HUD, fixed-function geometry) get their vertex positions blended when the matched
  *                        draw has the same vertex count. Text that changes can slide; that is why it is a second level.
  *
+ * Without RECOMP_RBX_INTERP the "Frame interpolation" setting picks the level: On is 1, Off is 0. It can change while
+ * the game runs (between frames). RECOMP_RBX_INTERP=0/1/2 overrides the setting for the whole run.
+ *
  * RECOMP_RBX_INTERP_DEBUG=1 swings every blended draw +-3 steps back and forth once a second, to show what is covered.
  *
  * A draw with no match, or whose values jump too far (a camera cut, a respawn), is drawn as the game gave it. A tick
@@ -2373,6 +2376,8 @@ typedef struct {
 } IpList;
 static IpList *s_ipA, *s_ipB, *s_ipC;
 static int s_ip = -1, s_ip_new, s_ip_valid, s_ip_began;
+static int s_ip_env = -1;    /* RECOMP_RBX_INTERP's level when it is set: it overrides the setting */
+static int s_ip_menu = 1;    /* the "Frame interpolation" setting (video_apply), On by default */
 static float s_ip_lead = 1.0f;   /* 0 = interpolate (one tick behind), 1 = extrapolate (no added latency) */
 static unsigned long long s_ip_tick_t, s_ip_T, s_ip_flip_t;   /* tick_t: the current tick's start on a smoothed clock */
 static unsigned long long s_ip_arrive_t;                        /* when the current tick's draws actually arrived */
@@ -2458,24 +2463,48 @@ static unsigned st_ip_cam, st_ip_false, st_ip_ticks, st_ip_blend, st_ip_nomatch,
 static unsigned s_tr_gvs, s_tr_cpu, s_tr_blend, s_tr_tick, s_tr_ffp; static uint32_t s_tr_gvs_va, s_tr_cpu_va;
 static int s_ip_debug;   /* RECOMP_RBX_INTERP_DEBUG=1: swing blended draws back and forth, to see what is covered */
 
+static void ip_list_reset(IpList *l);
+/* Switch to level want (0 off). Nothing carries over from before: the next tick starts blending afresh. */
+static void ip_set_level(int want)
+{
+    if (want == s_ip) return;
+    if (want && !s_ipA) {
+        s_ipA = (IpList *)calloc(1, sizeof *s_ipA); s_ipB = (IpList *)calloc(1, sizeof *s_ipB); s_ipC = (IpList *)calloc(1, sizeof *s_ipC);
+        if (!s_ipA || !s_ipB || !s_ipC) {
+            free(s_ipA); free(s_ipB); free(s_ipC); s_ipA = s_ipB = s_ipC = NULL;
+            fprintf(stderr, "[RBX INTERP] out of memory: off\n");
+            want = 0;
+            if (want == s_ip) return;
+        }
+    }
+    if (s_ipA) { ip_list_reset(s_ipA); ip_list_reset(s_ipB); ip_list_reset(s_ipC); }
+    s_ip_valid = s_ip_new = s_ip_began = 0;
+    s_ip_D_ok[1] = s_ip_D_ok[2] = 0;
+    s_ip = want;
+    if (s_ip)
+        fprintf(stderr, "[RBX INTERP] on: level %d (%s), lead %.2f (added latency ~%.0f%% of a tick)%s\n", s_ip,
+                s_ip == 1 ? "3D world" : "3D world + screen-space draws", s_ip_lead, (1.0f - s_ip_lead) * 100.0f,
+                s_ip_env >= 0 ? ", from RECOMP_RBX_INTERP" : "");
+    else
+        fprintf(stderr, "[RBX INTERP] off%s\n", s_ip_env >= 0 ? " (RECOMP_RBX_INTERP)" : "");
+}
+
 static int ip_on(void)
 {
     if (s_ip < 0) {
         const char *e = getenv("RECOMP_RBX_INTERP"), *x = getenv("RECOMP_RBX_INTERP_EXTRAP"), *l = getenv("RECOMP_RBX_INTERP_LEAD");
-        s_ip = e ? atoi(e) : 0;
-        if (s_ip < 0) s_ip = 0;
-        if (s_ip > 2) s_ip = 2;
+        if (e && e[0]) {
+            s_ip_env = atoi(e);
+            if (s_ip_env < 0) s_ip_env = 0;
+            if (s_ip_env > 2) s_ip_env = 2;
+        }
         if (x && x[0]) s_ip_lead = x[0] != '0' ? 1.0f : 0.0f;
         if (l && l[0]) s_ip_lead = (float)atof(l);
         if (s_ip_lead < 0) s_ip_lead = 0;
         if (s_ip_lead > 1) s_ip_lead = 1;
         { const char *d = getenv("RECOMP_RBX_INTERP_DEBUG"); s_ip_debug = d && d[0] && d[0] != '0'; }
-        if (s_ip) {
-            s_ipA = (IpList *)calloc(1, sizeof *s_ipA); s_ipB = (IpList *)calloc(1, sizeof *s_ipB); s_ipC = (IpList *)calloc(1, sizeof *s_ipC);
-            if (!s_ipA || !s_ipB || !s_ipC) { fprintf(stderr, "[RBX INTERP] out of memory: off\n"); s_ip = 0; }
-            else fprintf(stderr, "[RBX INTERP] on: level %d (%s), lead %.2f (added latency ~%.0f%% of a tick)\n", s_ip,
-                         s_ip == 1 ? "3D world" : "3D world + screen-space draws", s_ip_lead, (1.0f - s_ip_lead) * 100.0f);
-        }
+        s_ip = 0;
+        ip_set_level(s_ip_env >= 0 ? s_ip_env : s_ip_menu);
     }
     return s_ip;
 }
@@ -3767,6 +3796,8 @@ static void video_apply(void)
     unsigned aa = (options >> 3) & 3, aniso = 1u << ((options >> 5) & 7);
     unsigned samples = s_msaa_mask & (1u << aa) ? 1u << aa : 1;
     s_fps_limit = limits[(options >> 9) & 7];
+    s_ip_menu = (options >> 15) & 1;
+    if (s_ip >= 0 && s_ip_env < 0) ip_set_level(s_ip_menu);
     if (hires != s_hires || (aniso > 1) != (s_aniso > 1)) {
         for (i = 0; i < MAX_TEX; i++) { DEFER_REL(s_tx[i].srv); DEFER_REL(s_tx[i].tex); s_tx[i].used = 0; }
         s_hires = hires;

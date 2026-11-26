@@ -6,7 +6,7 @@
 #define RBX_OPTIONS_H
 
 enum { RBX_OPT_SCALE, RBX_OPT_FULLSCREEN, RBX_OPT_STRETCH, RBX_OPT_WIDE, RBX_OPT_VSYNC,
-       RBX_OPT_RATE, RBX_OPT_AA, RBX_OPT_ANISO, RBX_OPT_HIRES, RBX_OPT_COUNT };
+       RBX_OPT_RATE, RBX_OPT_AA, RBX_OPT_ANISO, RBX_OPT_HIRES, RBX_OPT_INTERP, RBX_OPT_COUNT };
 
 /* The first RBX_OPT_DISPLAY rows are the "Display" section, the rest "Graphics". */
 #define RBX_OPT_DISPLAY 4
@@ -39,6 +39,8 @@ static const RbxOption rbx_options[RBX_OPT_COUNT] = {
      "Keeps ground and walls sharp at steep angles. Cheap on modern GPUs."},
     {"Hi-res textures", "hires", 2, 1, {"Off", "On"},
      "Uses replacement textures from the texture_pack folder when present."},
+    {"Frame interpolation", "interp", 2, 1, {"Off", "On"},
+     "Smooths 3D motion between the game's 30 Hz steps. Turn it off if anything shakes or slides."},
 };
 
 #endif

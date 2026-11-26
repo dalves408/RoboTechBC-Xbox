@@ -139,6 +139,15 @@
         { "label": "On", "set": { "video/hires": "1" } }
       ],
       "defaults": { "video/hires": "1" }
+    },
+    {
+      "id": "interp", "label": "Frame interpolation", "group": "Graphics",
+      "help": "Smooths 3D motion between the game's 30 Hz steps. Turn it off if anything shakes or slides.",
+      "choices": [
+        { "label": "Off", "set": { "video/interp": "0" } },
+        { "label": "On", "set": { "video/interp": "1" } }
+      ],
+      "defaults": { "video/interp": "1" }
     }
   ],
   "actions": [
