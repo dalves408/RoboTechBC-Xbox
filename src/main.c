@@ -481,6 +481,10 @@ static void log_to_file(void)
     }
 }
 
+#ifdef RBX_HAVE_IMPORT
+int rbx_prepare_main(void);   /* src/rbx_prepare_import.c: --prepare, RecompLauncher's setup step */
+#endif
+
 /* ── WinMain ───────────────────────────────────────────────── */
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
@@ -498,6 +502,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
+#ifdef RBX_HAVE_IMPORT
+    {   /* --prepare: RecompLauncher's setup step; the game does not start */
+        int prepared = rbx_prepare_main();
+        if (prepared >= 0) return prepared;
+    }
+#endif
+
     if (!portable_paths()) {
         fprintf(stderr, "Could not initialize portable game paths. Check the installation and save folder paths.\n");
         return 1;
@@ -506,7 +517,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     if (GetFileAttributesA(YOUR_GAME_XBE_PATH) == INVALID_FILE_ATTRIBUTES) {
         fprintf(stderr, "game_files\\default.xbe is missing beside the exe.\n");
         MessageBoxA(NULL, "The game files are missing (game_files\\default.xbe).\n\n"
-                    "Run Setup again with this folder and select your Robotech: Battlecry disc image or folder.",
+                    "Run Setup again with this folder (or Set Up Again in RecompLauncher) and select your\n"
+                    "Robotech: Battlecry disc image or folder.",
                     "Robotech: Battlecry Recomp", MB_OK | MB_ICONERROR);
         return 1;
     }

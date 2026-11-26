@@ -204,6 +204,10 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/installer/manifest.h")
     target_compile_definitions(rbx_import PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(rbx_import PRIVATE bcrypt shell32)
     set_target_properties(rbx_import PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    # The same importer is the game's own --prepare step for RecompLauncher (recomplauncher.json).
+    target_sources(${PROJECT_NAME} PRIVATE src/rbx_prepare_import.c)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE RBX_HAVE_IMPORT)
+    target_link_libraries(${PROJECT_NAME} PRIVATE bcrypt shell32)
 endif()
 
 if(MSVC)

@@ -36,10 +36,16 @@ static unsigned long long g_base, g_img_len;
 static DiscFile g_disc[MANIFEST_COUNT];
 static unsigned long long g_xbe_sector, g_xbe_size;
 static int g_xbe_found;
+static int g_launcher;   /* RecompLauncher's setup step: "progress <0..1> <text>" lines and plain error sentences */
+
+#define ERR(msg) printf("%s" msg, g_launcher ? "" : "ERROR ")
 
 static void progress(void)
 {
-    printf("PROGRESS %llu %llu\n", g_done, g_total);
+    if (g_launcher)
+        printf("progress %.4f Copying and checking the game files\n", g_total ? (double)g_done / (double)g_total : 1.0);
+    else
+        printf("PROGRESS %llu %llu\n", g_done, g_total);
     fflush(stdout);
 }
 
@@ -239,14 +245,14 @@ static int import_image(const WCHAR *image)
     LARGE_INTEGER len;
     int i, missing = 0;
     g_img = CreateFileW(image, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (g_img == INVALID_HANDLE_VALUE) { printf("ERROR The disc image could not be opened.\n"); return 2; }
+    if (g_img == INVALID_HANDLE_VALUE) { ERR("The disc image could not be opened.\n"); return 2; }
     GetFileSizeEx(g_img, &len);
     g_img_len = (unsigned long long)len.QuadPart;
-    if (!find_xdvdfs(&rs, &rsz)) { printf("ERROR This is not an Xbox disc image.\n"); return 3; }
-    if (!walk(rs, rsz, "", 0)) { printf("ERROR The disc image is damaged or incomplete.\n"); return 5; }
+    if (!find_xdvdfs(&rs, &rsz)) { ERR("This is not an Xbox disc image.\n"); return 3; }
+    if (!walk(rs, rsz, "", 0)) { ERR("The disc image is damaged or incomplete.\n"); return 5; }
     if (!g_xbe_found || g_xbe_size != DISC_XBE_SIZE || !seek_img(g_base + g_xbe_sector * SECTOR) ||
         copy_checked(g_img, g_xbe_size, DISC_XBE_SHA256, NULL, 0) != 1) {
-        printf("ERROR This is not the supported " GAME_NAME " disc (" GAME_RELEASE "): its default.xbe differs.\n");
+        ERR("This is not the supported " GAME_NAME " disc (" GAME_RELEASE "): its default.xbe differs.\n");
         return 4;
     }
     progress();
@@ -260,11 +266,11 @@ static int import_image(const WCHAR *image)
         path_in(g_dest, MANIFEST[i].path, dst);
         if (!seek_img(g_base + g_disc[i].sector * SECTOR)) { missing++; continue; }
         r = copy_checked(g_img, MANIFEST[i].size, MANIFEST[i].sha256, dst, 1);
-        if (r < 0) { printf("ERROR Could not write to the install folder.\n"); return 6; }
+        if (r < 0) { ERR("Could not write to the install folder.\n"); return 6; }
         if (r) g_have[i] = 1; else { printf("DAMAGED %s\n", MANIFEST[i].path); missing++; }
     }
     progress();
-    if (missing) { printf("ERROR %d game files are missing or damaged (bad or incomplete dump).\n", missing); return 5; }
+    if (missing) { printf("%s%d game files are missing or damaged (bad or incomplete dump).\n", g_launcher ? "" : "ERROR ", missing); return 5; }
     return 0;
 }
 
@@ -299,7 +305,7 @@ static int import_folder(const WCHAR *source)
     HANDLE f;
     LARGE_INTEGER sz;
     int i, missing = 0, ok = 0;
-    if (!find_root(source, root)) { printf("ERROR default.xbe was not found in that folder.\n"); return 4; }
+    if (!find_root(source, root)) { ERR("default.xbe was not found in that folder.\n"); return 4; }
     swprintf_s(xbe, MAX_PATH, L"%s\\default.xbe", root);
     f = CreateFileW(xbe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (f != INVALID_HANDLE_VALUE) {
@@ -308,7 +314,7 @@ static int import_folder(const WCHAR *source)
         CloseHandle(f);
     }
     if (!ok) {
-        printf("ERROR This is not the supported " GAME_NAME " disc (" GAME_RELEASE "): its default.xbe differs.\n");
+        ERR("This is not the supported " GAME_NAME " disc (" GAME_RELEASE "): its default.xbe differs.\n");
         return 4;
     }
     progress();
@@ -325,49 +331,76 @@ static int import_folder(const WCHAR *source)
         else
             g_done += MANIFEST[i].size;
         CloseHandle(f);
-        if (r < 0) { printf("ERROR Could not write to the install folder.\n"); return 6; }
+        if (r < 0) { ERR("Could not write to the install folder.\n"); return 6; }
         if (r) g_have[i] = 1; else { printf("DAMAGED %s\n", MANIFEST[i].path); missing++; }
     }
     progress();
-    if (missing) { printf("ERROR %d game files are missing or damaged (bad or incomplete dump).\n", missing); return 5; }
+    if (missing) { printf("%s%d game files are missing or damaged (bad or incomplete dump).\n", g_launcher ? "" : "ERROR ", missing); return 5; }
     return 0;
 }
 
-int wmain(int argc, wchar_t **argv)
+/* Copies and checks every manifest file from source into dest. launcher: print RecompLauncher's progress lines. */
+int rbx_import_run(const WCHAR *source, const WCHAR *dest, int launcher)
 {
     WCHAR stamp[MAX_PATH];
     DWORD attr;
     size_t n;
     int r;
-    if (argc != 3) {
-        printf("usage: rbx_import <disc image, drive or folder> <dest folder>\n");
-        return 2;
-    }
+    g_launcher = launcher;
     g_done = 0; g_total = MANIFEST_BYTES;
-    wcscpy_s(g_dest, MAX_PATH, argv[2]);
+    wcscpy_s(g_dest, MAX_PATH, dest);
     n = wcslen(g_dest);
     while (n > 3 && (g_dest[n - 1] == L'\\' || g_dest[n - 1] == L'/')) g_dest[--n] = 0;
-    attr = GetFileAttributesW(argv[1]);
-    if (attr == INVALID_FILE_ATTRIBUTES) { printf("ERROR The disc image or folder was not found.\n"); return 2; }
+    attr = GetFileAttributesW(source);
+    if (attr == INVALID_FILE_ATTRIBUTES) { ERR("The disc image or folder was not found.\n"); return 2; }
     if (SHCreateDirectoryExW(NULL, g_dest, NULL) != ERROR_SUCCESS && GetFileAttributesW(g_dest) == INVALID_FILE_ATTRIBUTES) {
-        printf("ERROR Could not write to the install folder.\n");
+        ERR("Could not write to the install folder.\n");
         return 6;
     }
     swprintf_s(stamp, MAX_PATH, L"%s\\.rbx-imported", g_dest);
     DeleteFileW(stamp);
-    r = (attr & FILE_ATTRIBUTE_DIRECTORY) ? import_folder(argv[1]) : import_image(argv[1]);
-    if (g_img != INVALID_HANDLE_VALUE) CloseHandle(g_img);
+    r = (attr & FILE_ATTRIBUTE_DIRECTORY) ? import_folder(source) : import_image(source);
+    if (g_img != INVALID_HANDLE_VALUE) { CloseHandle(g_img); g_img = INVALID_HANDLE_VALUE; }
     if (!r) {
         HANDLE f = CreateFileW(stamp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
         static const char text[] = "rbx_import: every manifest file copied and checked\r\n";
         DWORD wr;
         if (f == INVALID_HANDLE_VALUE || !WriteFile(f, text, sizeof text - 1, &wr, NULL)) {
             if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
-            printf("ERROR Could not write to the install folder.\n");
+            ERR("Could not write to the install folder.\n");
             return 6;
         }
         CloseHandle(f);
-        printf("OK %d files\n", MANIFEST_COUNT);
+        if (launcher) printf("progress 1 Game files ready\n");
+        else printf("OK %d files\n", MANIFEST_COUNT);
     }
     return r;
 }
+
+/* A finished import is in dest: the stamp is there and every manifest file has its pinned size. Quick: no hashing. */
+int rbx_import_installed(const WCHAR *dest)
+{
+    WCHAR path[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    int i;
+    swprintf_s(path, MAX_PATH, L"%s\\.rbx-imported", dest);
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return 0;
+    for (i = 0; i < MANIFEST_COUNT; i++) {
+        path_in(dest, MANIFEST[i].path, path);
+        if (!GetFileAttributesExW(path, GetFileExInfoStandard, &a) ||
+            (((unsigned long long)a.nFileSizeHigh << 32) | a.nFileSizeLow) != MANIFEST[i].size)
+            return 0;
+    }
+    return 1;
+}
+
+#ifndef RBX_IMPORT_NO_MAIN
+int wmain(int argc, wchar_t **argv)
+{
+    if (argc != 3) {
+        printf("usage: rbx_import <disc image, drive or folder> <dest folder>\n");
+        return 2;
+    }
+    return rbx_import_run(argv[1], argv[2], 0);
+}
+#endif
