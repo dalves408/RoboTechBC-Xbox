@@ -13,7 +13,7 @@
 #define TextureExtractedBytes 792640173
 #endif
 #ifndef TextureManifestSHA256
-#define TextureManifestSHA256 "5237df6897fc3153a7712621ba1443bf27d45202b34ab9dd57dd5d55caace263"
+#define TextureManifestSHA256 "69abf10b4d99f83200428a446cdc43515318dbea5ecb5b5c9f3f5e8048fa4f35"
 #endif
 #ifndef TextureFileCount
 #define TextureFileCount 1086
@@ -25,14 +25,14 @@
 #define TexturePartCount 1
 #endif
 #ifndef TextureDownloadBytes
-#define TextureDownloadBytes 496502936
+#define TextureDownloadBytes 496425316
 #endif
 #ifndef TextureURL1
 #define TextureURL1 "https://github.com/dalves408/RoboTechBC-Xbox/releases/download/textures-1/texture-01.bin"
 #endif
 #ifndef TextureSHA2561
-#define TextureSHA2561 "592fa7356ff20605625565039272a9b1960aa5bd8466c61c0e63d421444164c5"
+#define TextureSHA2561 "69dfb9e7fcc15dcd2b2a1b570db4d508e2893145a47fb3b68bbbc1f53adcb227"
 #endif
 #ifndef TextureBytes1
-#define TextureBytes1 496502936
+#define TextureBytes1 496425316
 #endif
