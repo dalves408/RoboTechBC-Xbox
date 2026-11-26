@@ -108,9 +108,8 @@ static void sdlpad_rescan(int force)
         return;
     sp_last_scan = now;
     {
-        /* This runs on whichever guest thread polls the pad, once a second. Opening a pad (HIDAPI, Bluetooth)
-         * can take long enough to show as a hitch, so time it: a slow scan is logged, and if they show up in
-         * hitch reports, the scan moves to its own thread. */
+        /* Inline scan (no pad thread): runs on whichever thread polls the pad, once a second. Opening a
+         * pad (HIDAPI, Bluetooth) can take long enough to show as a hitch, so a slow scan is logged. */
         Uint64 t0 = SDL_GetTicksNS(), dt;
         sdlpad_rescan_now();
         dt = (SDL_GetTicksNS() - t0) / 1000000;

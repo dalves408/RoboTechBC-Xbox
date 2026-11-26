@@ -350,9 +350,18 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 
         /* Print native stack return addresses for debugging */
         {
+            /* The handler runs on the faulting thread, so clamp the scan to
+             * this thread's stack: a fault near the top of the stack (or a
+             * corrupt Rsp) must not fault again in here and lose the log. */
             uintptr_t *sp = (uintptr_t *)ep->ContextRecord->Rsp;
-            fprintf(stderr, "  Native stack (first 8 return addrs):\n");
-            for (int i = 0; i < 64 && sp[i]; i++) {
+            ULONG_PTR lo = 0, hi = 0;
+            int n = 0;
+            GetCurrentThreadStackLimits(&lo, &hi);
+            if ((uintptr_t)sp >= lo && (uintptr_t)sp < hi && !((uintptr_t)sp & 7))
+                n = (int)(((uintptr_t)hi - (uintptr_t)sp) / sizeof *sp);
+            if (n > 64) n = 64;
+            fprintf(stderr, "  Native stack (return addrs in the first %d slots):\n", n);
+            for (int i = 0; i < n && sp[i]; i++) {
                 if (sp[i] >= 0x140000000ULL && sp[i] < 0x150000000ULL) {
                     fprintf(stderr, "    [%d] 0x%llX\n", i, (unsigned long long)sp[i]);
                 }
