@@ -127,13 +127,20 @@ begin
   Result := FileExists(Dir + '\game_files\default.xbe') and FileExists(Dir + '\game_files\.rbx-imported');
 end;
 
-{ The version of the game in Dir, from its exe ('' when unknown) }
+{ The version of the game in Dir, from its exe ('' when unknown). A fourth part of 0 is dropped (1.0.0.0 reads as
+  1.0.0, like this Setup's own version). }
 function InstalledVersion(Dir: String): String;
 var
   V: String;
+  I, Dots: Integer;
 begin
   Result := '';
-  if GetVersionNumbersString(Dir + '\robotech_bc_recomp.exe', V) then Result := V;
+  if not GetVersionNumbersString(Dir + '\robotech_bc_recomp.exe', V) then Exit;
+  Dots := 0;
+  for I := 1 to Length(V) do
+    if V[I] = '.' then Dots := Dots + 1;
+  if (Dots = 3) and (Copy(V, Length(V) - 1, 2) = '.0') then V := Copy(V, 1, Length(V) - 2);
+  Result := V;
 end;
 
 { Saves, settings and logs live in the install folder, so it must be writable: Program Files is not, without

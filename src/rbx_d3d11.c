@@ -2505,6 +2505,8 @@ static int ip_on(void)
         { const char *d = getenv("RECOMP_RBX_INTERP_DEBUG"); s_ip_debug = d && d[0] && d[0] != '0'; }
         s_ip = 0;
         ip_set_level(s_ip_env >= 0 ? s_ip_env : s_ip_menu);
+        if (!s_ip)   /* starting off is not a change, so ip_set_level said nothing */
+            fprintf(stderr, "[RBX INTERP] off%s\n", s_ip_env >= 0 ? " (RECOMP_RBX_INTERP)" : " (Frame interpolation setting)");
     }
     return s_ip;
 }
