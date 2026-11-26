@@ -3,8 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # ============================================================================
 # Robotech Battlecry (Xbox) - Static Recompilation
 #
-# Scaffolded from xboxrecomp templates/new-game, matching other xboxrecomp projects /
-# Redcard 2003 / NHL Hitz Pro layout on this machine (<tools>).
+# Scaffolded from the xboxrecomp templates/new-game layout.
 # ============================================================================
 
 project(robotech_bc_recomp C)
@@ -22,7 +21,7 @@ add_compile_definitions(
     NOMINMAX
 )
 
-# Prefer the junction at tools/xboxrecomp (shared the build PC toolkit under <tools>\tools).
+# Prefer tools/xboxrecomp (a checkout, or a junction to a shared toolkit tree).
 set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/xboxrecomp" CACHE PATH
     "Path to the xboxrecomp toolkit root directory")
 

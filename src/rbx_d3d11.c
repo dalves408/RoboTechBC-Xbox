@@ -190,7 +190,7 @@ static unsigned s_vb_i, s_cb_i;
 static ID3D11Buffer *s_ibr[VB_RING];   /* index ring for the executor's indexed batches */
 static unsigned s_ib_i, s_ib_off;
 static uint32_t s_xvb_off;
-static unsigned s_vendor, s_flush_mode, s_flush_tex; /* RECOMP_GPU_FLUSH_TEX=1: flush before and after every texture (re)creation */        /* RECOMP_GPU_FLUSH: 0 none, 1 P8 512-wide glyph draws, 2 all textured draws, 3 every draw; default 0 everywhere (Intel UHD on the test laptop: no corruption with 0, and 3 cost ~3.5x fps) */
+static unsigned s_vendor, s_flush_mode, s_flush_tex; /* RECOMP_GPU_FLUSH_TEX=1: flush before and after every texture (re)creation */        /* RECOMP_GPU_FLUSH: 0 none, 1 P8 512-wide glyph draws, 2 all textured draws, 3 every draw; default 0 everywhere (on an Intel UHD laptop: no corruption with 0, and 3 cost ~3.5x fps) */
 static unsigned long s_defer_n; static struct { IUnknown *o; uint32_t f; } s_grave[4096];
 static ID3D11RasterizerState *s_rs, *s_rs_split;
 static uint32_t s_split_va;
