@@ -84,7 +84,6 @@ screenshots/
 *.bmp
 
 # Local misc / non-source
-media/
 
 # IDE / OS
 .vscode/
