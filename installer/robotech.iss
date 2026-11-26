@@ -16,6 +16,8 @@
 #define BuildDir "..\build\RelWithDebInfo"
 #endif
 #define AppTitle "Robotech: Battlecry Recomp"
+; AppTitle has a colon, which Windows does not allow in a file name: shortcuts and the Start menu use this instead
+#define ShortcutName "Robotech Battlecry Recomp"
 ; The hi-res texture pack (scripts/build_texture_pack.py writes texture_payload.iss): an optional task that downloads
 ; its .bin parts from the textures-<n> release, or uses the ones beside Setup, and extracts them into texture_pack.
 #if FileExists(AddBackslash(SourcePath) + "texture_payload.iss")
@@ -30,7 +32,7 @@ AppVersion={#AppVersion}
 AppPublisher=dalves408/RoboTechBC-Xbox
 AppPublisherURL=https://github.com/dalves408/RoboTechBC-Xbox
 DefaultDirName=C:\Games\Robotech Battlecry Recomp
-DefaultGroupName={#AppTitle}
+DefaultGroupName={#ShortcutName}
 DisableProgramGroupPage=yes
 ; portable: no uninstaller and no Programs and Features entry, so no previous folder is remembered either. The folder
 ; page always shows and an existing install is recognised in the folder chosen.
@@ -86,9 +88,9 @@ Source: "{#BuildDir}\rbx_texture_download.exe"; Flags: dontcopy
 Name: "{app}\SaveData"
 
 [Icons]
-Name: "{autoprograms}\{#AppTitle}"; Filename: "{app}\robotech_bc_recomp.exe"; WorkingDir: "{app}"
-Name: "{autoprograms}\{#AppTitle} Settings"; Filename: "{app}\Config.exe"; WorkingDir: "{app}"
-Name: "{autodesktop}\{#AppTitle}"; Filename: "{app}\robotech_bc_recomp.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autoprograms}\{#ShortcutName}"; Filename: "{app}\robotech_bc_recomp.exe"; WorkingDir: "{app}"
+Name: "{autoprograms}\{#ShortcutName} Settings"; Filename: "{app}\Config.exe"; WorkingDir: "{app}"
+Name: "{autodesktop}\{#ShortcutName}"; Filename: "{app}\robotech_bc_recomp.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
@@ -354,7 +356,7 @@ begin
   end
   else if (CurPageID = wpFinished) and (ImportError = '') then
     WizardForm.FinishedLabel.Caption := '{#AppTitle} ' + NewVer + ' is installed.' + #13#10#13#10 +
-      'Settings and controls: the {#AppTitle} Settings shortcut, or F1 in the game. ' +
+      'Settings and controls: the {#ShortcutName} Settings shortcut, or F1 in the game. ' +
       'Controllers work as soon as they are plugged in; the keyboard and mouse control player 1.';
   if (CurPageID = wpFinished) and WantTexturePack and TexturePackInstalled then
     WizardForm.FinishedLabel.Caption := WizardForm.FinishedLabel.Caption + #13#10#13#10 +

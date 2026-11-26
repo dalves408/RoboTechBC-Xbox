@@ -2,8 +2,8 @@ Robotech: Battlecry Recomp
 The original Xbox game, recompiled to run natively on Windows.
 
 PLAY
-  Start "Robotech: Battlecry Recomp" from the Start menu (or the desktop shortcut).
-  "Robotech: Battlecry Recomp Settings" (Config.exe) changes the video settings and
+  Start "Robotech Battlecry Recomp" from the Start menu (or the desktop shortcut).
+  "Robotech Battlecry Recomp Settings" (Config.exe) changes the video settings and
   controls outside the game; F1 in the game opens the same settings.
   Intros can be skipped with Enter / Space once the pad is live.
   From the release zip instead of Setup: RecompLauncher sets the game up from your
