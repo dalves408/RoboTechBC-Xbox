@@ -13,6 +13,10 @@
  * <dest_dir>\.rbx-imported is removed first and written last, only when every file is in place and checked: Setup
  * takes it as the sign of a finished install, so a run cut short never looks finished.
  *
+ *   rbx_import --check <source>
+ * only checks that <source> is the supported disc (as far as its default.xbe) and writes nothing: Setup runs it on
+ * the disc page's Next.
+ *
  * Exit codes: 0 ok, 2 source not found, 3 not an Xbox disc image, 4 not the supported disc, 5 files missing or
  * damaged, 6 cannot write. */
 #include <windows.h>
@@ -36,6 +40,7 @@ static unsigned long long g_base, g_img_len;
 static DiscFile g_disc[MANIFEST_COUNT];
 static unsigned long long g_xbe_sector, g_xbe_size;
 static int g_xbe_found;
+static int g_check;      /* --check: stop once the disc is known to be the right one; nothing is written */
 static int g_launcher;   /* RecompLauncher's setup step: "progress <0..1> <text>" lines and plain error sentences */
 
 #define ERR(msg) printf("%s" msg, g_launcher ? "" : "ERROR ")
@@ -255,6 +260,7 @@ static int import_image(const WCHAR *image)
         ERR("This is not the supported " GAME_NAME " disc (" GAME_RELEASE "): its default.xbe differs.\n");
         return 4;
     }
+    if (g_check) return 0;
     progress();
     for (i = 0; i < MANIFEST_COUNT; i++) {
         WCHAR dst[MAX_PATH];
@@ -317,6 +323,7 @@ static int import_folder(const WCHAR *source)
         ERR("This is not the supported " GAME_NAME " disc (" GAME_RELEASE "): its default.xbe differs.\n");
         return 4;
     }
+    if (g_check) return 0;
     progress();
     for (i = 0; i < MANIFEST_COUNT; i++) {
         WCHAR src[MAX_PATH], dst[MAX_PATH];
@@ -397,8 +404,19 @@ int rbx_import_installed(const WCHAR *dest)
 #ifndef RBX_IMPORT_NO_MAIN
 int wmain(int argc, wchar_t **argv)
 {
+    if (argc == 3 && !wcscmp(argv[1], L"--check")) {
+        DWORD attr = GetFileAttributesW(argv[2]);
+        int r;
+        g_check = 1;
+        if (attr == INVALID_FILE_ATTRIBUTES) { ERR("The disc image or folder was not found.\n"); return 2; }
+        r = (attr & FILE_ATTRIBUTE_DIRECTORY) ? import_folder(argv[2]) : import_image(argv[2]);
+        if (g_img != INVALID_HANDLE_VALUE) CloseHandle(g_img);
+        if (!r) printf("OK this is the supported disc\n");
+        return r;
+    }
     if (argc != 3) {
-        printf("usage: rbx_import <disc image, drive or folder> <dest folder>\n");
+        printf("usage: rbx_import <disc image, drive or folder> <dest folder>\n"
+               "       rbx_import --check <disc image, drive or folder>\n");
         return 2;
     }
     return rbx_import_run(argv[1], argv[2], 0);

@@ -75,8 +75,8 @@ Source: "{#BuildDir}\vcruntime140.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README.txt"; DestDir: "{app}"; Flags: ignoreversion isreadme
 ; RecompLauncher reads it from the game folder (Bring Your Recomps): how to set up and start the game
 Source: "..\recomplauncher.json"; DestDir: "{app}"; Flags: ignoreversion
-; the import tool only runs during setup; it is not installed
-Source: "{#BuildDir}\rbx_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
+; the import tool only runs during setup (the disc page's check, then the copy); it is not installed
+Source: "{#BuildDir}\rbx_import.exe"; Flags: dontcopy
 #ifdef HasTextures
 ; the hi-res texture pack's download helper, run from Setup's temp folder when the texture task is chosen
 Source: "{#BuildDir}\rbx_texture_download.exe"; Flags: dontcopy
@@ -414,6 +414,38 @@ begin
 #endif
 end;
 
+function ImportTool: String;
+begin
+  Result := ExpandConstant('{tmp}\rbx_import.exe');
+  if not FileExists(Result) then ExtractTemporaryFile('rbx_import.exe');
+end;
+
+{ The disc page's Next: the importer checks that this is the supported disc (its default.xbe) before anything is
+  installed, so a wrong file is turned away here rather than after the programs are copied. }
+function DiscIsSupported(Source: String): Boolean;
+var
+  Code: Integer;
+  Msg: String;
+begin
+  WizardForm.NextButton.Enabled := False;
+  try
+    if not Exec(ImportTool, '--check "' + Source + '"', '', SW_HIDE, ewWaitUntilTerminated, Code) then Code := 99;
+  finally
+    WizardForm.NextButton.Enabled := True;
+  end;
+  Result := Code = 0;
+  if Result then Exit;
+  case Code of
+    2: Msg := 'The disc image or folder could not be found.';
+    3: Msg := 'That file is not an Xbox disc image.';
+    4: Msg := 'That is not the supported Robotech: Battlecry disc (Xbox, USA). Select your own copy of that disc.';
+    5: Msg := 'The disc image is damaged or incomplete. The dump may be bad.';
+  else
+    Msg := 'The disc could not be checked (code ' + IntToStr(Code) + ').';
+  end;
+  if not WizardSilent then MsgBox(Msg, mbError, MB_OK) else Log('disc check: ' + Msg);
+end;
+
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
@@ -447,7 +479,9 @@ begin
     begin
       MsgBox('Select an existing disc image or folder.', mbError, MB_OK);
       Result := False;
-    end;
+    end
+    else if not DiscIsSupported(Trim(SrcEdit.Text)) then
+      Result := False;
   end;
 end;
 
@@ -511,7 +545,7 @@ begin
     WizardForm.ProgressGauge.Position := 0;
     LastError := '';
     Params := '"' + Trim(SrcEdit.Text) + '" "' + ExpandConstant('{app}\game_files') + '"';
-    if not ExecAndLogOutput(ExpandConstant('{tmp}\rbx_import.exe'), Params, '', SW_HIDE,
+    if not ExecAndLogOutput(ImportTool, Params, '', SW_HIDE,
         ewWaitUntilTerminated, Code, @ImportLog) then
       Code := 99;
     if Code <> 0 then
