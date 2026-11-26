@@ -33,6 +33,7 @@
 #include <dbghelp.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <io.h>
 #include <stdbool.h>
 #include <string.h>
 #include <wchar.h>
@@ -440,6 +441,46 @@ static LONG WINAPI crash_filter(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* Started from a shortcut (Setup's Start menu entry) nothing catches stderr, so
+ * the log goes to logs\run_<date>_<time>.log beside the exe, as Play.bat did.
+ * A launcher or console that already redirects stderr keeps it. The newest 20
+ * logs are kept. RECOMP_LOG_FILE=0 turns this off. */
+static void log_to_file(void)
+{
+    HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    const char *e = getenv("RECOMP_LOG_FILE");
+    char path[MAX_PATH];
+    SYSTEMTIME t;
+    if (e && e[0] == '0') return;
+    if (h && h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_UNKNOWN) return;
+    CreateDirectoryA("logs", NULL);
+    {   /* prune: keep the 19 newest, so 20 with this one */
+        WIN32_FIND_DATAA fd;
+        HANDLE f = FindFirstFileA("logs\\run_*.log", &fd);
+        char names[256][64];
+        int n = 0, i, j;
+        if (f != INVALID_HANDLE_VALUE) {
+            do { if (n < 256 && strlen(fd.cFileName) < 64) strcpy(names[n++], fd.cFileName); } while (FindNextFileA(f, &fd));
+            FindClose(f);
+        }
+        for (i = 1; i < n; i++)          /* names sort by time: run_YYYYMMDD_HHMMSS.log */
+            for (j = i; j > 0 && strcmp(names[j - 1], names[j]) > 0; j--) {
+                char tmp[64]; strcpy(tmp, names[j]); strcpy(names[j], names[j - 1]); strcpy(names[j - 1], tmp);
+            }
+        for (i = 0; i + 19 < n; i++) {
+            snprintf(path, sizeof path, "logs\\%s", names[i]);
+            DeleteFileA(path);
+        }
+    }
+    GetLocalTime(&t);
+    snprintf(path, sizeof path, "logs\\run_%04u%02u%02u_%02u%02u%02u.log",
+             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    if (freopen(path, "w", stderr)) {
+        setvbuf(stderr, NULL, _IONBF, 0);
+        SetStdHandle(STD_ERROR_HANDLE, (HANDLE)_get_osfhandle(_fileno(stderr)));
+    }
+}
+
 /* ── WinMain ───────────────────────────────────────────────── */
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
@@ -459,6 +500,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     if (!portable_paths()) {
         fprintf(stderr, "Could not initialize portable game paths. Check the installation and save folder paths.\n");
+        return 1;
+    }
+    log_to_file();
+    if (GetFileAttributesA(YOUR_GAME_XBE_PATH) == INVALID_FILE_ATTRIBUTES) {
+        fprintf(stderr, "game_files\\default.xbe is missing beside the exe.\n");
+        MessageBoxA(NULL, "The game files are missing (game_files\\default.xbe).\n\n"
+                    "Run Setup again with this folder and select your Robotech: Battlecry disc image or folder.",
+                    "Robotech: Battlecry Recomp", MB_OK | MB_ICONERROR);
         return 1;
     }
 
