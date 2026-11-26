@@ -2754,8 +2754,39 @@ static int ip_persp(const float *m)
     for (i = 0; i < 16; i++) if (fabsf(m[i]) > big) big = fabsf(m[i]);
     return w > big * 1e-6f;
 }
-/* GPU vertex-program batch: blended constants into *k, and for level 2 a pretransformed batch's positions into a
- * scratch copy of the inputs (*in). */
+/* Level 1 and screen-space draws. A HUD element that follows something in the world (the target marker around an
+ * enemy, the lock-on brackets) is placed by the game once per tick, at the tick's screen position, while the world
+ * under it is blended: left alone it steps 30 times a second against a target that moves smoothly, and shakes.
+ * Such a marker moves as one piece, so level 1 blends a screen-space draw when every vertex moved by the same
+ * amount since the last tick (within a pixel or two, which allows the slow growth of a marker as its target comes
+ * closer). Text whose glyphs change, a radar sweep or an animated gauge do not move as one piece and stay as the
+ * game drew them; a draw that did not move is the same either way. Level 2 blends every matched screen-space draw.
+ * pos/stride: the matched draw's positions as recorded (x, y first); cur/cstride: this tick's. */
+static int ip_screen_rigid(const float *pos, uint32_t pstride, const float *cur, uint32_t cstride, uint32_t nv)
+{
+    float dx0, dy0, minx = 1e30f, maxx = -1e30f, miny = 1e30f, maxy = -1e30f, tol;
+    uint32_t i;
+    if (s_ip >= 2) return 1;
+    if (!nv) return 0;
+    dx0 = cur[0] - pos[0]; dy0 = cur[1] - pos[1];
+    for (i = 0; i < nv; i++) {
+        const float *c = (const float *)((const uint8_t *)cur + (size_t)i * cstride);
+        if (c[0] < minx) minx = c[0];
+        if (c[0] > maxx) maxx = c[0];
+        if (c[1] < miny) miny = c[1];
+        if (c[1] > maxy) maxy = c[1];
+    }
+    tol = 1.5f + 0.04f * ((maxx - minx) > (maxy - miny) ? (maxx - minx) : (maxy - miny));
+    if (fabsf(dx0) + fabsf(dy0) < 0.25f) return 0;   /* did not move: nothing to blend */
+    for (i = 1; i < nv; i++) {
+        const float *a = (const float *)((const uint8_t *)pos + (size_t)i * pstride);
+        const float *c = (const float *)((const uint8_t *)cur + (size_t)i * cstride);
+        if (fabsf((c[0] - a[0]) - dx0) > tol || fabsf((c[1] - a[1]) - dy0) > tol) return 0;
+    }
+    return 1;
+}
+/* GPU vertex-program batch: blended constants into *k, and for a pretransformed batch (level 2, or a rigid move at
+ * level 1: ip_screen_rigid) its blended positions in a scratch copy of the inputs (*in). */
 static void ip_gvs(int prog, const Nv2aBatch *b, const RbxGvs *g, uint32_t nidx, RbxGvsConst *k, const float **in)
 {
     static float *scratch; static uint32_t scratch_n;
@@ -2763,7 +2794,6 @@ static void ip_gvs(int prog, const Nv2aBatch *b, const RbxGvs *g, uint32_t nidx,
     uint32_t tex = b->texture ? b->texture->offset : 0, nv = b->count, stride = g->nin * 16u;
     const IpDraw *m;
     int screen = prog == RBX_GVS_BA9E;
-    if (screen && s_ip < 2) return;
     if (!screen && !ip_persp(&g->k.cu[0][0])) return;
     key = ip_hash(key, &prog, sizeof prog); key = ip_hash(key, &nv, sizeof nv); key = ip_hash(key, &nidx, sizeof nidx);
     key = ip_hash(key, &tex, sizeof tex);
@@ -2788,6 +2818,7 @@ static void ip_gvs(int prog, const Nv2aBatch *b, const RbxGvs *g, uint32_t nidx,
         uint32_t i;
         float *w;
         if (m->vn != nv || !nv) return;
+        if (!ip_screen_rigid(&A->v[m->voff * 4], 16u, (const float *)g->in, stride, nv)) return;
         if (scratch_n < nv * stride) { free(scratch); scratch = (float *)malloc(nv * stride); scratch_n = scratch ? nv * stride : 0; if (!scratch) return; }
         memcpy(scratch, g->in, (size_t)nv * stride);
         for (i = 0; i < nv; i++)
@@ -2851,7 +2882,7 @@ static const Nv2aBatch *ip_cpu(const Nv2aSurface *s, const Nv2aBatch *b, Nv2aBat
     uint32_t st[4] = { r->blend_enable | r->blend_src << 1, r->blend_dst, r->depth_test_enable | r->alpha_test_enable << 1, r->color_mask };
     const IpDraw *m;
     IpList *A;
-    if (s_ip < 2 || !nv || s_ip_in_ffp) return b;
+    if (s_ip < 1 || !nv || s_ip_in_ffp) return b;
     key = ip_hash(key, &nv, sizeof nv); key = ip_hash(key, &idx, sizeof idx); key = ip_hash(key, &tex, sizeof tex);
     key = ip_hash(key, st, sizeof st); key = ip_hash(key, &s->color_va, sizeof s->color_va);
     ch = key;
@@ -2864,6 +2895,7 @@ static const Nv2aBatch *ip_cpu(const Nv2aSurface *s, const Nv2aBatch *b, Nv2aBat
         const Nv2aVertex *v = &b->vertices[i];
         if (fabsf(a[0] - v->x) > (float)s->width / 8 || fabsf(a[1] - v->y) > (float)s->height / 8 || (a[3] > 0) != (v->rhw > 0)) { st_ip_jump++; return b; }
     }
+    if (!ip_screen_rigid(&A->v[m->voff * 4], 16u, &b->vertices[0].x, (uint32_t)sizeof(Nv2aVertex), nv)) return b;
     if (scratch_n < nv) { free(scratch); scratch = (Nv2aVertex *)malloc(nv * sizeof *scratch); scratch_n = scratch ? nv : 0; if (!scratch) return b; }
     memcpy(scratch, b->vertices, nv * sizeof *scratch);
     for (i = 0; i < nv; i++) {
@@ -3028,7 +3060,7 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     if (!gb_ready() || !b->count) return;
     if (g_rbx_gvs.prog) { gb_draw_gvs(s, b); return; }
     s_tr_cpu++; s_tr_cpu_va = s->color_va;
-    if (ip_on() >= 2) b = ip_cpu(s, b, &ip_b);
+    if (ip_on() >= 1) b = ip_cpu(s, b, &ip_b);
     if (sr_on()) {   /* RECOMP_RBX_SIMRATE: quantised positions, colour and UVs of (up to) the first 256 vertices */
         uint32_t k, n = b->count < 256u ? b->count : 256u;
         for (k = 0; k < n; k++) {
