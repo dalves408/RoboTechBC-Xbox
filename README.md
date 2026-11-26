@@ -196,4 +196,6 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 
 ## License / ownership
 
+The code in this repository is licensed under the GNU General Public License v3.0; see [LICENSE](LICENSE). Code adapted from xboxrecomp (MIT) and other projects keeps its original notices.
+
 Robotech: Battlecry is a commercial game. Provide your own legally obtained Xbox ISO. This repo publishes only recomp/port engineering work — not game assets or binaries.
