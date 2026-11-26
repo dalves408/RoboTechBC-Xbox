@@ -2782,8 +2782,21 @@ static int ip_screen_rigid(const float *pos, uint32_t pstride, const float *cur,
         if (c[1] < miny) miny = c[1];
         if (c[1] > maxy) maxy = c[1];
     }
-    tol = 1.5f + 0.04f * ((maxx - minx) > (maxy - miny) ? (maxx - minx) : (maxy - miny));
-    if (fabsf(dx0) + fabsf(dy0) < 0.25f) return 0;   /* did not move: nothing to blend */
+    /* The target marker is drawn in pieces (arcs, ticks, the lock reticle) that also turn and pulse as they follow
+     * the target, so a piece moves as one piece only loosely: allow each vertex a third of the piece's size off the
+     * common move. Under the old 4% only some pieces were blended and the rest stepped at 30 Hz, so the marker's
+     * pieces drifted apart and back every tick. Text and gauges that change shape by more stay as drawn. */
+    tol = 1.5f + 0.35f * ((maxx - minx) > (maxy - miny) ? (maxx - minx) : (maxy - miny));
+    {
+        float moved = 0.0f;
+        for (i = 0; i < nv && moved < 0.25f; i++) {
+            const float *a = (const float *)((const uint8_t *)pos + (size_t)i * pstride);
+            const float *c = (const float *)((const uint8_t *)cur + (size_t)i * cstride);
+            float d = fabsf(c[0] - a[0]) + fabsf(c[1] - a[1]);
+            if (d > moved) moved = d;
+        }
+        if (moved < 0.25f) return 0;   /* no vertex moved (a turning piece can keep its first one): nothing to blend */
+    }
     for (i = 1; i < nv; i++) {
         const float *a = (const float *)((const uint8_t *)pos + (size_t)i * pstride);
         const float *c = (const float *)((const uint8_t *)cur + (size_t)i * cstride);
