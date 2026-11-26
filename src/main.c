@@ -604,6 +604,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             if (!getenv(defs[i].name))
                 _putenv_s(defs[i].name, defs[i].value);
         }
+        /* RecompLauncher's Big Picture mode (RECOMPLAUNCHER_MODE=bigpicture): start fullscreen for this run, as players
+         * on a controller expect. settings.ini is left as it is; RECOMP_FULLSCREEN set by hand still wins. */
+        {
+            const char *mode = getenv("RECOMPLAUNCHER_MODE");
+            if (mode && !_stricmp(mode, "bigpicture") && !getenv("RECOMP_FULLSCREEN"))
+                _putenv_s("RECOMP_FULLSCREEN", "1");
+        }
         /* The toolkit reads RECOMP_IRQL_UNSTICK as present/absent. */
         {
             const char *v = getenv("RECOMP_IRQL_UNSTICK");
