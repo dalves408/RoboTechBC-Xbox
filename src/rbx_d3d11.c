@@ -2861,9 +2861,12 @@ int rbx_ip_ffp_begin(const void *key_data, size_t key_bytes, float composite[16]
     const IpDraw *m;
     uint64_t key = 1469598103934665603ULL, ch;
     unsigned i;
+    if (!ip_on()) { s_ip_in_ffp = 1; return 0; }
+    /* An orthographic composite is the HUD (the target marker, gauges): not blended here, but left to the CPU path
+     * (ip_cpu), which blends a screen-space draw that moved as one piece. Marking it as fixed-function here kept the
+     * marker out of that, so it stepped 30 times a second. */
+    if (!ip_persp(composite)) { s_ip_in_ffp = 0; return 0; }
     s_ip_in_ffp = 1;
-    if (!ip_on()) return 0;
-    if (!ip_persp(composite)) return 0;
     key = ip_hash(key, "ffp", 3);
     key = ip_hash(key, key_data, key_bytes);
     ch = ip_hash(key, composite, 16 * sizeof(float));
