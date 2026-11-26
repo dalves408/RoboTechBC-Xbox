@@ -191,7 +191,7 @@ static DWORD WINAPI pad_scan_main(LPVOID arg)
         if (dt >= 4 && logged++ < 20)
             fprintf(stderr, "[PAD] rescan took %u ms on the pad thread (the game kept the last pad state)\n", (unsigned)dt);
     }
-    return 0;
+    /* not reached: the loop never ends */
 }
 
 static void ensure_init(void)
