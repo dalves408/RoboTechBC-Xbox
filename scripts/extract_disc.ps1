@@ -1,12 +1,21 @@
 param(
     [string]$Iso = (Join-Path (Split-Path $PSScriptRoot -Parent) 'Robotech - Battlecry (USA).xiso.iso'),
-    [string]$Destination = (Join-Path (Split-Path $PSScriptRoot -Parent) 'game_files')
+    [string]$Destination = (Join-Path (Split-Path $PSScriptRoot -Parent) 'game_files'),
+    # extract-xiso.exe: -ExtractXiso, else $env:RBX_EXTRACT_XISO, else tools\extract-xiso.exe, else PATH.
+    [string]$ExtractXiso = $env:RBX_EXTRACT_XISO
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
-$extract = '<tools>\tools\xiso\artifacts\extract-xiso.exe'
+$extract = $ExtractXiso
+if (-not $extract) {
+    $extract = Join-Path $projectRoot 'tools\extract-xiso.exe'
+    if (-not (Test-Path -LiteralPath $extract)) {
+        $cmd = Get-Command extract-xiso.exe -ErrorAction SilentlyContinue
+        if ($cmd) { $extract = $cmd.Source }
+    }
+}
 if (-not (Test-Path -LiteralPath $extract)) {
-    throw "extract-xiso not found at $extract"
+    throw "extract-xiso not found. Pass -ExtractXiso <path>, set RBX_EXTRACT_XISO, put it in tools\, or add it to PATH."
 }
 if (-not (Test-Path -LiteralPath $Iso)) {
     throw "ISO not found: $Iso"

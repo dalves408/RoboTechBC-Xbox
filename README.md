@@ -2,7 +2,7 @@
 
 Windows recompilation / port of the original Xbox **Robotech: Battlecry** disc, built with [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) and a DX11 present path.
 
-This repository holds the **game project** sources, scripts, and pinned USB patches. It does **not** ship the commercial disc, extracted `game_files\`, or the shared xboxrecomp toolkit tree (on the build PC that toolkit is a local junction at `tools\xboxrecomp` → `<tools>\tools\xboxrecomp`).
+This repository holds the **game project** sources, scripts, and pinned USB patches. It does **not** ship the commercial disc, extracted `game_files\`, or the xboxrecomp toolkit tree (`scripts\setup.ps1` clones it into `tools\xboxrecomp`).
 
 ## Current status (2026-11-11)
 
@@ -10,7 +10,7 @@ This repository holds the **game project** sources, scripts, and pinned USB patc
 | --- | --- |
 | Title / menus | Working (DX11, letterboxed 4:3). Menu flashing fixed (BlockOnFence spurious-wake recheck). 130+ fps. |
 | Controls | Working (bak OHCI, keyboard + USB pad); verified in-mission (stick, START pause menu). |
-| Ch1 mission | Plays live: world, HUD, radar, enemies, weapons. 60–80 fps (min 59 over a 100 s soak), no hangs. The previous "frozen cinematic" was the unresolved stub at 0x1166C (see `src/recomp_manual.c`), so the `RECOMP_M101_CINE_SHORT` overlay is no longer needed — it was a workaround, not a fix. |
+| Ch1 mission | Plays live: world, HUD, radar, enemies, weapons. 60–80 fps (min 59 over a 100 s soak), no hangs. The previous "frozen cinematic" was the unresolved stub at 0x1166C (see `src/recomp_manual.c`). |
 | Audio | Music, SFX and VO play; no underruns or clipping in the mix. Intro movie (Bink) audio is in sync and clean: the pinned voice processor (`patches\apu_vp_rbx.c`) waits out the title's VOICE_LOCK instead of skipping frames, which previously made the movie stream drift and get overwritten. |
 | Open | A rare (~1 in 13 runs) main-menu stall; `rbx_diag.py` now dumps all thread stacks when it recurs. |
 
@@ -22,7 +22,7 @@ This repository holds the **game project** sources, scripts, and pinned USB patc
 | Extracted tree | `game_files\` |
 | Main XBE | `game_files\default.xbe` (Title ID `544D0002`) |
 
-## Play (the build PC)
+## Play
 
 Double-click or run:
 
@@ -68,18 +68,13 @@ Both have a **CONTROLS** page. Every keyboard control above can be rebound (two 
 
 Video settings include 1×–5× internal resolution, borderless fullscreen, aspect-correct or stretched output, native widescreen (Off, Auto from the window, 16:9, 16:10, 21:9; see [docs/widescreen.md](docs/widescreen.md)), VSync, 30–360 FPS presentation limits or uncapped presentation, 2×/4×/8× MSAA where supported, 2×–16× anisotropic filtering, and hi-res texture replacements. The presentation limit leaves the Xbox game clock unchanged. Settings are saved to `settings.ini`.
 
-### Short Ch1 cinematic overlay (obsolete)
-
-`scripts\build_m101_cine_overlay.ps1` / `scripts\drive_ch1_overlay.ps1` (`RECOMP_M101_CINE_SHORT`) were a workaround for the frozen Ch1 cinematic. That freeze is fixed (stub 0x1166C), so the overlay is no longer needed; the scripts are kept for reference only.
-
 ## Build from scratch
 
-Needs Visual Studio 2022 Build Tools (MSVC), CMake, Python 3.12, Git, `extract-xiso`, and a local xboxrecomp checkout linked or copied as `tools\xboxrecomp`.
+Needs Visual Studio 2022 Build Tools (MSVC), CMake, Python 3.12, Git, and `extract-xiso` (put it in `tools\`, on `PATH`, or pass `-ExtractXiso <path>`). `setup.ps1` clones the pinned xboxrecomp revision into `tools\xboxrecomp`; set `RBX_SHARED_TOOLS` to a folder that already holds an `xboxrecomp` checkout to junction that instead.
 
 Place the SDL3 Windows x64 development package (3.4.20) beside the xboxrecomp checkout as `SDL3-3.4.20`, or set CMake's `RBX_SDL3_ROOT` to its location. The build copies `SDL3.dll` beside the executable.
 
 ```powershell
-cd "<repo>"
 .\scripts\setup.ps1
 .\scripts\extract_disc.ps1
 .\.venv\Scripts\python.exe scripts\pipeline.py --lift
@@ -89,13 +84,13 @@ cd "<repo>"
 
 The packaged game is portable. Keep the executable, DLLs, and `game_files` together. Xbox disk partitions are emulated in memory. Saves and other Xbox filesystem data go in `SaveData`, video settings in `settings.ini`, and optional replacement textures in `texture_pack`. The launcher keeps screenshots and logs in the same installation folder. Move the whole folder to carry your settings and saves with it.
 
-## Private test release
+## Local test package
 
 ```powershell
 python scripts\package_release.py --version 1.0
 ```
 
-Writes `dist\RobotechBC_Recomp_v<ver>_test.zip` (+ `.sha256`): exe, pdb, `vcruntime140.dll`, `SDL3.dll`, the disc `game_files\` (bring-up leftovers excluded), `Play.bat` (sets the play env; saves to `SaveData\`, logs to `logs\`) and `README.txt`. The game uses the Windows copy of `D3DCompiler_47.dll`. It contains game data: private testing on owned machines only, never commit or share `dist\`. Test an unzipped copy with `rbx_diag.py --exe <dir>\robotech_bc_recomp.exe --cwd <dir>`.
+Writes `dist\RobotechBC_Recomp_v<ver>_test.zip` (+ `.sha256`): exe, pdb, `vcruntime140.dll`, `SDL3.dll`, the disc `game_files\` (bring-up leftovers excluded), `Play.bat` (sets the play env; saves to `SaveData\`, logs to `logs\`) and `README.txt`. The game uses the Windows copy of `D3DCompiler_47.dll`. It contains data from your own disc: keep it on your own machines, and never commit or share `dist\`. Test an unzipped copy with `rbx_diag.py --exe <dir>\robotech_bc_recomp.exe --cwd <dir>`.
 
 ## Diagnostics
 
@@ -161,7 +156,7 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 | `RECOMP_XF_SPIN_US=n` | How long an idle vertex-transform worker spins before sleeping (default 200 µs). |
 | `RECOMP_XF_CONVCACHE=0` | A/B only: convert every triangle's vertices again instead of once per vertex per batch. |
 | `RECOMP_GPU_INDEXED=0` | A/B only: hand program batches to D3D11 as three full vertices per triangle instead of unique vertices plus an index buffer. |
-| `RECOMP_GPU_FLUSH=N` | Fallback for GPU drivers that show corrupted or flickering draws: flush the D3D11 queue after draws. `1` after glyph (text) draws, `2` after every textured draw, `3` after every draw. Default `0`. `3` used to be the default on Intel, but it cost about 3.5x in fps on the test laptop's UHD and fixed nothing there; try it only if an Intel GPU shows corruption. |
+| `RECOMP_GPU_FLUSH=N` | Fallback for GPU drivers that show corrupted or flickering draws: flush the D3D11 queue after draws. `1` after glyph (text) draws, `2` after every textured draw, `3` after every draw. Default `0`. `3` used to be the default on Intel, but it cost about 3.5x in fps on an Intel UHD laptop and fixed nothing there; try it only if an Intel GPU shows corruption. |
 | `RECOMP_RBX_WIDE_CULL=0` | A/B only: the game culls against its own 4:3 view again in widescreen, so objects pop in at the side edges (see docs/widescreen.md). |
 | `RECOMP_FFP_FOG=0` | A/B only: fixed-function meshes (mission world, terrain, buildings, sky) get no distance fog again, as before the fog-coordinate fix. The log says once per mode `[RBX XF] fixed-function fog: gen mode …`. |
 | `RECOMP_GPU_CLIP=0` | A/B or fallback: clip transformed batches at the near plane and back-face cull them on the CPU, as before, instead of on the GPU (default on). |
@@ -178,20 +173,19 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 ## Hard constraints (do not regress)
 
 1. **No `RECOMP_USB_SYNTH_TD` / `RECOMP_USB_XAPI_TD`** — SYNTH crashes this title’s XAPI ISR; keep bak OHCI pinned.
-2. **`RECOMP_SWM5_PACE_MS=0`** on the tester’s menu play path.
+2. **`RECOMP_SWM5_PACE_MS=0`** on the menu play path.
 3. **Full intros** for interactive testing unless explicitly asked to skip.
-4. **Never leave `m101_f.lvl` dirty.**
-5. **Run `scripts\patch_kickoff_yield.ps1` after every lift** (`build.ps1` does it): it re-applies the hand fixes to the gitignored `src\recomp\gen`.
+4. **Run `scripts\patch_kickoff_yield.ps1` after every lift** (`build.ps1` does it): it re-applies the hand fixes to the gitignored `src\recomp\gen`.
 
 ## Layout
 
 | Path | Role |
 | --- | --- |
 | `src\` | Host entry (`main.c`), DX11 present (`rbx_d3d11.c`), recomp stubs |
-| `scripts\` | Setup, extract, lift/build, gen patcher, Ch1 drive helpers |
+| `scripts\` | Setup, extract, lift/build, gen patcher |
 | `scripts\diag\` | Diagnostic harness, stack dumper, flash scanner |
 | `patches\` | Pinned bak OHCI (`ohci.c.dx11bak`, `ohci_rbx_pinned.c`) |
-| `docs\` | Milestone notes checked into this tree |
+| `docs\` | Design notes and UI screenshots |
 | `test_game.bat` | Interactive play launcher |
 
 ## License / ownership

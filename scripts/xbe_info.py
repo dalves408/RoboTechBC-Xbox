@@ -80,5 +80,5 @@ def analyze(path: Path) -> None:
 
 
 if __name__ == "__main__":
-    target = Path(sys.argv[1] if len(sys.argv) > 1 else r"<repo>\\game_files\\default.xbe")
+    target = Path(sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parent.parent / "game_files" / "default.xbe"))
     analyze(target)
