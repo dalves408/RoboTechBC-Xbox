@@ -37,7 +37,7 @@ __pycache__/
 # Generated recompiled code
 src/recomp/gen/
 
-# Shared toolkit junction (lives at <tools>\tools\xboxrecomp; not this repo)
+# xboxrecomp toolkit checkout or junction (not part of this repo)
 tools/
 
 # Game files / disc images (keep local; do not publish)

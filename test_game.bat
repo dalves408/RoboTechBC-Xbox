@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 rem Double-click: cold-boot with full intros + pad/keyboard menu hand-drive.
-rem Same idea as other xboxrecomp projects\run_menu_test.bat:
+rem Input notes:
 rem   raw keyboard INPUTSINK + async GetAsyncKeyState (console may keep focus)
 rem   A/Enter/Space/Z skips guest Bink/Attract and host FMV
 rem Delete dumps a screenshot under screenshots\.

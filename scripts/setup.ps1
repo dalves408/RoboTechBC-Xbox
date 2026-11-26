@@ -1,4 +1,9 @@
-param([switch]$SkipPython)
+param(
+    [switch]$SkipPython,
+    # Optional folder holding shared checkouts (xboxrecomp, Xbox-Debug-Kit) to
+    # junction instead of cloning. Defaults to $env:RBX_SHARED_TOOLS.
+    [string]$SharedTools = $env:RBX_SHARED_TOOLS
+)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
 $dependencies = Get-Content (Join-Path $projectRoot 'dependencies.json') -Raw | ConvertFrom-Json
@@ -7,11 +12,11 @@ New-Item -ItemType Directory -Force (Join-Path $projectRoot 'tools') | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $projectRoot 'analysis') | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $projectRoot 'src\recomp\gen') | Out-Null
 
-# Prefer the build PC's shared toolkit via junctions rather than cloning another copy.
-$sharedXboxrecomp = '<tools>\tools\xboxrecomp'
+# Prefer a shared toolkit checkout via a junction rather than cloning another copy.
+$sharedXboxrecomp = if ($SharedTools) { Join-Path $SharedTools 'xboxrecomp' } else { '' }
 $localXboxrecomp = Join-Path $projectRoot 'tools\xboxrecomp'
 if (-not (Test-Path -LiteralPath $localXboxrecomp)) {
-    if (Test-Path -LiteralPath $sharedXboxrecomp) {
+    if ($sharedXboxrecomp -and (Test-Path -LiteralPath $sharedXboxrecomp)) {
         cmd /c mklink /J "$localXboxrecomp" "$sharedXboxrecomp" | Out-Null
     } else {
         & git clone $dependencies.xboxrecomp.url $localXboxrecomp
@@ -21,9 +26,9 @@ if (-not (Test-Path -LiteralPath $localXboxrecomp)) {
     }
 }
 
-$sharedDebugKit = '<tools>\Xbox-Debug-Kit'
+$sharedDebugKit = if ($SharedTools) { Join-Path $SharedTools 'Xbox-Debug-Kit' } else { '' }
 $localDebugKit = Join-Path $projectRoot 'tools\xbox-debug-kit'
-if ((Test-Path -LiteralPath $sharedDebugKit) -and -not (Test-Path -LiteralPath $localDebugKit)) {
+if ($sharedDebugKit -and (Test-Path -LiteralPath $sharedDebugKit) -and -not (Test-Path -LiteralPath $localDebugKit)) {
     cmd /c mklink /J "$localDebugKit" "$sharedDebugKit" | Out-Null
 }
 

@@ -2,22 +2,22 @@
 
 Status: shipped, default on (`RECOMP_GPU_VSH=0` and `RECOMP_GPU_CLIP=0` turn the two parts off).
 
-## Result (bench, build 06bdfd0 = PR head plus the WIP)
+## Result (build 06bdfd0)
 
 Stream-out verify (`RECOMP_GPU_VSH_VERIFY=64`): 0 mismatches on AMD 680M, RTX 3070, GTX 1650 and Intel UHD (0.5–0.7 M vertices each). Visuals identical in menus, briefing, cutscenes, HUD and flight; no crashes. Every 9CEE batch turned out to be an all-black outline pass, now skipped before transform on every path.
 
 | GPU | Mission median fps, CPU path → GPU path | Menus |
 | --- | --- | --- |
-| AMD 680M (dev PC) | 213 / 210 → 225 / 230 | 314 → 308–313 |
+| AMD Radeon 680M (Ryzen 7 6800H) | 213 / 210 → 225 / 230 | 314 → 308–313 |
 | RTX 3070 (1800X) | 158 → 174 | 278 → 305 |
-| GTX 1650 (test laptop) | 229–234 → 329–335 | 298–340 → 284–379 |
-| Intel UHD (test laptop) | 220–277 → 282–290 | 239 → 282–291 |
+| GTX 1650 (laptop) | 229–234 → 329–335 | 298–340 → 284–379 |
+| Intel UHD (laptop) | 220–277 → 282–290 | 239 → 282–291 |
 
 CPU use drops by 0.1–0.15 cores. GPU clipping on its own (no GPU vertex programs) cost 5–8% in menus, so it ships only together with the vertex programs.
 
 ## Why
 
-Measured on the dev PC (6800H / 680M) at 858a0c0, the pushbuffer thread is 100% busy and is what limits fps (~155 in missions). The CPU vertex-program interpreter (`vsh_run_dec` + `run_mac`) takes ~16–23% of that thread. Attribute fetch, the post-transform conversion and the clipper add ~20% more. A GPU vertex shader removes all of that from the bottleneck thread for program batches.
+Measured on a Ryzen 7 6800H / 680M at 858a0c0, the pushbuffer thread is 100% busy and is what limits fps (~155 in missions). The CPU vertex-program interpreter (`vsh_run_dec` + `run_mac`) takes ~16–23% of that thread. Attribute fetch, the post-transform conversion and the clipper add ~20% more. A GPU vertex shader removes all of that from the bottleneck thread for program batches.
 
 ## What the CPU path does today (toolkit v0.16.0-24-g342f22a)
 
@@ -61,12 +61,12 @@ Measured on the dev PC (6800H / 680M) at 858a0c0, the pushbuffer thread is 100% 
 0. GPU clipping and culling (`RECOMP_GPU_CLIP=1`): the CPU still transforms, but the indexed hand-off goes over unclipped and unculled. The back end's vertex shaders write the two near planes as `SV_ClipDistance0`, keep w's sign, leave z unclamped (depth clip off, so the rasterizer clamps per pixel), and rasterizer states cull with the NV2A state. This is the part of step 2 the translated shaders need anyway, and it removes the clipper (~17% of the thread) on its own.
 Shipped first instead of the translator (stage 1 below): hand-written HLSL for the 5 known programs (4 shaders; 892C and E031 are the same words) behind `RECOMP_GPU_VSH=1`, sharing `patches/rbx_gvs.h` between the executor and the back end, with `RECOMP_GPU_VSH_VERIFY=N` doing the stream-out comparison from stage 3. The translator is only needed if more programs turn up.
 
-1. Translator plus a host-side test that runs the CPU interpreter and an HLSL-equivalent C rendition of the generated code over recorded programs and inputs. A program dump (`RECOMP_VSH_DUMP`) from the bench supplies the corpus.
+1. Translator plus a host-side test that runs the CPU interpreter and an HLSL-equivalent C rendition of the generated code over recorded programs and inputs. A program dump (`RECOMP_VSH_DUMP`) from a test run supplies the corpus.
 2. Executor gathers raw inputs and constants; back end draws program batches with the generated VS behind `RECOMP_GPU_VSH=1`.
 3. Bench: visual check with per-draw position diffs (`RECOMP_GPU_VSH_VERIFY=1` transforms one vertex per draw on the CPU and compares it with a GPU stream-out readback), then fps and profile.
 4. Default on once stage 3 is clean on AMD, NVIDIA and Intel.
 
-## Needs from the bench / the tester
+## Prerequisites
 
 - A `RECOMP_VSH_DUMP` capture covering the menu, briefing and one mission. This gives the programs, constants and a few inputs per program for the translator tests.
-- The toolkit's `nv2a_vsh_interp.c` and `.h` (the version). The translator must match its decode exactly, so it should be patched in from this repo like `rbx_present.cmake`, or copied into `patches/`.
+- The toolkit's `nv2a_vsh_interp.c` and `.h` (the version this port was written against). The translator must match its decode exactly, so it should be patched in from this repo like `rbx_present.cmake`, or copied into `patches/`.
