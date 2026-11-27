@@ -3537,6 +3537,7 @@ extern volatile LONG rbx_input_guest_frame;
 static ID3D11Texture2D *s_share;
 static IDXGIKeyedMutex *s_share_mutex;
 static ID3D11Texture2D *s_share_retired;
+static ID3D11RenderTargetView *s_share_rtv;   /* SMAA's last pass draws into s_share through it */
 static uint32_t s_share_w, s_share_h;
 static int s_share_failed, s_share_on;
 static HANDLE s_share_handle;
@@ -3689,7 +3690,6 @@ static ID3D11RenderTargetView *s_smaa_rtv[2];
 static ID3D11ShaderResourceView *s_smaa_srv[2];
 static uint32_t s_smaa_w, s_smaa_h;
 static int s_smaa_failed;
-static ID3D11RenderTargetView *s_share_rtv;
 
 static void smaa_fail(const char *what)
 {
