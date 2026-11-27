@@ -39,12 +39,11 @@ static int mode, selected, yes, initialized, sdl_window_input, scenario_mode, pa
 static int page, col, listening;
 static const char *status;
 static RbxKeymap keymap;       /* CONTROLS: read by the game thread, changed by the menu */
-static volatile LONG block_input, hold_frame, video, available_msaa;
+static volatile LONG block_input, hold_frame, video;
 static DWORD release_at;
 static WORD last_pad;
 
 unsigned rbx_settings_video(void) { return (unsigned)InterlockedCompareExchange(&video, 0, 0); }
-void rbx_settings_msaa_supported(unsigned mask) { InterlockedExchange(&available_msaa, (LONG)mask); }
 int rbx_settings_input_blocked(void) { return InterlockedCompareExchange(&block_input, 0, 0) != 0; }
 void rbx_settings_wait(void)
 {
@@ -209,10 +208,7 @@ static void change_value(int direction)
     int count = (int)options[selected].count;
     if (!count) return;
     int value = (int)choice[selected];
-    unsigned mask = (unsigned)InterlockedCompareExchange(&available_msaa, 0, 0) | 1u;
-    do {
-        value = (value + count + direction) % count;
-    } while (selected == AA && !(mask & (1u << value)));
+    value = (value + count + direction) % count;
     if ((unsigned)value == choice[selected]) return;
     choice[selected] = (unsigned)value;
     apply_choice(selected);
@@ -433,12 +429,6 @@ void rbx_settings_tick(void)
     }
     sdl_window_input = rbx_sdl_window_tick(parent, rbx_settings_key, rbx_settings_input_blocked);
     if (scenario_mode) return;
-    unsigned mask = (unsigned)InterlockedCompareExchange(&available_msaa, 0, 0);
-    if (mask && !(mask & (1u << choice[AA]))) {
-        do { choice[AA]--; } while (!(mask & (1u << choice[AA])));
-        apply_choice(AA);
-        if (mode) paint_overlay();
-    }
     if (mode) position_overlay();
     else rbx_fb_focus_tick();
 
@@ -500,13 +490,7 @@ void rbx_settings_install(void)
     }
 
     for (int row = 0; row < CLOSE; row++) {
-        unsigned value = options[row].initial;
-        if (ini[0]) {
-            WCHAR key[32];
-            MultiByteToWideChar(CP_UTF8, 0, options[row].key, -1, key, 32);
-            value = GetPrivateProfileIntW(L"video", key, value, ini);
-        }
-        choice[row] = value < options[row].count ? value : options[row].initial;
+        choice[row] = ini[0] ? rbx_option_load(row, ini) : options[row].initial;
     }
     const char *fullscreen = getenv("RECOMP_FULLSCREEN");
     const char *vsync = getenv("RECOMP_PRESENT_VSYNC");

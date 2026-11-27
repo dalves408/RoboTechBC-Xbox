@@ -10,7 +10,7 @@ A native Windows port of the original Xbox **Robotech: Battlecry**, made by stat
 - **High frame rates.** Play at 30–360 FPS or uncapped, with VSync on or off. The game itself still runs at its original speed.
 - **Frame interpolation.** The game updates at 30 Hz, and interpolation blends the 3D world between those steps, so motion looks smooth at high frame rates. It's on by default and can be switched off in the F1 menu.
 - **Native widescreen.** Choose Off, Auto (follows the window), 16:9, 16:10 or 21:9. The view widens rather than stretching, and objects at the sides no longer pop in (see [docs/widescreen.md](docs/widescreen.md)).
-- **Sharper image.** 1×–5× internal resolution, 2×/4×/8× MSAA and 2×–16× anisotropic filtering.
+- **Sharper image.** 1×–5× internal resolution, SMAA anti-aliasing (Ultra preset) and 2×–16× anisotropic filtering.
 - **Hi-res texture pack (optional).** 1,086 of the game's textures, upscaled 4×. Install it with Setup or the separate Hi-Res Textures Setup.
 - **Controllers, keyboard and mouse.** Works with any controller SDL3 supports (Xbox, PlayStation, Switch and others), with rumble and hot-plugging. Two controllers give two players in Versus. Every keyboard control can be rebound, and the A/B and X/Y buttons can be swapped for Nintendo-style pads.
 - **Settings overlay and Config.exe.** Press F1 in the game, or hold Back and press Start on controller 1, to change video settings and controls while you play. `Config.exe` edits the same settings outside the game ([screenshot](docs/ui/config.png)).
@@ -210,11 +210,12 @@ python scripts\diag\perf_compare.py analysis\diag\base analysis\diag\xf4
 | `scripts\` | Setup, extract, lift/build, gen patcher |
 | `scripts\diag\` | Diagnostic harness, stack dumper, flash scanner |
 | `patches\` | Pinned bak OHCI (`ohci.c.dx11bak`, `ohci_rbx_pinned.c`) |
+| `third_party\smaa\` | [SMAA](https://github.com/iryoku/smaa) shader and lookup textures (MIT); `scripts\smaa_hlsl2h.py` embeds the shader |
 | `docs\` | Design notes and UI screenshots |
 | `test_game.bat` | Interactive play launcher |
 
 ## License / ownership
 
-The code in this repository is licensed under the GNU General Public License v3.0; see [LICENSE](LICENSE). Code adapted from xboxrecomp (MIT) and other projects keeps its original notices.
+The code in this repository is licensed under the GNU General Public License v3.0; see [LICENSE](LICENSE). Code adapted from xboxrecomp (MIT) and other projects keeps its original notices; SMAA (MIT) is under [third_party/smaa](third_party/smaa/LICENSE.txt).
 
 Robotech: Battlecry is a commercial game. Provide your own legally obtained Xbox ISO. This repo publishes only recomp/port engineering work — not game assets or binaries.

@@ -4,6 +4,7 @@
  * order is the menu order; the values stored are indexes into values[]. */
 #ifndef RBX_OPTIONS_H
 #define RBX_OPTIONS_H
+#include <windows.h>
 
 enum { RBX_OPT_SCALE, RBX_OPT_FULLSCREEN, RBX_OPT_STRETCH, RBX_OPT_WIDE, RBX_OPT_VSYNC,
        RBX_OPT_RATE, RBX_OPT_AA, RBX_OPT_ANISO, RBX_OPT_HIRES, RBX_OPT_INTERP, RBX_OPT_COUNT };
@@ -33,8 +34,9 @@ static const RbxOption rbx_options[RBX_OPT_COUNT] = {
      "Waits for the monitor's refresh: no tearing, slightly more input delay."},
     {"FPS limit", "rate", 7, 6, {"30 FPS", "60 FPS", "120 FPS", "144 FPS", "240 FPS", "360 FPS", "Uncapped"},
      "Caps how often frames are shown. The game's own clock is unchanged."},
-    {"Anti-aliasing", "msaa", 4, 0, {"Off", "2x MSAA", "4x MSAA", "8x MSAA"},
-     "Smooths jagged edges. Levels your GPU cannot do are skipped."},
+    /* SMAA Ultra on the finished frame (rbx_d3d11.c); it replaced 2x/4x/8x MSAA, saved under "msaa". */
+    {"Anti-aliasing", "smaa", 2, 0, {"Off", "SMAA Ultra"},
+     "Smooths jagged edges across the whole picture, HUD included."},
     {"Anisotropic filtering", "anisotropy", 5, 0, {"Off", "2x", "4x", "8x", "16x"},
      "Keeps ground and walls sharp at steep angles. Cheap on modern GPUs."},
     {"Hi-res textures", "hires", 2, 1, {"Off", "On"},
@@ -42,5 +44,18 @@ static const RbxOption rbx_options[RBX_OPT_COUNT] = {
     {"Frame interpolation", "interp", 2, 1, {"Off", "On"},
      "Smooths 3D motion between the game's 30 Hz steps. Turn it off if anything shakes or slides."},
 };
+
+/* A row's saved value from the [video] section of ini, or its default. Settings from before SMAA have no "smaa"
+ * key: any MSAA level they saved turns SMAA on. */
+static __inline unsigned rbx_option_load(int row, const WCHAR *ini)
+{
+    WCHAR key[32];
+    UINT v;
+    MultiByteToWideChar(CP_UTF8, 0, rbx_options[row].key, -1, key, 32);
+    v = GetPrivateProfileIntW(L"video", key, -1, ini);
+    if (v == (UINT)-1 && row == RBX_OPT_AA)
+        v = GetPrivateProfileIntW(L"video", L"msaa", 0, ini) ? 1u : 0u;
+    return v < rbx_options[row].count ? v : rbx_options[row].initial;
+}
 
 #endif
