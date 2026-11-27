@@ -74,7 +74,7 @@ Source: "{#BuildDir}\SDL3.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\SDL3-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; the Visual C++ runtime the game links against (an app-local copy, as the test releases had; build_installer.py puts it beside the programs)
 Source: "{#BuildDir}\vcruntime140.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "README.txt"; DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "README.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; RecompLauncher reads it from the game folder (Bring Your Recomps): how to set up and start the game
 Source: "..\recomplauncher.json"; DestDir: "{app}"; Flags: ignoreversion
 ; the import tool only runs during setup (the disc page's check, then the copy); it is not installed

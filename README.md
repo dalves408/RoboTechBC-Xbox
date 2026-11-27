@@ -1,53 +1,48 @@
-# Robotech: Battlecry (Xbox → Windows)
+# Robotech: Battlecry Recomp
 
 <a href="https://recomplauncher.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
 
-Windows recompilation / port of the original Xbox **Robotech: Battlecry** disc, built with [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) and a DX11 present path.
+A native Windows port of the original Xbox **Robotech: Battlecry**, made by static recompilation with [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) and drawn with Direct3D 11. The game runs from your own disc. This repository holds the port's source code only: no game files, no disc images and no Microsoft or Xbox code.
 
-This repository holds the **game project** sources, scripts, and pinned USB patches. It does **not** ship the commercial disc, extracted `game_files\`, or the xboxrecomp toolkit tree (`scripts\setup.ps1` clones it into `tools\xboxrecomp`).
+## Features
 
-## Current status (2026-11-11)
+- **The whole game.** Story mode, Training and Versus, with full intros, music, sound effects and voice.
+- **High frame rates.** Play at 30–360 FPS or uncapped, with VSync on or off. The game itself still runs at its original speed.
+- **Frame interpolation.** The game updates at 30 Hz, and interpolation blends the 3D world between those steps, so motion looks smooth at high frame rates. It's on by default and can be switched off in the F1 menu.
+- **Native widescreen.** Choose Off, Auto (follows the window), 16:9, 16:10 or 21:9. The view widens rather than stretching, and objects at the sides no longer pop in (see [docs/widescreen.md](docs/widescreen.md)).
+- **Sharper image.** 1×–5× internal resolution, 2×/4×/8× MSAA and 2×–16× anisotropic filtering.
+- **Hi-res texture pack (optional).** 1,086 of the game's textures, upscaled 4×. Install it with Setup or the separate Hi-Res Textures Setup.
+- **Controllers, keyboard and mouse.** Works with any controller SDL3 supports (Xbox, PlayStation, Switch and others), with rumble and hot-plugging. Two controllers give two players in Versus. Every keyboard control can be rebound, and the A/B and X/Y buttons can be swapped for Nintendo-style pads.
+- **Settings overlay and Config.exe.** Press F1 in the game, or hold Back and press Start on controller 1, to change video settings and controls while you play. `Config.exe` edits the same settings outside the game ([screenshot](docs/ui/config.png)).
+- **Portable.** Saves, settings, screenshots and logs stay in the game folder.
 
-| Area | State |
-| --- | --- |
-| Title / menus | Working (DX11, letterboxed 4:3). Menu flashing fixed (BlockOnFence spurious-wake recheck). 130+ fps. |
-| Controls | Working (bak OHCI, keyboard + USB pad); verified in-mission (stick, START pause menu). |
-| Ch1 mission | Plays live: world, HUD, radar, enemies, weapons. 60–80 fps (min 59 over a 100 s soak), no hangs. The previous "frozen cinematic" was the unresolved stub at 0x1166C (see `src/recomp_manual.c`). |
-| Audio | Music, SFX and VO play; no underruns or clipping in the mix. Intro movie (Bink) audio is in sync and clean: the pinned voice processor (`patches\apu_vp_rbx.c`) waits out the title's VOICE_LOCK instead of skipping frames, which previously made the movie stream drift and get overwritten. |
-| Open | A rare (~1 in 13 runs) main-menu stall; `rbx_diag.py` now dumps all thread stacks when it recurs. |
+## Requirements
 
-## Disc (local only — gitignored)
+- Windows 10 or 11, 64-bit
+- A graphics card with Direct3D 11 (feature level 11)
+- **Your own copy of Robotech: Battlecry for the original Xbox (USA).** Use a disc image (`.iso` or `.xiso`), or a folder or drive that holds `default.xbe`. Setup checks every file it copies.
+- About 4.5 GB of free disk space, plus 1.3 GB for the hi-res texture pack
 
-| Item | Path / name |
-| --- | --- |
-| XISO | `Robotech - Battlecry (USA).xiso.iso` |
-| Extracted tree | `game_files\` |
-| Main XBE | `game_files\default.xbe` (Title ID `544D0002`) |
+## Install
 
-## Play
+1. Download `RobotechBC-Recomp-v1.0.0-Windows-x64-Setup.exe` from [Releases](../../releases/latest).
+2. Run it, pick an install folder, and point it at your disc image or folder. Tick **hi-res texture pack** if you want it (a 496 MB download).
+3. Start the game from the Start menu (**Robotech Battlecry Recomp**). Settings are in the same folder.
 
-Double-click or run:
+To add the texture pack later, run `RobotechBC-Recomp-HiRes-Textures-r1-Windows-x64-Setup.exe` and choose your game folder. Running the game Setup again on an installed folder offers to update or repair it, keeping your saves and settings.
 
-```bat
-test_game.bat
-```
+**RecompLauncher:** the release also has a `.zip` for [RecompLauncher](https://recomplauncher.com), which sets up the game from your disc image for you.
 
-That launcher:
+## Controls
 
-- Runs `build\RelWithDebInfo\robotech_bc_recomp.exe`
-- Keeps **full intros** (restores any stashed Binks)
-- Forces `RECOMP_SWM5_PACE_MS=0` (non-zero early-signals the D3D fence and breaks menus into white-box glyphs)
-- Pins **bak OHCI** from `patches\ohci.c.dx11bak` and rebuilds if the shared toolkit `ohci.c` drifted
-- Clears `RECOMP_USB_SYNTH_TD` / `RECOMP_USB_XAPI_TD` (do **not** enable these for this title)
-
-### Controls
+The controller works as on the Xbox. Keyboard defaults:
 
 | Input | Pad |
 | --- | --- |
 | Arrows | D-pad |
 | Enter / Z | A (confirm / skip intro) |
 | X | B |
-| Space | START (skip intro / Attract) |
+| Space | START |
 | WASD / keypad 8462 | Left stick |
 | IJKL | Right stick |
 | C / V | X / Y |
@@ -55,20 +50,22 @@ That launcher:
 | 1 / 3 | Left / right trigger |
 | Shift / Ctrl | Left / right stick click |
 | Backspace | BACK |
-| Delete | Screenshot → `screenshots\shot_*.bmp` |
-| F1 | Video settings |
-| Esc | Quit confirmation or close settings |
+| Delete | Screenshot (saved in `screenshots\`) |
+| F1 | Settings |
 | F11 / Alt+Enter | Toggle borderless fullscreen |
+| Esc | Quit, or close settings |
 
-Keys work even when the console keeps focus (raw INPUTSINK + async). Enter/Space/Z skip guest Bink/Attract once the pad map is open (~20–40s in). Wait through logos to the title menu.
+All of these can be changed on the **CONTROLS** page of the F1 menu or `Config.exe` (two keys per control). The map is saved in `settings.ini`.
 
-Versus supports two players. Connect two SDL3 gamepads for separate controls; the game sees Player 2's controller once a second gamepad is connected (with one, there is no Player 2). If Player 2 disconnects, their controls go neutral and resume when SDL3 reconnects the pad. Keyboard and mouse control Player 1. Controller 1 can hold Back and press Start to open Video settings. Use the D-pad or left stick and A to adjust settings, and B or Start to close the overlay.
+## Troubleshooting
 
-`Config.exe` ([screenshot](docs/ui/config.png), [controls](docs/ui/config_controls.png)), built beside the game, edits the same settings outside the game: the same options, mouse or keyboard, with Save & Play.
+- **Corrupted or flickering graphics on an older or Intel GPU:** try `RECOMP_GPU_FLUSH=1` (see [Diagnostics](#diagnostics)).
+- **Something looks off with interpolation:** turn **Frame interpolation** off in the F1 menu. This takes effect at once.
+- **A crash** writes a `.dmp` file to `crashes\` in the game folder, and each run writes a log to `logs\`. Please attach both when you report a problem.
 
-Both have a **CONTROLS** page. Every keyboard control above can be rebound (two keys each; a key does one thing, so binding it elsewhere moves it). Controllers with A/B or X/Y the other way round (Nintendo layout) can swap them. In the F1 menu, Tab or Page Down (White/Black on a pad) switches pages; Enter on a key slot waits for a key, Delete clears it. The map is stored in `settings.ini` under `[keyboard]` and `[controls]`. `RECOMP_RBX_TOOLKIT_KEYS=1` goes back to the toolkit's fixed map. The F1 menu, the Esc quit prompt and Config.exe share one look (`src/rbx_ui.c`), taken from the game's own blueprint-grid menus and the field-manual styling of the strategy guide.
+## Developers
 
-Video settings include 1×–5× internal resolution, borderless fullscreen, aspect-correct or stretched output, native widescreen (Off, Auto from the window, 16:9, 16:10, 21:9; see [docs/widescreen.md](docs/widescreen.md)), VSync, 30–360 FPS presentation limits or uncapped presentation, 2×/4×/8× MSAA where supported, 2×–16× anisotropic filtering, and hi-res texture replacements. The presentation limit leaves the Xbox game clock unchanged. Settings are saved to `settings.ini`.
+The sections below are for building the port from source.
 
 ## Build from scratch
 
@@ -85,6 +82,30 @@ Place the SDL3 Windows x64 development package (3.4.20) beside the xboxrecomp ch
 ```
 
 The packaged game is portable. Keep the executable, DLLs, and `game_files` together. Xbox disk partitions are emulated in memory. Saves and other Xbox filesystem data go in `SaveData`, video settings in `settings.ini`, and optional replacement textures in `texture_pack`. The launcher keeps screenshots and logs in the same installation folder. Move the whole folder to carry your settings and saves with it.
+
+## Disc (local only — gitignored)
+
+| Item | Path / name |
+| --- | --- |
+| XISO | `Robotech - Battlecry (USA).xiso.iso` |
+| Extracted tree | `game_files\` |
+| Main XBE | `game_files\default.xbe` (Title ID `544D0002`) |
+
+## Play from a build
+
+Double-click or run:
+
+```bat
+test_game.bat
+```
+
+That launcher:
+
+- Runs `build\RelWithDebInfo\robotech_bc_recomp.exe`
+- Keeps **full intros** (restores any stashed Binks)
+- Forces `RECOMP_SWM5_PACE_MS=0` (non-zero early-signals the D3D fence and breaks menus into white-box glyphs)
+- Pins **bak OHCI** from `patches\ohci.c.dx11bak` and rebuilds if the shared toolkit `ohci.c` drifted
+- Clears `RECOMP_USB_SYNTH_TD` / `RECOMP_USB_XAPI_TD` (do **not** enable these for this title)
 
 ## Local test package
 
