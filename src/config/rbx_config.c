@@ -53,11 +53,7 @@ static void load(void)
 {
     int i;
     for (i = 0; i < RBX_OPT_COUNT; i++) {
-        WCHAR key[32];
-        unsigned v;
-        MultiByteToWideChar(CP_UTF8, 0, rbx_options[i].key, -1, key, 32);
-        v = GetPrivateProfileIntW(L"video", key, (INT)rbx_options[i].initial, s_ini);
-        s_value[i] = s_saved[i] = v < rbx_options[i].count ? v : rbx_options[i].initial;
+        s_value[i] = s_saved[i] = rbx_option_load(i, s_ini);
     }
     rbx_keymap_load(&s_map, s_ini);
     s_map_saved = s_map;

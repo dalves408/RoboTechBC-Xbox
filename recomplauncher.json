@@ -109,15 +109,13 @@
       "defaults": { "video/rate": "6" }
     },
     {
-      "id": "msaa", "label": "Anti-aliasing", "group": "Graphics",
-      "help": "Smooths jagged edges. Levels your graphics card can't do are skipped.",
+      "id": "smaa", "label": "Anti-aliasing", "group": "Graphics",
+      "help": "Smooths jagged edges across the whole picture, HUD included.",
       "choices": [
-        { "label": "Off", "set": { "video/msaa": "0" } },
-        { "label": "2x MSAA", "set": { "video/msaa": "1" } },
-        { "label": "4x MSAA", "set": { "video/msaa": "2" } },
-        { "label": "8x MSAA", "set": { "video/msaa": "3" } }
+        { "label": "Off", "set": { "video/smaa": "0" } },
+        { "label": "SMAA Ultra", "set": { "video/smaa": "1" } }
       ],
-      "defaults": { "video/msaa": "0" }
+      "defaults": { "video/smaa": "0" }
     },
     {
       "id": "anisotropy", "label": "Anisotropic filtering", "group": "Graphics",

@@ -115,8 +115,7 @@ static void sr_flip(unsigned long long now)
 #define VB_BYTES (8u * 1024u * 1024u)
 
 typedef struct { uint32_t va, w, h, bpp, pitch, dirty, used, aa_sx, aa_sy;
-                 ID3D11Texture2D *tex, *stage, *msaa; ID3D11RenderTargetView *rtv; ID3D11ShaderResourceView *srv; uint32_t sampled;
-                 int resolve_pending;
+                 ID3D11Texture2D *tex, *stage; ID3D11RenderTargetView *rtv; ID3D11ShaderResourceView *srv; uint32_t sampled;
                  /* deferred readback: the copy queued at the last flip (pstage, one of stage/stage2) and where it goes */
                  ID3D11Texture2D *stage2, *pstage; int pend; uint32_t pva, pw, ph, ppitch, pbpp;
                  /* down is the guest-sized copy written back to guest memory when the render scale is above 1 */
@@ -219,7 +218,7 @@ static ID3D11ShaderResourceView *s_white_srv;
 static uint32_t s_vb_off;
 /* F1 options, requested from the window's thread and applied at a flip. */
 static int s_scale = 1, s_resets;
-static unsigned s_msaa = 1, s_msaa_mask = 1, s_aniso = 1, s_fps_limit;
+static unsigned s_smaa, s_aniso = 1, s_fps_limit;   /* s_smaa: the "Anti-aliasing" setting (SMAA Ultra on the way to the window) */
 static int s_cap_drop;   /* RECOMP_FPS_CAP_DROP=1: the FPS limit only drops frames on their way to the window (old) */
 static ID3D11VertexShader *s_bl_vs;
 static ID3D11PixelShader *s_bl_ps;
@@ -586,14 +585,6 @@ static int gb_init(void)
       hr = D3D11CreateDevice(NULL, warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                              nwant ? want : NULL, nwant, D3D11_SDK_VERSION, &s_dev, &fl, &s_ctx); }
     if (FAILED(hr)) { fprintf(stderr, "[RBX DX11] D3D11CreateDevice failed 0x%08lX\n", (unsigned long)hr); return 0; }
-    for (unsigned i = 1; i <= 3; i++) {
-        UINT color = 0, depth = 0;
-        if (SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(s_dev, DXGI_FORMAT_B8G8R8A8_UNORM, 1u << i, &color)) &&
-            SUCCEEDED(ID3D11Device_CheckMultisampleQualityLevels(s_dev, DXGI_FORMAT_D24_UNORM_S8_UINT, 1u << i, &depth)) &&
-            color && depth)
-            s_msaa_mask |= 1u << i;
-    }
-    rbx_settings_msaa_supported(s_msaa_mask);
     hr = rbx_compile(s_hlsl, sizeof s_hlsl - 1, "gb", NULL, NULL, "vs", "vs_4_0", 0, 0, &vsb, &err);
     if (FAILED(hr)) { fprintf(stderr, "[RBX DX11] vs: %s\n", err ? (char *)ID3D10Blob_GetBufferPointer(err) : "?"); return 0; }
     hr = rbx_compile(s_hlsl, sizeof s_hlsl - 1, "gb", NULL, NULL, "ps", "ps_4_0", 0, 0, &psb, &err);
@@ -884,21 +875,9 @@ static void blit(ID3D11ShaderResourceView *srv, ID3D11RenderTargetView *rtv, uin
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
 }
 
-static void rt_resolve(Rt *rt)
-{
-    if (!rt->resolve_pending) return;
-    ID3D11ShaderResourceView *none[4] = {0};
-    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, none);
-    ID3D11DeviceContext_ResolveSubresource(s_ctx, (ID3D11Resource *)rt->tex, 0,
-        (ID3D11Resource *)rt->msaa, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
-    rt->resolve_pending = 0;
-}
-
 /* What a staging copy reads: the guest-sized image of this target. */
 static ID3D11Resource *rt_guest_image(Rt *rt)
 {
-    rt_resolve(rt);
     if (!rt->down) return (ID3D11Resource *)rt->tex;
     blit(rt->srv, rt->down_rtv, rt->w, rt->h, rt_full_w(rt) * (uint32_t)s_scale, rt->h * (uint32_t)s_scale);
     return (ID3D11Resource *)rt->down;
@@ -908,8 +887,6 @@ static void rt_release(Rt *r)
 {
     SAFE_REL(r->rtv); SAFE_REL(r->srv); SAFE_REL(r->tex); SAFE_REL(r->stage); SAFE_REL(r->stage2);
     SAFE_REL(r->down); SAFE_REL(r->down_rtv);
-    SAFE_REL(r->msaa);
-    r->resolve_pending = 0;
     r->pend = 0; r->pstage = NULL; r->shown_dirty = 0; r->dirty = 0;
 }
 
@@ -943,7 +920,6 @@ static void rt_seed_from_guest(Rt *rt, const Nv2aSurface *s)
     if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &t)) &&
         SUCCEEDED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t, NULL, &v))) {
         blit(v, rt->rtv, rt_full_w(rt) * (uint32_t)s_scale, s->height * (uint32_t)s_scale, s->width, s->height);
-        rt->resolve_pending = rt->msaa != NULL;
     }
     SAFE_REL(v); SAFE_REL(t);
     free(px);
@@ -1063,18 +1039,7 @@ static Rt *get_rt(const Nv2aSurface *s)
     s_rt[free_i].ex = ex;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_rt[free_i].tex))) { rt_release(&s_rt[free_i]); return NULL; }
     ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_rt[free_i].tex, NULL, &s_rt[free_i].srv);
-    if (s_msaa > 1) {
-        td.SampleDesc.Count = s_msaa;
-        td.BindFlags = D3D11_BIND_RENDER_TARGET;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_rt[free_i].msaa))) {
-            rt_release(&s_rt[free_i]);
-            return NULL;
-        }
-        td.SampleDesc.Count = 1;
-    }
-    if (FAILED(ID3D11Device_CreateRenderTargetView(s_dev,
-            (ID3D11Resource *)(s_rt[free_i].msaa ? s_rt[free_i].msaa : s_rt[free_i].tex),
-            NULL, &s_rt[free_i].rtv))) {
+    if (FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_rt[free_i].tex, NULL, &s_rt[free_i].rtv))) {
         rt_release(&s_rt[free_i]);
         return NULL;
     }
@@ -1108,10 +1073,9 @@ static Rt *get_rt(const Nv2aSurface *s)
             if (s_evicted[j] == s->color_va) was_evicted = 1;
         if (alias >= 0) st_rt_alias++;
         if (s_resets) rt_seed_from_guest(&s_rt[free_i], s);
-        else if (seed && alias >= 0 && !s_rt[free_i].msaa && s_rt[alias].ex == ex) {
+        else if (seed && alias >= 0 && s_rt[alias].ex == ex) {
             /* Same pixels, 1:1, over the overlap (both are at the current render scale). */
             D3D11_BOX box;
-            rt_resolve(&s_rt[alias]);
             box.left = box.top = box.front = 0; box.back = 1;
             box.right = (rt_full_w(&s_rt[alias]) < w + 2u * ex ? rt_full_w(&s_rt[alias]) : w + 2u * ex) * (uint32_t)s_scale;
             box.bottom = (s_rt[alias].h < h ? s_rt[alias].h : h) * (uint32_t)s_scale;
@@ -1138,7 +1102,7 @@ static Ds *get_ds(const Nv2aSurface *s, uint32_t zva)
     if (slot < 0) { slot = (int)(s_tick & 3); SAFE_REL(s_ds[slot].dsv); SAFE_REL(s_ds[slot].tex); }
     memset(&td, 0, sizeof td);
     td.Width = (s->width + 2u * ex) * (uint32_t)s_scale; td.Height = s->height * (uint32_t)s_scale; td.MipLevels = td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; td.SampleDesc.Count = s_msaa; td.Usage = D3D11_USAGE_DEFAULT;
+    td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ds[slot].tex))) return NULL;
     ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)s_ds[slot].tex, NULL, &s_ds[slot].dsv);
@@ -1723,7 +1687,6 @@ static ID3D11ShaderResourceView *get_tex_slow(const Nv2aTexture *t)
     s_noalpha = (t->color == 0x1E || t->color == 0x1F || t->color == 0x07) ? 1 : 0;
     for (i = 0; i < MAX_RT; i++)
         if (s_rt[i].tex && s_rt[i].srv && s_rt[i].va == t->offset && s_rt[i].w == t->width && s_rt[i].h == t->height) {
-            rt_resolve(&s_rt[i]);
             s_rt[i].sampled = s_frame + 1; st_rtsamples++;
             return s_rt[i].srv;
         }
@@ -2011,7 +1974,6 @@ static void gb_clear_impl(const Nv2aSurface *s, const Nv2aRenderState *rs, uint3
             } else
                 ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rt->rtv, c);
         }
-        rt->resolve_pending = rt->msaa != NULL;
         rt->dirty = 1; rt->shown_dirty = 1;
     }
     if ((flags & 3) && (ds = get_ds(s, rs->zeta_va)) != NULL) {
@@ -3028,7 +2990,6 @@ static void gb_draw_gvs(const Nv2aSurface *s, const Nv2aBatch *b)
     if (s_flush_mode >= 3) ID3D11DeviceContext_Flush(s_ctx);
     gvs_verify(s, r, prog);
     rt->dirty = 1; rt->shown_dirty = 1;
-    rt->resolve_pending = rt->msaa != NULL;
     st_draws++; st_tris += nidx / 3;
 }
 static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
@@ -3501,7 +3462,6 @@ static void gb_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
         s_vb_off += kept * (uint32_t)sizeof(Nv2aVertex);
         if (use_rc && packed_ext) s_xvb_off += kept * (uint32_t)sizeof(RcVertExt);
         rt->dirty = 1; rt->shown_dirty = 1;
-        rt->resolve_pending = rt->msaa != NULL;
         st_draws++; st_tris += (indexed ? g_rbx_bidx_n : kept) / 3;
     }
 }
@@ -3577,6 +3537,7 @@ extern volatile LONG rbx_input_guest_frame;
 static ID3D11Texture2D *s_share;
 static IDXGIKeyedMutex *s_share_mutex;
 static ID3D11Texture2D *s_share_retired;
+static ID3D11RenderTargetView *s_share_rtv;   /* SMAA's last pass draws into s_share through it */
 static uint32_t s_share_w, s_share_h;
 static int s_share_failed, s_share_on;
 static HANDLE s_share_handle;
@@ -3613,6 +3574,7 @@ static void share_close(void)
         gpu_present_set_source(NULL, 0, 0);
     s_share_on = 0;
     SAFE_REL(s_share_retired);
+    SAFE_REL(s_share_rtv);
     SAFE_REL(s_share_mutex);
     SAFE_REL(s_share);
     s_share_handle = NULL;
@@ -3621,7 +3583,7 @@ static void share_close(void)
 
 /* RECOMP_GPU_PRESDUMP=<prefix>[:every]: writes exactly what the window is given (the presented D3D target, not guest
  * memory) as <prefix>_f<frame>.bmp, 24-bit, every N-th published frame (default 30). */
-static void present_dump(Rt *rt)
+static void present_dump(ID3D11Texture2D *src)
 {
     static int on = -1, guest_frames; static unsigned every = 30, n; static char pfx[400];
     static ID3D11Texture2D *st; static uint32_t sw, sh;
@@ -3644,14 +3606,14 @@ static void present_dump(Rt *rt)
       if (w < 0) { const char *e = getenv("RECOMP_GPU_PRESDUMP_SECS"); w = e && sscanf(e, "%u-%u", &lo, &hi) == 2; t0 = GetTickCount(); }
       sec = (GetTickCount() - t0) / 1000; if (w && (sec < lo || sec >= hi)) return; }
     if ((guest_frames ? s_frame : n++) % every) return;
-    ID3D11Texture2D_GetDesc(rt->tex, &td);
+    ID3D11Texture2D_GetDesc(src, &td);
     if (!st || sw != td.Width || sh != td.Height) {
         SAFE_REL(st);
         td.Usage = D3D11_USAGE_STAGING; td.BindFlags = 0; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ; td.MiscFlags = 0;
         if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st))) { st = NULL; return; }
         sw = td.Width; sh = td.Height;
     }
-    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)rt->tex);
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st, (ID3D11Resource *)src);
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &m))) return;
     snprintf(path, sizeof path, "%s_f%06u.bmp", pfx, s_frame);
     if ((f = fopen(path, "wb")) != NULL) {
@@ -3668,6 +3630,217 @@ static void present_dump(Rt *rt)
         free(line); fclose(f);
     }
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+}
+
+/* ---- SMAA ---------------------------------------------------------------------------------------------------
+ * The "Anti-aliasing" setting (F1 / Config.exe). SMAA 1x at the Ultra preset (luma edges, threshold 0.05, 32 search
+ * steps, 16 diagonal, corner rounding 25), applied on the way to the window: the published target goes through the
+ * three passes (edges, blending weights, neighbourhood blending) straight into the shared frame texture, in place of
+ * the plain copy. Nothing the game sees changes: its targets, render-to-texture, readbacks and guest memory keep the
+ * unfiltered image. SMAA looks at one frame at a time, so an interpolated frame is filtered like any other (no history
+ * to ghost), and it covers the whole target, widescreen sides included. It replaced MSAA, which multiplied the cost of
+ * every draw and every target and could not reach the game's own render-to-texture copies. If the shaders or targets
+ * cannot be made, the window gets the plain copy and one line in the log. */
+#include "rbx_smaa_hlsl.h"
+#include "../third_party/smaa/AreaTex.h"
+#include "../third_party/smaa/SearchTex.h"
+
+static const char s_smaa_pre[] =
+"#define SMAA_CUSTOM_SL 1\n"
+"#define SMAA_PRESET_ULTRA 1\n"
+"cbuffer SmaaCb : register(b0) { float4 smaa_rt_metrics; };\n"
+"#define SMAA_RT_METRICS smaa_rt_metrics\n"
+"SamplerState LinearSampler : register(s0);\n"
+"SamplerState PointSampler : register(s1);\n"
+"#define SMAATexture2D(tex) Texture2D tex\n"
+"#define SMAATexturePass2D(tex) tex\n"
+"#define SMAASampleLevelZero(tex, coord) tex.SampleLevel(LinearSampler, coord, 0)\n"
+"#define SMAASampleLevelZeroPoint(tex, coord) tex.SampleLevel(PointSampler, coord, 0)\n"
+"#define SMAASampleLevelZeroOffset(tex, coord, offset) tex.SampleLevel(LinearSampler, coord, 0, offset)\n"
+"#define SMAASample(tex, coord) tex.Sample(LinearSampler, coord)\n"
+"#define SMAASamplePoint(tex, coord) tex.Sample(PointSampler, coord)\n"
+"#define SMAASampleOffset(tex, coord, offset) tex.Sample(LinearSampler, coord, offset)\n"
+"#define SMAA_FLATTEN [flatten]\n"
+"#define SMAA_BRANCH [branch]\n"
+"#define SMAATexture2DMS2(tex) Texture2DMS<float4, 2> tex\n"
+"#define SMAALoad(tex, pos, sample) tex.Load(pos, sample)\n";
+
+static const char s_smaa_post[] =
+"Texture2D colorTex : register(t0); Texture2D edgesTex : register(t1); Texture2D areaTex : register(t2);\n"
+"Texture2D searchTex : register(t3); Texture2D blendTex : register(t4);\n"
+"float2 smaa_quad(uint i, out float4 p) { float2 q = float2((i << 1) & 2, i & 2);\n"
+"  p = float4(q * float2(2, -2) + float2(-1, 1), 0, 1); return q; }\n"
+"struct VE { float4 p : SV_Position; float2 uv : TEXCOORD0; float4 o[3] : TEXCOORD1; };\n"
+"struct VW { float4 p : SV_Position; float2 uv : TEXCOORD0; float2 pix : TEXCOORD1; float4 o[3] : TEXCOORD2; };\n"
+"struct VB { float4 p : SV_Position; float2 uv : TEXCOORD0; float4 o : TEXCOORD1; };\n"
+"VE edge_vs(uint i : SV_VertexID) { VE v; v.uv = smaa_quad(i, v.p); SMAAEdgeDetectionVS(v.uv, v.o); return v; }\n"
+"float2 edge_ps(VE v) : SV_Target { return SMAALumaEdgeDetectionPS(v.uv, v.o, colorTex); }\n"
+"VW weight_vs(uint i : SV_VertexID) { VW v; v.uv = smaa_quad(i, v.p); SMAABlendingWeightCalculationVS(v.uv, v.pix, v.o); return v; }\n"
+"float4 weight_ps(VW v) : SV_Target { return SMAABlendingWeightCalculationPS(v.uv, v.pix, v.o, edgesTex, areaTex, searchTex, 0); }\n"
+"VB blend_vs(uint i : SV_VertexID) { VB v; v.uv = smaa_quad(i, v.p); SMAANeighborhoodBlendingVS(v.uv, v.o); return v; }\n"
+"float4 blend_ps(VB v) : SV_Target { return SMAANeighborhoodBlendingPS(v.uv, v.o, colorTex, blendTex); }\n";
+
+static ID3D11VertexShader *s_smaa_vs[3];
+static ID3D11PixelShader *s_smaa_ps[3];
+static ID3D11Buffer *s_smaa_cb;
+static ID3D11SamplerState *s_smaa_smp[2];               /* linear, point */
+static ID3D11ShaderResourceView *s_smaa_area, *s_smaa_search;
+static ID3D11Texture2D *s_smaa_tex[2];                  /* edges (RG8), blending weights (RGBA8) */
+static ID3D11RenderTargetView *s_smaa_rtv[2];
+static ID3D11ShaderResourceView *s_smaa_srv[2];
+static uint32_t s_smaa_w, s_smaa_h;
+static int s_smaa_failed;
+
+static void smaa_fail(const char *what)
+{
+    fprintf(stderr, "[RBX DX11] SMAA unavailable (%s): frames go to the window without anti-aliasing\n", what);
+    s_smaa_failed = 1;
+}
+
+/* The shaders and lookup textures, once, the first time SMAA is on (the shader cache keeps later boots quick). */
+static int smaa_init(void)
+{
+    static const char *entry[3][2] = { {"edge_vs", "edge_ps"}, {"weight_vs", "weight_ps"}, {"blend_vs", "blend_ps"} };
+    size_t n1 = sizeof s_smaa_pre - 1, n2 = sizeof k_hlsl_smaa - 1, n3 = sizeof s_smaa_post - 1;
+    char *src;
+    unsigned i, t0 = qpc_us();
+    D3D11_BUFFER_DESC bd;
+    D3D11_SAMPLER_DESC sm;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SUBRESOURCE_DATA sd;
+    ID3D11Texture2D *tex = NULL;
+    if (s_smaa_failed) return 0;
+    if (s_smaa_ps[2]) return 1;
+    if (!(src = (char *)malloc(n1 + n2 + n3))) { smaa_fail("out of memory"); return 0; }
+    memcpy(src, s_smaa_pre, n1); memcpy(src + n1, k_hlsl_smaa, n2); memcpy(src + n1 + n2, s_smaa_post, n3);
+    for (i = 0; i < 3; i++) {
+        ID3DBlob *vb = NULL, *pb = NULL, *err = NULL;
+        HRESULT hr = rbx_compile(src, n1 + n2 + n3, "smaa", NULL, NULL, entry[i][0], "vs_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vb, &err);
+        if (SUCCEEDED(hr)) { SAFE_REL(err); hr = rbx_compile(src, n1 + n2 + n3, "smaa", NULL, NULL, entry[i][1], "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &pb, &err); }
+        if (FAILED(hr)) {
+            fprintf(stderr, "[RBX DX11] SMAA %s: %s\n", vb ? entry[i][1] : entry[i][0], err ? (char *)ID3D10Blob_GetBufferPointer(err) : "?");
+            SAFE_REL(vb); SAFE_REL(pb); SAFE_REL(err); free(src);
+            smaa_fail("shader compile");
+            return 0;
+        }
+        ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(vb), ID3D10Blob_GetBufferSize(vb), NULL, &s_smaa_vs[i]);
+        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(pb), ID3D10Blob_GetBufferSize(pb), NULL, &s_smaa_ps[i]);
+        SAFE_REL(vb); SAFE_REL(pb); SAFE_REL(err);
+    }
+    free(src);
+    memset(&bd, 0, sizeof bd);
+    bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_DYNAMIC; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_smaa_cb);
+    memset(&sm, 0, sizeof sm);
+    sm.AddressU = sm.AddressV = sm.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP; sm.MaxLOD = D3D11_FLOAT32_MAX;
+    sm.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    ID3D11Device_CreateSamplerState(s_dev, &sm, &s_smaa_smp[0]);
+    sm.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    ID3D11Device_CreateSamplerState(s_dev, &sm, &s_smaa_smp[1]);
+    memset(&td, 0, sizeof td);
+    td.MipLevels = td.ArraySize = 1; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    td.Width = AREATEX_WIDTH; td.Height = AREATEX_HEIGHT; td.Format = DXGI_FORMAT_R8G8_UNORM;
+    sd.pSysMem = areaTexBytes; sd.SysMemPitch = AREATEX_PITCH; sd.SysMemSlicePitch = 0;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &tex)))
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)tex, NULL, &s_smaa_area);
+    SAFE_REL(tex);
+    td.Width = SEARCHTEX_WIDTH; td.Height = SEARCHTEX_HEIGHT; td.Format = DXGI_FORMAT_R8_UNORM;
+    sd.pSysMem = searchTexBytes; sd.SysMemPitch = SEARCHTEX_PITCH;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, &sd, &tex)))
+        ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)tex, NULL, &s_smaa_search);
+    SAFE_REL(tex);
+    for (i = 0; i < 3; i++) if (!s_smaa_vs[i] || !s_smaa_ps[i]) { smaa_fail("shader create"); return 0; }
+    if (!s_smaa_cb || !s_smaa_smp[0] || !s_smaa_smp[1] || !s_smaa_area || !s_smaa_search) { smaa_fail("lookup textures"); return 0; }
+    fprintf(stderr, "[RBX DX11] SMAA Ultra ready (%u ms)\n", (qpc_us() - t0) / 1000u);
+    return 1;
+}
+
+/* The edge and weight targets, at the size of the frame being shown. */
+static int smaa_targets(uint32_t w, uint32_t h)
+{
+    static const DXGI_FORMAT fmt[2] = { DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM };
+    D3D11_TEXTURE2D_DESC td;
+    unsigned i;
+    if (s_smaa_tex[1] && s_smaa_w == w && s_smaa_h == h) return 1;
+    for (i = 0; i < 2; i++) { SAFE_REL(s_smaa_srv[i]); SAFE_REL(s_smaa_rtv[i]); SAFE_REL(s_smaa_tex[i]); }
+    s_smaa_w = s_smaa_h = 0;
+    memset(&td, 0, sizeof td);
+    td.Width = w; td.Height = h; td.MipLevels = td.ArraySize = 1; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    for (i = 0; i < 2; i++) {
+        td.Format = fmt[i];
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_smaa_tex[i])) ||
+            FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_smaa_tex[i], NULL, &s_smaa_rtv[i])) ||
+            FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_smaa_tex[i], NULL, &s_smaa_srv[i]))) {
+            for (i = 0; i < 2; i++) { SAFE_REL(s_smaa_srv[i]); SAFE_REL(s_smaa_rtv[i]); SAFE_REL(s_smaa_tex[i]); }
+            fprintf(stderr, "[RBX DX11] SMAA targets %ux%u failed: this frame is shown without anti-aliasing\n", w, h);
+            return 0;
+        }
+    }
+    s_smaa_w = w; s_smaa_h = h;
+    return 1;
+}
+
+/* rt (w x h at the render scale) through SMAA into the shared frame texture. The caller holds its keyed mutex. 0 = not
+ * done (SMAA off or unavailable), and the caller copies instead. Sets every state it uses, like blit(). */
+static unsigned st_smaa_us, st_smaa_n;
+static int smaa_present(Rt *rt, uint32_t w, uint32_t h)
+{
+    static const float zero[4] = { 0, 0, 0, 0 };
+    ID3D11ShaderResourceView *none[5] = { NULL, NULL, NULL, NULL, NULL }, *srv[5];
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_VIEWPORT vp;
+    unsigned t0;
+    if (!s_smaa || !rt->srv || !smaa_init() || !smaa_targets(w, h)) return 0;
+    if (!s_share_rtv && FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_share, NULL, &s_share_rtv))) {
+        s_share_rtv = NULL;
+        smaa_fail("frame texture view");
+        return 0;
+    }
+    t0 = qpc_us();
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_smaa_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        float *c = (float *)m.pData;
+        c[0] = 1.0f / (float)w; c[1] = 1.0f / (float)h; c[2] = (float)w; c[3] = (float)h;
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_smaa_cb, 0);
+    }
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 5, none);
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_smaa_rtv[0], zero);   /* edge detection discards edgeless pixels */
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    vp.TopLeftX = vp.TopLeftY = 0; vp.Width = (float)w; vp.Height = (float)h; vp.MinDepth = 0; vp.MaxDepth = 1;
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_GSSetShader(s_ctx, NULL, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_smaa_cb);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_smaa_cb);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 2, s_smaa_smp);
+    /* 1: luma edges */
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_smaa_rtv[0], NULL);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_smaa_vs[0], NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_smaa_ps[0], NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &rt->srv);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    /* 2: blending weights (every pixel is written; edgeless ones get zero) */
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_smaa_rtv[1], NULL);
+    srv[0] = NULL; srv[1] = s_smaa_srv[0]; srv[2] = s_smaa_area; srv[3] = s_smaa_search; srv[4] = NULL;
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_smaa_vs[1], NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_smaa_ps[1], NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 5, srv);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    /* 3: neighbourhood blending into the window's frame */
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_share_rtv, NULL);
+    srv[0] = rt->srv; srv[1] = srv[2] = srv[3] = NULL; srv[4] = s_smaa_srv[1];
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_smaa_vs[2], NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_smaa_ps[2], NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 5, srv);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 5, none);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    st_smaa_us += qpc_us() - t0; st_smaa_n++;
+    return 1;
 }
 
 static void publish_frame(void)
@@ -3717,6 +3890,7 @@ static void publish_frame(void)
             D3D11_TEXTURE2D_DESC td;
             IDXGIResource *res = NULL;
             HANDLE handle = NULL;
+            SAFE_REL(s_share_rtv);
             /* Keep the old completed frame visible until the replacement is ready. */
             if (s_share_on) {
                 s_share_retired = s_share;
@@ -3764,8 +3938,9 @@ static void publish_frame(void)
             share_close();
         return;
     }
-    rt_resolve(rt);
-    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_share, (ID3D11Resource *)rt->tex);
+    if (!smaa_present(rt, s_share_w, s_share_h))
+        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_share, (ID3D11Resource *)rt->tex);
+    present_dump(s_share);
     ID3D11DeviceContext_Flush(s_ctx);
     HRESULT released = IDXGIKeyedMutex_ReleaseSync(s_share_mutex, 0);
     if (released != S_OK) {
@@ -3783,7 +3958,6 @@ static void publish_frame(void)
                 ++s_share_serial, va, s_frame, s_share_w, s_share_h);
     gpu_present_frame_ready();
     st_pub++;
-    present_dump(rt);
     if (s_fps_limit && s_cap_drop) {
         unsigned long long interval = gb_qf() / s_fps_limit;
         unsigned long long current = (unsigned long long)now.QuadPart;
@@ -3833,8 +4007,7 @@ static void video_apply(void)
     static const unsigned limits[] = {30, 60, 120, 144, 240, 360, 0};
     unsigned options = rbx_settings_video();
     int scale = (int)(options & 7) + 1, hires = (options >> 8) & 1, i;
-    unsigned aa = (options >> 3) & 3, aniso = 1u << ((options >> 5) & 7);
-    unsigned samples = s_msaa_mask & (1u << aa) ? 1u << aa : 1;
+    unsigned smaa = ((options >> 3) & 3) != 0, aniso = 1u << ((options >> 5) & 7);
     s_fps_limit = limits[(options >> 9) & 7];
     s_ip_menu = (options >> 15) & 1;
     if (s_ip >= 0 && s_ip_env < 0) ip_set_level(s_ip_menu);
@@ -3847,16 +4020,19 @@ static void video_apply(void)
         s_aniso = aniso;
     }
     float wide = wide_target((options >> 12) & 7);
-    if (scale != s_scale || samples != s_msaa || wide != s_wide) {
+    if (smaa != s_smaa) {
+        s_smaa = smaa;
+        fprintf(stderr, "[RBX DX11] video: anti-aliasing %s\n", s_smaa ? "SMAA Ultra" : "off");
+    }
+    if (scale != s_scale || wide != s_wide) {
         ID3D11RenderTargetView *none = NULL;
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &none, NULL);
         for (i = 0; i < MAX_RT; i++) { rt_release(&s_rt[i]); s_rt[i].va = 0; }
         for (i = 0; i < 4; i++) { SAFE_REL(s_ds[i].dsv); SAFE_REL(s_ds[i].tex); s_ds[i].va = 0; }
         s_scale = scale;
-        s_msaa = samples;
         s_wide = wide;
         s_resets++;
-        fprintf(stderr, "[RBX DX11] video: render scale %dx, MSAA %ux, widescreen %.3f (aspect %.3f)\n", s_scale, s_msaa,
+        fprintf(stderr, "[RBX DX11] video: render scale %dx, widescreen %.3f (aspect %.3f)\n", s_scale,
                 s_wide, s_wide * 4.0f / 3.0f);
     }
 }
@@ -3952,16 +4128,16 @@ static void gb_flip_impl(void)
             fprintf(stderr, "[RBXPERF] ms=%u flips=%u pub=%u ft_avg_us=%u ft_max_us=%u hitch33=%u hitch50=%u hitch100=%u "
                             "rb_n=%u rb_us=%u sh_n=%u sh_us=%u sh_total=%u sh_hits=%u catchup=%ld fence_early=%ld fence_timeout=%ld "
                             "mmio_traps=%ld apu_lock_waits=%u apu_lock_timeouts=%u fence_wait_us=%ld pb_drops=%u pb_midwalk_get=%u "
-                            "rt_new=%u rt_evict=%u rt_alias=%u pub_nort=%u pub_multi=%u clear_partial=%u rb_defer=%u rb_evict=%u cap=%u pace_n=%u pace_us=%u pace_calls=%u pace_late=%u\n",
+                            "rt_new=%u rt_evict=%u rt_alias=%u pub_nort=%u pub_multi=%u clear_partial=%u rb_defer=%u rb_evict=%u cap=%u pace_n=%u pace_us=%u pace_calls=%u pace_late=%u smaa_n=%u smaa_cpu_us=%u\n",
                     win_ms, st_flips, st_pub,
                     st_ft_n ? (unsigned)(st_ft_sum * 1000000ULL / qf / st_ft_n) : 0u, (unsigned)(st_ft_max * 1000000ULL / qf),
                     st_hitch33, st_hitch50, st_hitch100, st_rb_n, st_rb_us, st_sh_n, st_sh_us, s_sh_total, st_sh_hits,
                     (long)(fc - l_fc), (long)(fs - l_fs), (long)(ft - l_ft), (long)(mm - l_mm), lw - l_lw, lt - l_lt,
                     (long)(fw - l_fw), pd - l_pd, pm - l_pm,
-                    st_rt_new, st_rt_evict, st_rt_alias, st_pub_nort, st_pub_multi, st_clear_partial, st_rb_defer, st_rb_evict, s_fps_limit, st_pace_n, st_pace_us, st_pace_calls, st_pace_late);
+                    st_rt_new, st_rt_evict, st_rt_alias, st_pub_nort, st_pub_multi, st_clear_partial, st_rb_defer, st_rb_evict, s_fps_limit, st_pace_n, st_pace_us, st_pace_calls, st_pace_late, st_smaa_n, st_smaa_us);
             l_fc = fc; l_fs = fs; l_ft = ft; l_mm = mm; l_lw = lw; l_lt = lt; l_fw = fw; l_pd = pd; l_pm = pm;
             st_rb_us = st_rb_n = st_sh_us = st_sh_n = st_sh_hits = st_pub = 0;
-            st_rt_new = st_rt_evict = st_rt_alias = st_pub_nort = st_pub_multi = st_clear_partial = st_rb_defer = st_rb_evict = st_pace_n = st_pace_us = st_pace_calls = st_pace_late = 0;
+            st_rt_new = st_rt_evict = st_rt_alias = st_pub_nort = st_pub_multi = st_clear_partial = st_rb_defer = st_rb_evict = st_pace_n = st_pace_us = st_pace_calls = st_pace_late = st_smaa_n = st_smaa_us = 0;
             st_ft_sum = st_ft_max = 0; st_ft_n = st_hitch33 = st_hitch50 = st_hitch100 = 0;
         }
         g_pb_scan_ticks = 0; g_pb_scan_segs = 0;
