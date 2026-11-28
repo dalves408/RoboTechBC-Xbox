@@ -6094,6 +6094,29 @@ void nv2a_pb_exec_report(void)
         last_ms = now;
     }
     flip_hold_report();
+    /* The rest of the report (about 600 lines with [TEXUSE], the method
+     * histogram, a framebuffer dump) ran on the pushbuffer thread every ten
+     * seconds in every build, because RECOMP_PB_EXEC (always on here) arms the
+     * report. Writing it held the thread for about half a second: a freeze in
+     * the picture every ten seconds, and the audio feed ran dry with it (the
+     * crackle). Now it is only written when a diagnostic asks for it:
+     * RECOMP_PB_REPORT_FULL=1, RECOMP_NV2A_TRACE, RECOMP_PB_SCAN,
+     * RECOMP_FB_DUMP or RECOMP_PB_UNHANDLED_ALL. The one-line summary below
+     * stays, for rbx_diag.py. */
+    {
+        static int full = -1;
+        if (full < 0) {
+            const char *e = getenv("RECOMP_PB_REPORT_FULL");
+            full = (e && e[0] == '1') || getenv("RECOMP_NV2A_TRACE") || getenv("RECOMP_PB_SCAN")
+                || getenv("RECOMP_FB_DUMP") || getenv("RECOMP_PB_UNHANDLED_ALL");
+        }
+        if (!full) {
+            fprintf(stderr, "[GPU] draws %u, clears %u | %u unhandled methods (%d distinct)\n",
+                    s_gpu.draws, s_gpu.clears, s_gpu.unhandled_total, s_unhandled_count);
+            fflush(stderr);
+            return;
+        }
+    }
     fprintf(stderr, "[GPU] surface 0x%08X pitch %u clip %ux%u+%u+%u"
                     " clears %u | %u unhandled methods (%d distinct)\n",
             s_gpu.color_offset, s_gpu.pitch, s_gpu.clip_w, s_gpu.clip_h,
