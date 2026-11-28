@@ -185,6 +185,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     winmm
     dbghelp
     gdi32
+    user32
 )
 
 # Config.exe: the settings window outside the game. It edits the same

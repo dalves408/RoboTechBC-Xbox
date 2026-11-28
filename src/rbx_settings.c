@@ -68,7 +68,7 @@ static void apply_choice(int row)
     /* One word gives the render thread a consistent settings snapshot. */
     LONG render = (LONG)(choice[SCALE] | choice[AA] << 3 | choice[ANISO] << 5 |
                          choice[HIRES] << 8 | choice[RATE] << 9 | choice[WIDE] << 12 |
-                         choice[INTERP] << 15);
+                         choice[INTERP] << 15 | choice[VSYNC] << 16);
     InterlockedExchange(&video, render);
     if (row == FULLSCREEN && xbox_fb_window() &&
         (int)choice[FULLSCREEN] != xbox_fb_is_fullscreen())
