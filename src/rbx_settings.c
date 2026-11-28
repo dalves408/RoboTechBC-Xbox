@@ -514,6 +514,9 @@ void rbx_settings_install(void)
     if (fullscreen) choice[FULLSCREEN] = *fullscreen && *fullscreen != '0';
     if (vsync) choice[VSYNC] = *vsync && *vsync != '0';
     if (stretch) choice[STRETCH] = *stretch && *stretch != '0';
+    /* The window reads RECOMP_FULLSCREEN when it opens (after this), so a saved or default Fullscreen On starts the
+     * game fullscreen. RECOMP_FULLSCREEN set by hand (or by Big Picture mode) still wins. */
+    if (!fullscreen && choice[FULLSCREEN]) _putenv_s("RECOMP_FULLSCREEN", "1");
     const char *wide = getenv("RECOMP_RBX_WIDESCREEN");
     if (wide && *wide) {
         /* off (0), auto (1), 16:9, 16:10, 21:9; any other w:h is a custom shape the renderer reads itself */

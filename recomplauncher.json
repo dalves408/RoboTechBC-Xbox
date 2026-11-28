@@ -62,7 +62,7 @@
         { "label": "Off", "set": { "video/fullscreen": "0" } },
         { "label": "On", "set": { "video/fullscreen": "1" } }
       ],
-      "defaults": { "video/fullscreen": "0" }
+      "defaults": { "video/fullscreen": "1" }
     },
     {
       "id": "stretch", "label": "Stretch image", "group": "Display",
@@ -92,7 +92,7 @@
         { "label": "Off", "set": { "video/vsync": "0" } },
         { "label": "On", "set": { "video/vsync": "1" } }
       ],
-      "defaults": { "video/vsync": "0" }
+      "defaults": { "video/vsync": "1" }
     },
     {
       "id": "rate", "label": "FPS limit", "group": "Graphics",
@@ -106,7 +106,7 @@
         { "label": "360 FPS", "set": { "video/rate": "5" } },
         { "label": "Uncapped", "set": { "video/rate": "6" } }
       ],
-      "defaults": { "video/rate": "6" }
+      "defaults": { "video/rate": "1" }
     },
     {
       "id": "msaa", "label": "Anti-aliasing", "group": "Graphics",
