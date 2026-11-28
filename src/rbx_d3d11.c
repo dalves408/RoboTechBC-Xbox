@@ -3996,6 +3996,8 @@ extern volatile long g_rbx_frontend_fps;   /* src/recomp_manual.c */
  * the refresh rate of the monitor the window is on (or to the FPS limit, if that is lower). The rate is the exact
  * one Windows reports (59.94 Hz stays 59.94, not 60) and is looked up again when the window moves to another
  * monitor and every two seconds, so a mode change is followed. RECOMP_RBX_VSYNC_PACE=0 turns the hold off. */
+static HMONITOR s_pace_mon;   /* the monitor refresh_interval last looked at */
+static int s_vblank_pace = 1; /* RECOMP_RBX_VSYNC_PACE=timer: VSync paces on the timer only, not the vblank */
 static unsigned long long refresh_interval(unsigned long long qf)
 {
     extern HWND xbox_fb_window(void);
@@ -4005,10 +4007,15 @@ static unsigned long long refresh_interval(unsigned long long qf)
     LARGE_INTEGER q;
     HWND hwnd;
     HMONITOR mon;
-    if (enabled < 0) { const char *e = getenv("RECOMP_RBX_VSYNC_PACE"); enabled = !(e && e[0] == '0'); }
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_RBX_VSYNC_PACE");
+        enabled = !(e && e[0] == '0');
+        if (e && !_stricmp(e, "timer")) s_vblank_pace = 0;
+    }
     if (!enabled) return 0;
     hwnd = xbox_fb_window();
     mon = hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) : MonitorFromPoint((POINT){0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    s_pace_mon = mon;
     QueryPerformanceCounter(&q);
     if (mon == last_mon && checked_at && (unsigned long long)q.QuadPart - checked_at < 2 * qf) return cached;
     last_mon = mon; checked_at = (unsigned long long)q.QuadPart;
@@ -4057,6 +4064,129 @@ static unsigned long long refresh_interval(unsigned long long qf)
     return cached;
 }
 
+/* A timer at the refresh rate is not enough for smooth motion: the window's Present waits for the monitor's own
+ * vblank, and a flip that lands a fraction of a millisecond either side of it is shown one refresh early or late,
+ * so frames are repeated and skipped while the counter still reads 60. With VSync on the flips are therefore
+ * released on the monitor's vblank itself (IDXGIOutput::WaitForVBlank on the output the window is on), every Nth
+ * one, N being the FPS limit rounded to a whole fraction of the refresh (60 on 60 Hz: every vblank; 60 on 120 Hz:
+ * every 2nd; 60 on 144 Hz: every 2nd, 72 FPS), so each frame stays on screen for the same number of refreshes.
+ * The output is looked up on the device's adapter first, then on every adapter (a laptop whose panel hangs off the
+ * integrated GPU). If no output matches, the wait fails, or it stops waiting, pacing falls back to the timer. */
+static IDXGIOutput *vblank_output(HMONITOR mon)
+{
+    static IDXGIOutput *out;
+    static HMONITOR out_mon;
+    static int failed_for_mon;
+    if (mon == out_mon && (out || failed_for_mon)) return out;
+    if (out) { IDXGIOutput_Release(out); out = NULL; }
+    out_mon = mon; failed_for_mon = 0;
+    if (!mon) { failed_for_mon = 1; return NULL; }
+    {
+        IDXGIDevice *dd = NULL;
+        IDXGIAdapter *ad = NULL;
+        if (s_dev && SUCCEEDED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice, (void **)&dd))
+            && SUCCEEDED(IDXGIDevice_GetAdapter(dd, &ad))) {
+            IDXGIOutput *o;
+            for (UINT i = 0; !out && IDXGIAdapter_EnumOutputs(ad, i, &o) == S_OK; i++) {
+                DXGI_OUTPUT_DESC od;
+                if (SUCCEEDED(IDXGIOutput_GetDesc(o, &od)) && od.Monitor == mon) out = o;
+                else IDXGIOutput_Release(o);
+            }
+        }
+        if (ad) IDXGIAdapter_Release(ad);
+        if (dd) IDXGIDevice_Release(dd);
+    }
+    if (!out) {
+        IDXGIFactory1 *f = NULL;
+        if (SUCCEEDED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&f))) {
+            IDXGIAdapter1 *ad;
+            for (UINT a = 0; !out && IDXGIFactory1_EnumAdapters1(f, a, &ad) == S_OK; a++) {
+                IDXGIOutput *o;
+                for (UINT i = 0; !out && IDXGIAdapter1_EnumOutputs(ad, i, &o) == S_OK; i++) {
+                    DXGI_OUTPUT_DESC od;
+                    if (SUCCEEDED(IDXGIOutput_GetDesc(o, &od)) && od.Monitor == mon) out = o;
+                    else IDXGIOutput_Release(o);
+                }
+                IDXGIAdapter1_Release(ad);
+            }
+            IDXGIFactory1_Release(f);
+        }
+    }
+    if (!out) failed_for_mon = 1;
+    fprintf(stderr, "[RBX DX11] VSync: %s\n", out ? "flips released on the monitor's vblank"
+                                                  : "no DXGI output for the window's monitor, timer pacing");
+    return out;
+}
+
+/* Timer wait until the QPC tick 'until' (waitable timer to ~1 ms before, then yield). */
+static void pace_sleep_until(HANDLE timer, unsigned long long until, unsigned long long qf)
+{
+    LARGE_INTEGER q;
+    unsigned long long now;
+    QueryPerformanceCounter(&q); now = (unsigned long long)q.QuadPart;
+    while (now < until) {
+        unsigned long long left_us = (until - now) * 1000000ULL / qf;
+        if (left_us > 1500) {
+            if (timer) {
+                LARGE_INTEGER due;
+                due.QuadPart = -(LONGLONG)((left_us - 1000) * 10);   /* 100 ns units, relative */
+                if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 50);
+                else Sleep(1);
+            } else Sleep(1);
+        } else SwitchToThread();
+        QueryPerformanceCounter(&q); now = (unsigned long long)q.QuadPart;
+    }
+}
+
+/* VSync pacing on the vblank: returns 1 if it paced this flip, 0 to fall back to the timer. */
+static int pace_vblank(HANDLE timer, unsigned long long period, unsigned cap, unsigned long long qf)
+{
+    static unsigned long long last_vbl;
+    static unsigned last_n, short_waits;
+    static int broken;
+    unsigned long long now, target;
+    unsigned n;
+    LARGE_INTEGER q;
+    IDXGIOutput *out;
+    if (broken) return 0;
+    out = vblank_output(s_pace_mon);
+    if (!out) return 0;
+    /* Refreshes per frame: the limit rounded to a whole fraction of the refresh, at least 1. */
+    n = cap ? (unsigned)((2 * qf + period * cap) / (2 * period * cap)) : 1;
+    if (n < 1) n = 1;
+    if (n != last_n) {
+        fprintf(stderr, "[RBX DX11] VSync: every %u%s vblank, %.2f FPS\n", n, n == 1 ? "st" : n == 2 ? "nd" : n == 3 ? "rd" : "th",
+                (double)qf / (double)(period * n));
+        last_n = n; last_vbl = 0;
+    }
+    QueryPerformanceCounter(&q); now = (unsigned long long)q.QuadPart;
+    if (last_vbl) {
+        target = last_vbl + n * period;
+        /* More than half a refresh past this frame's vblank: the frame took too long. Let it go now (the window
+         * still waits for a vblank) and line up again on the next one. */
+        if (now > target + period / 2) { last_vbl = 0; st_pace_late++; return 1; }
+        /* Sleep to half a refresh before the vblank we want, then wait for it. */
+        if (target > period / 2 && now < target - period / 2) {
+            st_pace_n++; st_pace_us += (unsigned)((target - now) * 1000000ULL / qf);
+            pace_sleep_until(timer, target - period / 2, qf);
+        }
+    }
+    if (FAILED(IDXGIOutput_WaitForVBlank(out))) {
+        fprintf(stderr, "[RBX DX11] VSync: WaitForVBlank failed, timer pacing\n");
+        broken = 1; return 0;
+    }
+    QueryPerformanceCounter(&q);
+    /* A wait that returns at once again and again (a display that is off, some VRR drivers) is no clock. */
+    if ((unsigned long long)q.QuadPart - now < period / 8) {
+        if (++short_waits >= 30) {
+            fprintf(stderr, "[RBX DX11] VSync: WaitForVBlank does not wait, timer pacing\n");
+            broken = 1; return 0;
+        }
+    } else short_waits = 0;
+    last_vbl = (unsigned long long)q.QuadPart;
+    return 1;
+}
+
 static void pace_flip(void)
 {
     static HANDLE timer;
@@ -4094,21 +4224,11 @@ static void pace_flip(void)
         timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
         if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
     }
+    if (vsync_interval && s_vblank_pace && pace_vblank(timer, vsync_interval, cap, qf)) { next = 0; return; }
     QueryPerformanceCounter(&q); now = (unsigned long long)q.QuadPart;
     if (!next || now > next + interval) { next = now + interval; st_pace_late++; return; }
     if (now < next) { st_pace_n++; st_pace_us += (unsigned)((next - now) * 1000000ULL / qf); }
-    while (now < next) {
-        unsigned long long left_us = (next - now) * 1000000ULL / qf;
-        if (left_us > 1500) {
-            if (timer) {
-                LARGE_INTEGER due;
-                due.QuadPart = -(LONGLONG)((left_us - 1000) * 10);   /* 100 ns units, relative */
-                if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 50);
-                else Sleep(1);
-            } else Sleep(1);
-        } else SwitchToThread();
-        QueryPerformanceCounter(&q); now = (unsigned long long)q.QuadPart;
-    }
+    pace_sleep_until(timer, next, qf);
     next += interval;
 }
 static void gb_flip(void) { unsigned t0 = qpc_us(); gb_mark(4); gb_flip_impl(); gb_mark(0); st_us_flip += qpc_us() - t0; pace_flip(); }
