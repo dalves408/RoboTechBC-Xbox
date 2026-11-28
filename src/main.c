@@ -581,6 +581,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
              * FB thread; guest pacing is enough for bring-up. */
             { "RECOMP_HEAP_RECLAIM", "1" },
             { "RECOMP_AC97_READY", "1" },
+            /* 8 x 512-sample XAudio2 buffers (85 ms queued at most) instead of
+             * the toolkit's 4 (43 ms): rides out a short stall in the guest's
+             * audio feed instead of crackling. On the HPVictus it cut the
+             * underruns about 3x and the silence about 5x. */
+            { "RECOMP_AUDIO_BUF_COUNT", "8" },
             /* Keep MmAllocateContiguousMemory out of the loaded image range so
              * XAPI's USB interrupt EDs resolve; without this the pad can
              * enumerate (setups OK) but never open interrupt-IN reports. */
